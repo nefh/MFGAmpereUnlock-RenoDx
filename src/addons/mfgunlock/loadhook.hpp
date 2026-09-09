@@ -32,7 +32,8 @@
 #pragma once
 
 #include <windows.h>
-
+#include <intrin.h>
+#include <cstdint>
 #include <atomic>
 #include <cwctype>
 
@@ -44,6 +45,8 @@ namespace mfgunlock::loadhook {
 
 // Called with the freshly loaded DLSS-G snippet. Set by the addon.
 inline void (*g_on_dlssg_loaded)(HMODULE) = nullptr;
+// Optional resolver observer. It receives the result after GetProcAddress resolves it.
+inline FARPROC (*g_on_get_proc_address)(HMODULE, LPCSTR, FARPROC, const void*) = nullptr;
 // slInit must be hooked before the game calls it, and it calls it early --
 // so catch the interposer as it is mapped rather than hoping to beat it.
 inline void (*g_on_interposer_loaded)() = nullptr;
@@ -75,6 +78,7 @@ inline bool NameContains(const wchar_t* path, const wchar_t* needle) {
 
 inline void Notify(HMODULE module, const wchar_t* path) {
   if (module == nullptr || path == nullptr) return;
+  if ((reinterpret_cast<uintptr_t>(module) & 3u) != 0) return; // resource handle
   // Driver OTA snippets are commonly mapped from ...\models\dlssg\... under
   // opaque numeric .bin names. The loader call may receive only that basename,
   // so also inspect the resolved module path after the mapping completes.
@@ -97,16 +101,17 @@ inline void Notify(HMODULE module, const wchar_t* path) {
 
 using LoadLibraryExWFn = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
 using LoadLibraryWFn = HMODULE(WINAPI*)(LPCWSTR);
+using GetProcAddressFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 
 inline LoadLibraryExWFn g_real_load_library_ex_w = nullptr;
 inline LoadLibraryWFn g_real_load_library_w = nullptr;
-
+inline GetProcAddressFn g_real_get_proc_address = nullptr;
 inline HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR file_name, HANDLE file, DWORD flags) {
   HMODULE module = g_real_load_library_ex_w(file_name, file, flags);
   // Data-file mappings are not executable images; patching one would be
   // meaningless and the caller is not going to run code from it.
   constexpr DWORD kDataOnly = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE |
-                              LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+                              LOAD_LIBRARY_AS_IMAGE_RESOURCE | DONT_RESOLVE_DLL_REFERENCES;
   if ((flags & kDataOnly) == 0) Notify(module, file_name);
   return module;
 }
@@ -116,14 +121,23 @@ inline HMODULE WINAPI HookedLoadLibraryW(LPCWSTR file_name) {
   Notify(module, file_name);
   return module;
 }
+inline FARPROC WINAPI HookedGetProcAddress(HMODULE module, LPCSTR name) {
+  FARPROC resolved = g_real_get_proc_address(module, name);
+  const DWORD last_error = GetLastError();
+  if (resolved != nullptr && g_on_get_proc_address != nullptr)
+    resolved = g_on_get_proc_address(module, name, resolved, _ReturnAddress());
+  SetLastError(last_error);
+  return resolved;
+}
 
 inline const std::vector<hook::HookItem> kHooks = {
     {"LoadLibraryExW", reinterpret_cast<void**>(&g_real_load_library_ex_w),
      reinterpret_cast<void*>(&HookedLoadLibraryExW)},
-    {"LoadLibraryW", reinterpret_cast<void**>(&g_real_load_library_w),
+        {"LoadLibraryW", reinterpret_cast<void**>(&g_real_load_library_w),
      reinterpret_cast<void*>(&HookedLoadLibraryW)},
+    {"GetProcAddress", reinterpret_cast<void**>(&g_real_get_proc_address),
+     reinterpret_cast<void*>(&HookedGetProcAddress)},
 };
-
 }  // namespace internal
 
 inline void TryInstall() {

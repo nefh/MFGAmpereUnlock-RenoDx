@@ -96,7 +96,14 @@ inline std::atomic<unsigned long long> g_ota_flags_before{0};
 // that is the moment to make sure -- and to refuse to force if we cannot.
 inline void (*g_ensure_pacing)() = nullptr;
 inline bool (*g_pacing_ready)() = nullptr;
-
+// Optional Ampere admission check. Null preserves the existing Ada path.
+// It covers provider retargeting, the temporal program and MFG arch gates;
+// pacing remains owned by the existing g_ensure_pacing path below.
+inline bool (*g_multi_frame_ready)() = nullptr;
+inline std::atomic_bool g_declined_backend{false};
+inline sl::Result (*g_on_init)(const sl::Preferences&, uint64_t,
+    sl::Result (*)(const sl::Preferences&, uint64_t)) = nullptr;
+inline bool (*g_init_compatible)(HMODULE) = nullptr;
 namespace internal {
 
 using SetOptionsFn = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSGOptions&);
@@ -107,6 +114,9 @@ using InitFn = sl::Result (*)(const sl::Preferences&, uint64_t);
 
 inline SetOptionsFn g_real_set_options = nullptr;
 inline GetStateFn g_real_get_state = nullptr;
+inline hook::AddressHook g_set_options_entry;
+inline hook::AddressHook g_get_state_entry;
+inline std::atomic_bool g_entry_shutting_down{false};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
 
@@ -123,7 +133,12 @@ inline InitFn g_real_init = nullptr;
 // Both flags are in the SDK's own default; the app has to actively drop them.
 // Putting them back is a far better answer than shipping DLLs by hand, because
 // the driver then supplies a matched, signed, current plugin set.
+inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_version);
 inline sl::Result HookedInit(const sl::Preferences& pref, uint64_t sdk_version) {
+  return g_on_init ? g_on_init(pref, sdk_version, InitWithPreferences)
+                   : InitWithPreferences(pref, sdk_version);
+}
+inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_version) {
   if (g_real_init == nullptr) return sl::Result::eErrorNotInitialized;
   if (!g_force_ota.load(std::memory_order_relaxed)) return g_real_init(pref, sdk_version);
 
@@ -160,7 +175,33 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
                                    const sl::DLSSGOptions& options) {
   if (g_real_set_options == nullptr) return sl::Result::eErrorNotInitialized;
 
-  const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
+    const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
+  // A game can request native 3x/4x without our force-multiplier path. On
+  // Ampere, never pass that through until the provider and temporal backend
+  // are ready. Keep native 2x available as the first execution milestone.
+  if (g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
+      options.numFramesToGenerate > 1) {
+    bool ready = g_multi_frame_ready();
+    if (ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
+        g_ensure_pacing != nullptr) {
+      g_ensure_pacing();
+    }
+    if (ready && g_pacing_ready != nullptr) ready = g_pacing_ready();
+    if (!ready) {
+      if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
+        reshade::log::message(
+            reshade::log::level::warning,
+            "mfgunlock: Ampere multi-frame backend is not ready; clamping the native "
+            "request to one generated frame (2x).");
+      }
+      auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
+      const uint32_t requested = options.numFramesToGenerate;
+      mutable_options.numFramesToGenerate = 1;
+      const sl::Result result = g_real_set_options(viewport, options);
+      mutable_options.numFramesToGenerate = requested;
+      return result;
+    }
+  }
   if (multiplier < 2 || options.mode == sl::DLSSGMode::eOff) {
     const sl::Result result = g_real_set_options(viewport, options);
     if (options.mode != sl::DLSSGMode::eOff) {
@@ -182,8 +223,17 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     return result;
   }
 
-  const uint32_t desired = multiplier - 1;  // generated frames, not total
+    const uint32_t desired = multiplier - 1;  // generated frames, not total
   const uint32_t requested = options.numFramesToGenerate;
+  if (desired > 1 && g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
+    if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "mfgunlock: NOT forcing 3x+ on Ampere -- provider retargeting, temporal "
+          "correction or the MFG arch gates are not ready. Leaving the game's request alone.");
+    }
+    return g_real_set_options(viewport, options);
+  }
   g_last_requested.store(requested, std::memory_order_relaxed);
   if (requested >= desired) return g_real_set_options(viewport, options);
 
@@ -312,8 +362,12 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   }
   if (result != sl::Result::eOk || state.structVersion < sl::kStructVersion2) return result;
 
-  const unsigned int reported = state.numFramesToGenerateMax;
+    const unsigned int reported = state.numFramesToGenerateMax;
   g_runtime_max_generated.store(reported, std::memory_order_relaxed);
+  if (g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
+    if (state.numFramesToGenerateMax > 1) state.numFramesToGenerateMax = 1;
+    return result;
+  }
 
   const unsigned int wanted = g_advertised_max_generated.load(std::memory_order_relaxed);
   if (wanted < 2 || reported >= wanted) return result;
@@ -330,21 +384,37 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
 }
 
 inline sl::Result HookedGetFeatureFunction(sl::Feature feature, const char* function_name,
-                                           void*& function) {
+                                                void*& function) {
   const sl::Result result = g_real_get_feature_function(feature, function_name, function);
   if (result != sl::Result::eOk || function_name == nullptr || function == nullptr) return result;
+  if (feature != sl::kFeatureDLSS_G || g_entry_shutting_down.load(std::memory_order_acquire)) return result;
+
   if (std::strcmp(function_name, "slDLSSGSetOptions") == 0) {
-    g_real_set_options = reinterpret_cast<SetOptionsFn>(function);
-    function = reinterpret_cast<void*>(&HookedSetOptions);
-    reshade::log::message(
-        reshade::log::level::info,
-        "mfgunlock: wrapped slDLSSGSetOptions; frame-multiplier override is live.");
+    if (hook::InstallAddress(g_set_options_entry, function,
+                             reinterpret_cast<void*>(&HookedSetOptions),
+                             "slDLSSGSetOptions")) {
+      g_real_set_options = g_set_options_entry.Original<SetOptionsFn>();
+      reshade::log::message(
+          reshade::log::level::info,
+          "mfgunlock: slDLSSGSetOptions hook installed.");
+    } else {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "mfgunlock: slDLSSGSetOptions hook failed.");
+    }
   } else if (std::strcmp(function_name, "slDLSSGGetState") == 0) {
-    g_real_get_state = reinterpret_cast<GetStateFn>(function);
-    function = reinterpret_cast<void*>(&HookedGetState);
-    reshade::log::message(
-        reshade::log::level::info,
-        "mfgunlock: wrapped slDLSSGGetState; native multiplier-menu override is live.");
+    if (hook::InstallAddress(g_get_state_entry, function,
+                             reinterpret_cast<void*>(&HookedGetState),
+                             "slDLSSGGetState")) {
+      g_real_get_state = g_get_state_entry.Original<GetStateFn>();
+      reshade::log::message(
+          reshade::log::level::info,
+          "mfgunlock: slDLSSGGetState hook installed.");
+    } else {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "mfgunlock: slDLSSGGetState hook failed.");
+    }
   }
   return result;
 }
@@ -354,8 +424,7 @@ inline const std::vector<hook::HookItem> kInterposerHooks = {
      reinterpret_cast<void*>(&HookedGetFeatureFunction)},
 };
 
-// slInit is only detoured when the OTA override is actually wanted -- an unused
-// hook on a game's init path is risk for nothing.
+// slInit is armed for OTA or an explicit native capability callback.
 inline const std::vector<hook::HookItem> kInterposerHooksWithOta = {
     {"slGetFeatureFunction", reinterpret_cast<void**>(&g_real_get_feature_function),
      reinterpret_cast<void*>(&HookedGetFeatureFunction)},
@@ -374,7 +443,8 @@ inline void TryInstall() {
   HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
   if (interposer == nullptr) return;
   if (GetProcAddress(interposer, "slGetFeatureFunction") == nullptr) return;
-  const auto* hooks = g_force_ota.load(std::memory_order_relaxed)
+  const bool observe_init = g_on_init && g_init_compatible && g_init_compatible(interposer);
+  const auto* hooks = (g_force_ota.load(std::memory_order_relaxed) || observe_init)
                           ? &internal::kInterposerHooksWithOta
                           : &internal::kInterposerHooks;
   if (!hook::Install(interposer, *hooks, "sl.interposer.dll")) return;
@@ -383,10 +453,15 @@ inline void TryInstall() {
 }
 
 inline void Uninstall() {
-  if (!g_hooked.load(std::memory_order_acquire)) return;
+  internal::g_entry_shutting_down.store(true, std::memory_order_release);
   if (internal::g_installed_hooks != nullptr) hook::Uninstall(*internal::g_installed_hooks);
   internal::g_installed_hooks = nullptr;
   g_hooked.store(false, std::memory_order_release);
+
+  hook::UninstallAddress(internal::g_get_state_entry);
+  hook::UninstallAddress(internal::g_set_options_entry);
+  internal::g_real_get_state = nullptr;
+  internal::g_real_set_options = nullptr;
 }
 
 }  // namespace mfgunlock::framecount

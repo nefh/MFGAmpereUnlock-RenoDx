@@ -122,7 +122,7 @@
 #include "./loadhook.hpp"
 #include "./midpoint.hpp"
 #include "./ngx_hook.hpp"
-
+#include "./ampere_caps.hpp"
 namespace {
 
 constexpr const char* kConfigSection = "RenoDX.MFGUnlock";
@@ -194,9 +194,10 @@ NVSDK_NGX_Result HookedGetUInt32(void* self, const char* name, unsigned int* out
   NVSDK_NGX_Result result = g_real_get_uint32(self, name, out);
 
   if (!g_enabled.load(std::memory_order_relaxed)) return result;
-  if (name == nullptr || out == nullptr) return result;
+    if (name == nullptr || out == nullptr) return result;
   if (std::strcmp(name, kParamName) != 0) return result;
-
+  if (mfgunlock::framecount::g_multi_frame_ready != nullptr &&
+      !mfgunlock::framecount::g_multi_frame_ready()) return result;
   const bool failed = NgxFailed(result);
   const unsigned int reported = failed ? 0u : *out;
   const unsigned int want = g_max_count.load(std::memory_order_relaxed);
@@ -550,8 +551,11 @@ int g_gate_attempts = 0;
 // Split out so the load-time trigger can patch a module it already holds a
 // handle to. That path runs under the loader lock, where CreateToolhelp32Snapshot
 // (which FindDlssgModule uses) would deadlock -- so it must never scan.
+bool HasTemporalPatch(HMODULE mod);
 void PatchArchGatesInModule(HMODULE mod) {
   if (mod == nullptr) return;
+  const bool ampere = mfgunlock::ampere::UseAmperePath();
+  if (ampere && (!mfgunlock::ampere::PrepareProvider(mod) || !HasTemporalPatch(mod))) return;
   if (std::find(g_gate_modules.begin(), g_gate_modules.end(), mod) != g_gate_modules.end()) return;
   if (std::find(g_gate_rejected_modules.begin(), g_gate_rejected_modules.end(), mod) !=
       g_gate_rejected_modules.end()) {
@@ -598,6 +602,16 @@ void PatchArchGatesInModule(HMODULE mod) {
     return;
   }
 
+    if (ampere) {
+    g_gate_sites.reserve(g_gate_sites.size() + found.size());
+    g_gate_modules.reserve(g_gate_modules.size() + 1);
+    if (!mfgunlock::ampere::ApplyMfgComparisons(found)) return;
+    for (unsigned char* site : found) g_gate_sites.push_back({site, kArchOld});
+    g_gate_modules.push_back(mod);
+    g_gate_patched.store(true, std::memory_order_release);
+    mfgunlock::ampere::Log("MFG comparison gates opened after PTX and temporal preparation");
+    return;
+  }
   const size_t sites_before = g_gate_sites.size();
   for (unsigned char* site : found) {
     DWORD old_protect = 0;
@@ -666,9 +680,14 @@ std::vector<MidpointModulePatch> g_midpoint_modules;
 std::vector<HMODULE> g_midpoint_rejected_modules;
 std::string g_midpoint_detail;
 int g_midpoint_attempts = 0;
-
+bool HasTemporalPatch(HMODULE mod) {
+  return std::any_of(g_midpoint_modules.begin(), g_midpoint_modules.end(),
+                     [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
+}
 void PatchMidpointInModule(HMODULE mod) {
   if (mod == nullptr) return;
+  if (mfgunlock::ampere::UseAmperePath() &&
+      !mfgunlock::ampere::PrepareProvider(mod)) return;
   const auto already_patched = std::find_if(
       g_midpoint_modules.begin(), g_midpoint_modules.end(),
       [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
@@ -717,17 +736,27 @@ void ProcessLoadedDlssgModule(HMODULE mod) {
     g_provider_rescan_requested.store(true, std::memory_order_release);
     return;
   }
-  RememberDlssgModule(mod);
-  if (g_enabled.load(std::memory_order_relaxed)) PatchArchGatesInModule(mod);
-  if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
+    RememberDlssgModule(mod);
+  if (mfgunlock::ampere::UseAmperePath()) {
+    if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
+    if (g_enabled.load(std::memory_order_relaxed)) PatchArchGatesInModule(mod);
+  } else {
+    if (g_enabled.load(std::memory_order_relaxed)) PatchArchGatesInModule(mod);
+    if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
+  }
   ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
 }
 
 void RunProviderMaintenance() {
   AcquireSRWLockExclusive(&g_provider_maintenance_lock);
-  DiscoverDlssgModules();
-  if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
-  if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+    DiscoverDlssgModules();
+  if (mfgunlock::ampere::UseAmperePath()) {
+    if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+    if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
+  } else {
+    if (g_enabled.load(std::memory_order_relaxed)) TryPatchDlssgArchGate();
+    if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+  }
   ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
 }
 
@@ -1289,6 +1318,7 @@ void OnInitCommandQueue(reshade::api::command_queue* /*queue*/) {
 // ---------------------------------------------------------------- overlay
 
 void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
+  mfgunlock::ampere::caps::Draw();
   bool enabled = g_enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Enable multi-frame override", &enabled)) {
     g_enabled.store(enabled, std::memory_order_relaxed);
@@ -1336,7 +1366,7 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::TextDisabled("DLSS-G plugin found; flip-metering patch pending (%d).",
                         g_flip_meter_attempts);
   } else {
-    ImGui::TextDisabled("DLSS-G plugin not located yet -- turn frame generation on.");
+    ImGui::TextDisabled("Pacing path not exercised yet; this is not a plugin-load test.");
   }
   if (g_ceiling_patched.load(std::memory_order_acquire)) {
     ImGui::Text("Streamline device-limit bypassed: compiled %ux, effective %ux.",
@@ -1360,7 +1390,8 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
       const unsigned int observed =
           mfgunlock::framecount::g_max_actual_frames_presented.load(std::memory_order_relaxed);
       if (observed > 1) {
-        ImGui::Text("MFG validation: active; observed up to %u actual presentations.", observed);
+        ImGui::Text("Up to %u total presentations observed; generated content NOT verified."
+, observed);
       } else {
         ImGui::TextDisabled("DLSS-G status is OK; generated output has not been confirmed yet.");
       }
@@ -1448,8 +1479,12 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
 
 void LoadConfig() {
   int value = 0;
-  if (reshade::get_config_value(nullptr, kConfigSection, "Enabled", value)) {
+    if (reshade::get_config_value(nullptr, kConfigSection, "Enabled", value)) {
     g_enabled.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "AmpereExperimental", value)) {
+    mfgunlock::ampere::g_enabled.store(
+        value != 0 && g_enabled.load(std::memory_order_relaxed), std::memory_order_relaxed);
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "MaxCount", value)) {
     if (value < static_cast<int>(kMinCount)) value = static_cast<int>(kMinCount);
@@ -1486,8 +1521,22 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
     case DLL_PROCESS_ATTACH:
       g_self_module = h_module;
       if (!reshade::register_addon(h_module)) return FALSE;
-      LoadConfig();
-
+            LoadConfig();
+      mfgunlock::ampere::caps::Initialize(g_self_module);
+      if (mfgunlock::ampere::g_enabled.load()) {
+        mfgunlock::ampere::Log(
+            "Ampere support enabled; provider and NGX checks remain fail-closed");
+        mfgunlock::ampere::ngx::g_prepare_loaded_providers = RunProviderMaintenance;
+        mfgunlock::loadhook::g_on_get_proc_address = mfgunlock::ampere::caps::Resolve;
+        mfgunlock::framecount::g_on_init = mfgunlock::ampere::caps::OnInit;
+        mfgunlock::framecount::g_init_compatible = mfgunlock::ampere::caps::internal::KnownStreamline;
+        mfgunlock::framecount::g_multi_frame_ready = []() {
+          if (!mfgunlock::ampere::UseAmperePath()) return true;
+          return mfgunlock::ampere::PreparedProviderCount() == 1 &&
+                 g_midpoint_patched.load(std::memory_order_acquire) &&
+                 g_gate_patched.load(std::memory_order_acquire);
+        };
+      }
       // The frame-count override must never ask for more generated frames than
       // the pacing can deliver, and it is the only code that runs at a moment
       // when the DLSS-G plugin is guaranteed loaded. Give it both a way to
@@ -1518,9 +1567,21 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_overlay("MFG Unlock", OnRegisterOverlay);
       mfgunlock::loadhook::Uninstall();
+            // Stop discovery first, then detach every addon-owned entry hook before
+      // restoring mapped-image data. External code only ever cached native
+      // function addresses, so those pointers remain valid after this DLL leaves.
+      mfgunlock::loadhook::g_on_get_proc_address = nullptr;
+      mfgunlock::loadhook::g_on_dlssg_loaded = nullptr;
+      mfgunlock::loadhook::g_on_interposer_loaded = nullptr;
+      mfgunlock::framecount::g_on_init = nullptr;
+      mfgunlock::framecount::g_init_compatible = nullptr;
+      mfgunlock::framecount::g_multi_frame_ready = nullptr;
+      mfgunlock::ampere::ngx::g_prepare_loaded_providers = nullptr;
+      mfgunlock::ampere::caps::Shutdown();
       mfgunlock::framecount::Uninstall();
       RestoreMidpoint();
       RestoreDlssgArchGate();
+      mfgunlock::ampere::Restore();
       RestoreFrameCountCeiling();
       RestoreFlipMetering();
       reshade::unregister_addon(h_module);

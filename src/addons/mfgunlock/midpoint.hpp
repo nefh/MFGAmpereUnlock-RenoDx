@@ -59,6 +59,7 @@ constexpr uint32_t kFatbinMagic = 0xBA55ED50u;
 constexpr size_t kOuterHeader = 16;
 constexpr uint32_t kPtxKind = 1;
 constexpr uint32_t kAdaArch = 89;
+constexpr uint32_t kAmpereArch = 86;
 constexpr uint64_t kUncompressedFlags = 0x41;
 
 // Structural expectations. NVIDIA renamed every kernel in 310.9, but the D157
@@ -159,7 +160,8 @@ inline bool FindAdaPtxEntry(const uint8_t* fat, size_t fat_size, size_t& entry_o
     const uint64_t payload = ReadU64(fat + p + 8);
     if (hdr < 64 || payload == 0) return false;
     if (p + hdr + payload > fat_size) return false;
-    if (kind == kPtxKind && ReadU32(fat + p + 28) == kAdaArch) {
+        const uint32_t arch = ReadU32(fat + p + 28);
+    if (kind == kPtxKind && (arch == kAdaArch || arch == kAmpereArch)) {
       entry_offset = p;
       return true;
     }
@@ -175,7 +177,7 @@ inline bool BuildTemporalFatbin(const uint8_t* fat, size_t fat_size,
                                 std::vector<uint8_t>& out, std::string& why) {
   size_t entry = 0;
   if (!FindAdaPtxEntry(fat, fat_size, entry)) {
-    why = "no sm_89 PTX entry";
+        why = "no sm_89/sm_86 PTX entry";
     return false;
   }
 

@@ -1,7 +1,15 @@
-# MFG Unlock
+# MFGAmpereUnlock
+
+> **Well, it seems to be working on Ampere too... Try it yourself. Have fun, chooms!**
+
+![MFGAmpereUnlock running on an RTX 3090](docs/media/ampere-screenshot.png)
+
+[▶ DLSS MFG (Multi Frame Generation 4x) on Ampere | RTX3090 | Cyberpunk 2077](https://www.youtube.com/watch?v=RrrmVoKKQMs)
+
+---
 
 A [ReShade](https://reshade.me/) addon that enables **DLSS multi-frame generation
-(3x / 4x and above) on GeForce RTX 40-series** cards, which NVIDIA ships gated to
+(3x / 4x and above) on GeForce RTX ~~40~~30-series** cards, which NVIDIA ships gated to
 RTX 50-series only — and corrects the frame interpolation so the extra frames
 carry new motion instead of repeats.
 
@@ -71,37 +79,42 @@ replace or claim authorship of either original contribution.
 
 ## Tested Games
 
-| Game | Status |
-|---|---|
-| S.T.A.L.K.E.R. 2: Heart of Chornobyl | Working |
-| God of War Ragnarök | Working |
-| Death Stranding 2: On the Beach | Working |
-| Clair Obscur: Expedition 33 | Working |
-| The Last of Us Part II Remastered | Working |
-| Resident Evil Requiem | Working |
-| Assassin's Creed IV: Black Flag | Working |
-| PRAGMATA | Working |
-| Cyberpunk 2077 | Working |
-| Alan Wake 2 | Working |
-| Dragon's Dogma 2 | Working |
-| The Blood of Dawnwalker | Maybe |
-| Starfield | Working |
-| Star Wars Outlaws | Working |
-| Marvel's Spider-Man 2 | Working |
-| Mortal Shell II | Working |
-| Resonance: A Plague Tale Legacy | Working |
-| Black Myth: Wukong | Working |
-| Assetto Corsa Rally | Working |
-| Indiana Jones and the Great Circle | Working — launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
-| Hell Is Us | Working |
-| Silent Hill 2 | Working |
-| Forza Horizon 6 | Working |
-| Assassin's Creed Shadows | Working |
-| Stellar Blade | Working |
-| Doom the Dark Ages | Working — launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
-| Horizon Forbidden West | Working |
-| 007 The First Light | Working |
+The **Ada** column preserves the upstream MFGAdaUnlock test results.
+The **Ampere** column is intentionally sparse for now: Cyberpunk 2077 is the first validated title.
+**Ampere testers wanted:** if you try one of these games on an RTX 30-series card, let me know how it goes.
 
+| Game | Ampere | Ada | Comment |
+| --- | --- | --- | --- |
+| S.T.A.L.K.E.R. 2: Heart of Chornobyl | | Working | |
+| God of War Ragnarök | | Working | |
+| Death Stranding 2: On the Beach | | Working | |
+| Clair Obscur: Expedition 33 | | Working | |
+| The Last of Us Part II Remastered | | Working | |
+| Resident Evil Requiem | | Working | |
+| Assassin's Creed IV: Black Flag | | Working | |
+| PRAGMATA | | Working | |
+| Cyberpunk 2077 | Working | Working | |
+| Alan Wake 2 | | Working | |
+| Dragon's Dogma 2 | | Working | |
+| The Blood of Dawnwalker | | Maybe | |
+| Starfield | | Working | |
+| Star Wars Outlaws | | Working | |
+| Marvel's Spider-Man 2 | | Working | |
+| Mortal Shell II | | Working | |
+| Resonance: A Plague Tale Legacy | | Working | |
+| Black Myth: Wukong | | Working | |
+| Assetto Corsa Rally | | Working | |
+| Indiana Jones and the Great Circle | | Working | Launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
+| Hell Is Us | | Working | |
+| Silent Hill 2 | | Working | |
+| Forza Horizon 6 | | Working | |
+| Assassin's Creed Shadows | | Working | |
+| Stellar Blade | | Working | |
+| Doom the Dark Ages | | Working | Launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
+| Horizon Forbidden West | | Working | |
+| 007 The First Light | | Working | |
+
+The Ada results are inherited from upstream MFGAdaUnlock. Ampere results are just a new, blank column.
 These are the games personally tested with this fork; this is not a claim of
 universal compatibility. Results may vary with the game version, DLSS and
 Streamline versions, GPU, drivers, and configuration.
@@ -120,7 +133,8 @@ runtime version.
 
 ## Requirements
 
-- **GeForce RTX 40-series.** See [Why not 30-series?](#why-not-30-series) below.
+- ~~**GeForce RTX 40-series.** See [Why not 30-series?](#why-not-30-series) below.~~
+- **GeForce RTX 30-series.**
 - ReShade with addon support (this is an `.addon64`, not an effect).
 - A game shipping DLSS frame generation via Streamline, with a reasonably modern
   `nvngx_dlssg.dll` (310.x). Games still on the DLSS 3 snippet (3.5.x) contain no
@@ -307,15 +321,21 @@ the game's setting.
 ## How it works
 
 Three gates decide whether multi-frame generation is available, and the addon
-opens the two that matter:
+opens ~~the two that matter~~ all three:
 
 1. `nvngx_dlssg.dll` exports `NVSDK_NGX_GetGPUArchitecture` as a hardcoded
-   minimum architecture — `mov eax, 0x190` (Ada). A 40-series card already clears
-   this, so it is left alone.
+   minimum architecture — `mov eax, 0x190` (Ada). ~~A 40-series card already clears
+   this, so it is left alone.~~ On Ampere, the addon lowers
+   this to `0x170`, retargets compatible provider PTX from `sm_89` to `sm_86`,
+   and prevents the Ada cubin from being selected.
 2. `DLSSGInstanceManager::PopulateParameters` compares the NVAPI arch id against
    `0x1b0` (Blackwell) to decide whether to advertise a max frame count of 5 or 1.
 3. A second compare against the same constant feeds a runtime capability flag
    that drives generation itself.
+
+Ampere also has to pass the earlier Streamline/NGX adapter support check. The
+addon relaxes that check only for DLSS-G after a matching Ampere GPU and
+compatible provider have been identified.
 
 Patching (2) without (3) makes the options appear and then render black. The
 addon rewrites both compares, in both encodings, in memory only — NGX verifies
@@ -339,33 +359,42 @@ freeze presentation.
 Each source file documents its own area in detail — start with the header comment
 in [`addon.cpp`](src/addons/mfgunlock/addon.cpp).
 
-## Why not 30-series?
 
-Not because of the gates — those are just constants. Because the DLSS 4 snippet
-ships **no Ampere machine code**. Its 70 fatbins carry `PTX sm_89` ×70,
-`PTX sm_120` ×31 and `cubin sm_89` ×31, and nothing for sm_80/sm_86. PTX is
-forward-compatible only, so sm_89 PTX cannot be JIT-compiled down to sm_86; the
-module load fails outright.
+## ~~Why not 30-series?~~
+## And yet, it seems to be working on 30-series too!
 
-Retargeting is *theoretically* open — the kernels use only
-`mma.sync m16n8k16/m16n8k8` FP16 and `ldmatrix`, with zero instructions newer
-than sm_86 (no FP8, no wgmma, no TMA), and the old hardware optical-flow
-dependency is gone in DLSS 4. But frame generation costs roughly a fixed amount
-per generated frame, and Ampere has far less FP16 tensor throughput per SM, so
-the generation pass would likely cost more than the frame it saves. It was
-investigated and deliberately dropped.
+
+~~Not because of the gates — those are just constants. Because the DLSS 4 snippet~~
+~~ships **no Ampere machine code**. Its 70 fatbins carry `PTX sm_89` ×70,~~
+~~`PTX sm_120` ×31 and `cubin sm_89` ×31, and nothing for sm_80/sm_86. PTX is~~
+~~forward-compatible only, so sm_89 PTX cannot be JIT-compiled down to sm_86; the~~
+~~module load fails outright.~~
+
+~~Retargeting is *theoretically* open — the kernels use only~~
+~~`mma.sync m16n8k16/m16n8k8` FP16 and `ldmatrix`, with zero instructions newer~~
+~~than sm_86 (no FP8, no wgmma, no TMA), and the old hardware optical-flow~~
+~~dependency is gone in DLSS 4. But frame generation costs roughly a fixed amount~~
+~~per generated frame, and Ampere has far less FP16 tensor throughput per SM, so~~
+~~the generation pass would likely cost more than the frame it saves. It was~~
+~~investigated and deliberately dropped.~~
 
 ## Building
 
 The addon is built as part of a [RenoDX](https://github.com/clshortfuse/renodx)
 tree, which supplies ReShade, ImGui, Detours, and the NGX/Streamline headers.
 
+Ampere support also uses NVIDIA's public NVAPI headers. The validated Windows build pins NVIDIA/NVAPI commit `87dca62`.
+
 ```bash
 git clone --recursive https://github.com/clshortfuse/renodx
 cp -r src/addons/mfgunlock <renodx>/src/addons/
 cd <renodx>
+    git clone https://github.com/NVIDIA/nvapi.git external/NVAPI
+    git -C external/NVAPI checkout 87dca62
+    $env:CL = '/I"' + (Resolve-Path ".\external\NVAPI").Path + '"'
 cmake --preset vs-x64
 cmake --build build.vs --config Release --target mfgunlock
+Remove-Item Env:CL
 ```
 
 The build globs `src/**/**/addon.cpp`, so no CMake changes are needed. The output
@@ -375,7 +404,7 @@ Prebuilt binaries are attached to [Releases](../../releases).
 
 ## Credits
 
-- [dashdogy/RTX40MFG-Unlock](https://github.com/dashdogy/RTX40MFG-Unlock)
+- https://github.com/dashdogy/RTX40MFG-Unlock
   provided the foundational reverse engineering and original working ASI
   implementation. Dashdogy diagnosed the midpoint compaction bug, demonstrated
   the corrected slot-9 temporal program, established the verified
@@ -387,11 +416,23 @@ Prebuilt binaries are attached to [Releases](../../releases).
   ReShade-addon format and was verified by reproducing the original patcher's
   output digest byte-for-byte.
 - [Dreamt](https://github.com/ImDreamt) created the original ReShade/RenoDX addon
-  adaptation and repository from which this project is forked.
+  adaptation and repository on which MFGAdaUnlock is based.
+- [mavismmg](https://github.com/mavismmg) developed and maintained the
+  [MFGAdaUnlock-RenoDx](https://github.com/mavismmg/MFGAdaUnlock-RenoDx) fork,
+  extending the Ada implementation with broader game and DLSS-G provider
+  compatibility, lifecycle and pacing fixes, Vulkan support, runtime diagnostics,
+  and compatibility testing.
+- Special thanks to [Coldwood1026](https://github.com/Coldwood1026) for sharing
+  `ptx_out.zip` with the DLSS-G PTX and demonstrating successful cubin
+  compilation for SM 8.6 and SM 7.5, providing the starting point for the
+  Ampere backport work.
 - Special thanks to [mugensc](https://next.nexusmods.com/profile/mugensc) for the
   RenoDX DLSS5 compatibility testing and known-good runtime combination.
 - Built on [RenoDX](https://github.com/clshortfuse/renodx) by clshortfuse, and
   [ReShade](https://github.com/crosire/reshade) by crosire.
+
+## Next steps?
+Bring it to Turing too :)
 
 ## Disclaimer
 

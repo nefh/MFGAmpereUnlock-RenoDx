@@ -1,6 +1,8 @@
 # Build output
 build/
 build.vs/
+build.validation/
+build.sanitize/
 out/
 *.addon64
 *.addon32
@@ -25,3 +27,5 @@ _nvngx*
 *.user
 Thumbs.db
 desktop.ini
+__pycache__/
+*.pyc
