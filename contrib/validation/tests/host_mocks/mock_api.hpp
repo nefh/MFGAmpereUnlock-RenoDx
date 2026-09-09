@@ -308,4 +308,5 @@ inline void Separator() {}
 inline void TextUnformatted(const char*) {}
 inline void Text(const char*, ...) {}
 inline void TextWrapped(const char*, ...) {}
+inline void TextDisabled(const char*, ...) {}
 }  // namespace ImGui

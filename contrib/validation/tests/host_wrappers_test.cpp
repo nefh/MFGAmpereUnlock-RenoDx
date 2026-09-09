@@ -439,13 +439,34 @@ int main() {
   mock::resources[plugin_module] = full_resource;
 
   auto bound = ampere_caps::BindPlugin(plugin_module, Proc(RealGateway));
-  Check(bound != Proc(RealGateway), "native gateway bound");
-  auto gateway = reinterpret_cast<ampere_caps::GatewayFn>(bound);
-  Check(!ampere_caps::g_plugins[0].running.load(), "DLL presence not startup");
+  Check(bound == Proc(RealGateway), "native gateway pointer preserved");
+  auto& plugin = ampere_caps::g_plugins[0];
+  Check(plugin.gateway_hook.installed.load() &&
+            plugin.gateway_hook.Targets(reinterpret_cast<void*>(Proc(RealGateway))),
+        "native gateway entry hook installed");
+  auto gateway = reinterpret_cast<ampere_caps::GatewayFn>(
+      plugin.gateway_hook.replacement.load(std::memory_order_acquire));
+  Check(gateway != nullptr, "gateway detour captured");
+  Check(!plugin.running.load(), "DLL presence not startup");
 
-  auto on_load = reinterpret_cast<ampere_caps::LoadFn>(gateway("slOnPluginLoad"));
-  auto on_startup = reinterpret_cast<ampere_caps::StartupFn>(gateway("slOnPluginStartup"));
-  auto on_shutdown = reinterpret_cast<ampere_caps::ShutdownFn>(gateway("slOnPluginShutdown"));
+  Check(gateway("slOnPluginLoad") == RealGateway("slOnPluginLoad"),
+        "native load pointer preserved");
+  Check(gateway("slOnPluginStartup") == RealGateway("slOnPluginStartup"),
+        "native startup pointer preserved");
+  Check(gateway("slOnPluginShutdown") == RealGateway("slOnPluginShutdown"),
+        "native shutdown pointer preserved");
+  Check(plugin.load_hook.installed.load() && plugin.startup_hook.installed.load() &&
+            plugin.shutdown_hook.installed.load(),
+        "native lifecycle entry hooks installed");
+
+  auto on_load = reinterpret_cast<ampere_caps::LoadFn>(
+      plugin.load_hook.replacement.load(std::memory_order_acquire));
+  auto on_startup = reinterpret_cast<ampere_caps::StartupFn>(
+      plugin.startup_hook.replacement.load(std::memory_order_acquire));
+  auto on_shutdown = reinterpret_cast<ampere_caps::ShutdownFn>(
+      plugin.shutdown_hook.replacement.load(std::memory_order_acquire));
+  Check(on_load != nullptr && on_startup != nullptr && on_shutdown != nullptr,
+        "lifecycle detours captured");
   Check(gateway("slDLSSGSetOptions") == RealGateway("slDLSSGSetOptions"),
         "native options not replaced with dummy");
 
@@ -485,7 +506,8 @@ int main() {
 
   auto resolved = ampere::ngx::Resolve(ngx_module, "NVSDK_NGX_D3D12_GetFeatureRequirements",
                                        Proc(RealRequirements));
-  Check(resolved != Proc(RealRequirements), "NGX resolver wrapped");
+  Check(resolved == Proc(RealRequirements), "NGX resolver preserves native pointer");
+  Check(runtime.requirements == RealRequirements, "NGX native entry recorded");
 
   mock::install_ok = false;
   ampere::ngx::EnsureEntryHooks();
