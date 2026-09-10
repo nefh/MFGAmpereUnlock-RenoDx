@@ -6,6 +6,41 @@
 
 [▶ DLSS MFG (Multi Frame Generation 4x) on Ampere | RTX3090 | Cyberpunk 2077](https://www.youtube.com/watch?v=RrrmVoKKQMs)
 
+## Usage
+
+1. Install [ReShade](https://reshade.me/) with addon support, or install the
+   appropriate [RenoDX](https://github.com/clshortfuse/renodx) mod for the game.
+2. Download the [latest release from this fork](../../releases/latest).
+3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the
+   game. This is commonly the directory containing the game executable, but a
+   game-specific RenoDX package may use its own addon folder.
+4. Append the following to `ReShade.ini`:
+
+   ```ini
+   [ADDON]
+   LoadFromDllMain=renodx-mfgunlock.addon64
+   ```
+
+   **If omitted, MFG Unlock will append itself automatically; restart the game
+   once afterwards for MFG to be detected.**
+5. Use the latest
+   [`nvngx_dlssg.dll`](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/)
+   available from TechPowerUp. Back up the DLL bundled with the game before
+   replacing it.
+6. Launch the game and select the desired Multi Frame Generation multiplier
+   directly from the game's graphics settings. If the game only provides an
+   on/off Frame Generation option, use **Force frame multiplier** in the
+   ReShade **MFG Unlock** addon panel instead.
+
+The latest `nvngx_dlssg.dll` is the normal recommendation when this addon is
+used by itself. When using it together with RenoDX DLSS5, first read the
+version-specific guidance below instead of mixing individual DLLs from
+different packages.
+
+For NVIDIA Dynamic MFG, replacing only `nvngx_dlssg.dll` is not sufficient.
+The game must load a complete Streamline runtime that implements Dynamic MFG;
+VSync and frame-limiter support for Dynamic MFG was added in Streamline 2.14.1.
+
 ---
 
 A [ReShade](https://reshade.me/) addon that enables **DLSS multi-frame generation
@@ -141,38 +176,6 @@ runtime version.
   multi-frame code at all and need a newer one dropped in beside the executable.
   When an update is needed, use the latest
   [`nvngx_dlssg.dll` available from TechPowerUp](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/).
-
-## Usage
-
-1. Install [ReShade](https://reshade.me/) with addon support, or install the
-   appropriate [RenoDX](https://github.com/clshortfuse/renodx) mod for the game.
-2. Download the [latest release from this fork](../../releases/latest).
-3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the
-   game. This is commonly the directory containing the game executable, but a
-   game-specific RenoDX package may use its own addon folder.
-4. Use the latest
-   [`nvngx_dlssg.dll` available from TechPowerUp](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/).
-   Back up the DLL bundled with the game before replacing it.
-5. Launch the game and select the desired Multi Frame Generation multiplier
-   directly from the game's graphics settings. If the game only provides an
-   on/off Frame Generation option, use **Force frame multiplier** in the
-   ReShade **MFG Unlock** addon panel instead.
-
-The latest `nvngx_dlssg.dll` is the normal recommendation when this addon is
-used by itself. When using it together with RenoDX DLSS5, first read the
-version-specific guidance below instead of mixing individual DLLs from
-different packages.
-
-`Auto` is the default profile, so no architecture entry is needed. It reads the
-NVIDIA adapter's architecture and selects Ada, Ampere, or Turing. To override it,
-set `Architecture=Ada`, `Architecture=Ampere`, or `Architecture=Turing` under
-`[RenoDX.MFGUnlock]`. Profile changes take effect after restarting the game.
-Turing runtime reports are welcome.
-
-The backport capability hooks need the addon during ReShade startup. On a first
-launch without an `[ADDON] LoadFromDllMain` entry, MFG Unlock adds itself to that
-list without replacing other addons. Restart the game once when prompted; later
-launches are automatic.
 
 ## Using with RenoDX DLSS5
 
