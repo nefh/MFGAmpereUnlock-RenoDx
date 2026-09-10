@@ -54,7 +54,7 @@ inline bool FindCompatiblePtxEntry(const uint8_t* fat, size_t fat_size, size_t& 
     const uint64_t payload = ReadU64(fat + p + 8);
     if (hdr < 64 || payload == 0) return false;
     if (hdr > fat_size - p || payload > fat_size - p - hdr) return false;
-    if (kind == kPtxKind && (ReadU32(fat + p + 28) == kAdaArch || ReadU32(fat + p + 28) == 86)) {
+    if (kind == kPtxKind && (ReadU32(fat + p + 28) == kAdaArch || ReadU32(fat + p + 28) == 86 || ReadU32(fat + p + 28) == 75)) {
       entry_offset = p;
       return true;
     }
@@ -69,7 +69,7 @@ inline bool BuildTemporalFatbin(const uint8_t* fat, size_t fat_size,
                                 std::vector<uint8_t>& out, std::string& why) {
   size_t entry = 0;
   if (!FindCompatiblePtxEntry(fat, fat_size, entry)) {
-    why = "no sm_89/sm_86 PTX entry";
+    why = "no compatible temporal PTX entry";
     return false;
   }
   const uint32_t hdr = ReadU32(fat + entry + 4);

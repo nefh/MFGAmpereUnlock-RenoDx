@@ -289,8 +289,12 @@ struct FeatureRequirements {
 struct FeatureVersion {
   std::array<uint32_t, 8> payload{};
 };
+enum class PreferenceFlags : uint32_t {
+  eAllowOTA = 1u << 5,
+  eLoadDownloadedPlugins = 1u << 6,
+};
 struct Preferences {
-  uint32_t flags = 0;
+  PreferenceFlags flags{};
   const Feature* features = nullptr;
   size_t numFeatures = 0;
 };

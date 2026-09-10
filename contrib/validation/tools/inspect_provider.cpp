@@ -39,9 +39,12 @@ std::string Quoted(const std::string& value) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 2) {
-      throw std::runtime_error("usage: inspect_provider <nvngx_dlssg.dll or .fatbin>");
+    if (argc != 2 && argc != 3) {
+      throw std::runtime_error("usage: inspect_provider <nvngx_dlssg.dll or .fatbin> [Ampere|Turing|Ada]");
     }
+    const auto selected = mfgunlock::architecture::Parse(argc == 3 ? argv[2] : nullptr);
+    const auto* target_profile = mfgunlock::architecture::GetProfile(selected);
+    if (!target_profile) throw std::runtime_error("offline inspection requires an explicit architecture");
 
     const auto path = std::filesystem::path(argv[1]);
     const auto file_size = std::filesystem::file_size(path);
@@ -119,6 +122,8 @@ int main(int argc, char** argv) {
     std::cout << "{\n"
               << "  \"schema\":\"mfgampereunlock_provider_inspection_v1\",\n"
               << "  \"file\":" << Quoted(path.filename().string()) << ",\n"
+              << "  \"architecture\":" << Quoted(mfgunlock::architecture::Name(selected)) << ",\n"
+              << "  \"target_sm\":" << target_profile->target_sm << ",\n"
               << "  \"fatbins\":[\n";
 
     for (auto [section_offset, section_bytes] : sections) {
@@ -140,21 +145,21 @@ int main(int argc, char** argv) {
 
         ampere_ptx::Plan plan;
         std::string detail;
-        const auto result = ampere_ptx::Retarget({candidate, fatbin_bytes}, plan, detail);
+        const auto result = ampere_ptx::Retarget({candidate, fatbin_bytes}, plan, detail, *target_profile);
         const bool accepted = result == ampere_ptx::Result::kRetargeted;
         retargeted += accepted;
         rejected += result == ampere_ptx::Result::kRejected;
 
         bool temporal_compatible = false;
-        if (accepted) {
+        if (accepted || !target_profile->NeedsRetarget()) {
+          const auto* prepared = accepted ? plan.replacement.data() : candidate;
           const size_t replacement_bytes =
-              16 + static_cast<size_t>(fatbin::ReadU64(plan.replacement.data() + 8));
-          const auto* profile =
-              temporal::FindTemporalProfile(plan.replacement.data(), replacement_bytes);
+              16 + static_cast<size_t>(fatbin::ReadU64(prepared + 8));
+          const auto* profile = temporal::FindTemporalProfile(prepared, replacement_bytes);
           Bytes output;
           if (profile != nullptr) {
             temporal_compatible = temporal::BuildTemporalFatbin(
-                plan.replacement.data(), replacement_bytes, *profile, output, detail);
+                prepared, replacement_bytes, *profile, output, detail);
           }
         }
         temporal_matches += temporal_compatible;
@@ -171,7 +176,8 @@ int main(int argc, char** argv) {
       }
     }
 
-    const bool candidate = retargeted > 0 && rejected == 0 && temporal_matches == 1;
+    const bool candidate = (!target_profile->NeedsRetarget() || retargeted > 0) &&
+                           rejected == 0 && temporal_matches == 1;
     std::cout << "\n  ],\n"
               << "  \"retargetable\":" << retargeted << ",\n"
               << "  \"rejected\":" << rejected << ",\n"

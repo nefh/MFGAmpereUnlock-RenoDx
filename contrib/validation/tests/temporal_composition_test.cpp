@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: MIT
 #include "../../../src/addons/mfgunlock/ampere_policy.hpp"
 #include "../../../src/addons/mfgunlock/ampere_ptx.hpp"
+#if defined(MFG_TEST_RUNTIME_MIDPOINT)
+#include "../../../src/addons/mfgunlock/midpoint.hpp"
+#else
 #include "../tools/temporal_probe.hpp"
+#endif
 
 #include <fstream>
 #include <iostream>
@@ -62,7 +66,8 @@ Bytes Read(const char* path) {
   return {std::istreambuf_iterator<char>(file), {}};
 }
 
-void Composition(const Bytes& raw, bool mixed = false) {
+void Composition(const Bytes& raw, bool mixed = false,
+                 const mfgunlock::ArchitectureProfile& target_profile = mfgunlock::architecture::kAmpere) {
   auto fatbin = Container(raw);
   if (mixed) {
     auto blackwell = fatbin;
@@ -87,20 +92,20 @@ void Composition(const Bytes& raw, bool mixed = false) {
   std::string reason;
   Check(temporal::BuildTemporalFatbin(fatbin.data(), fatbin.size(), *profile, ada, reason));
 
-  ap::Plan ampere;
-  Check(ap::Retarget(fatbin, ampere, reason) == ap::Result::kRetargeted);
+  ap::Plan retargeted;
+  Check(ap::Retarget(fatbin, retargeted, reason, target_profile) == ap::Result::kRetargeted);
 
   Bytes composed;
   const size_t visible_bytes =
-      16 + static_cast<size_t>(fb::ReadU64(ampere.replacement.data() + 8));
-  Check(temporal::BuildTemporalFatbin(ampere.replacement.data(), visible_bytes,
+      16 + static_cast<size_t>(fb::ReadU64(retargeted.replacement.data() + 8));
+  Check(temporal::BuildTemporalFatbin(retargeted.replacement.data(), visible_bytes,
                                      *profile, composed, reason));
   Check(composed.size() == ada.size());
 
   std::vector<fb::Entry> entries;
   size_t end = 0;
   Check(fb::Parse(composed, entries, end));
-  Check(entries.size() == (mixed ? 2u : 1u) && entries.back().architecture == 86 &&
+  Check(entries.size() == (mixed ? 2u : 1u) && entries.back().architecture == target_profile.target_sm &&
         entries.back().flags == 0x41);
 
   const auto offset = entries.back().PayloadOffset();
@@ -108,12 +113,14 @@ void Composition(const Bytes& raw, bool mixed = false) {
                   entries.back().payload_bytes);
   Check(ptx.find("ld.param.f32 %f134, [" + std::string(profile->entry_name) +
                  "_param_0+32]") != std::string::npos);
-  Check(ptx.find(".target sm_86") != std::string::npos);
+  const auto target_name = ".target sm_" + std::to_string(target_profile.target_sm);
+  Check(ptx.find(target_name) != std::string::npos);
 
   // Restore the two architecture bytes. The remaining output must be exactly
   // the upstream temporal transformation.
-  const auto target = ptx.find(".target sm_86") + std::string(".target sm_8").size();
-  composed[offset + target] = '9';
+  const auto target = ptx.find(target_name) + std::string(".target sm_").size();
+  composed[offset + target] = '8';
+  composed[offset + target + 1] = '9';
   Put<uint32_t>(composed, entries.back().offset + 28, 89);
   Check(composed == ada);
 }
@@ -123,39 +130,39 @@ void Policy() {
 
   RequirementsEvidence evidence{true, true, 1, kNgxSuccess, kDlssGFeatureId,
                                 kAdapterUnsupported, kAdaArchitecture};
-  Check(CanRelaxRequirements(evidence));
+  Check(CanRelaxRequirements(evidence, &mfgunlock::architecture::kAmpere));
 
   auto test = evidence;
   test.prepared_providers = 0;
-  Check(!CanRelaxRequirements(test));
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   test = evidence;
   test.prepared_providers = 2;
-  Check(!CanRelaxRequirements(test));
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   test = evidence;
-  test.ampere_adapter = false;
-  Check(!CanRelaxRequirements(test));
+  test.adapter_bound = false;
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   test = evidence;
   test.enabled = false;
-  Check(!CanRelaxRequirements(test));
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   test = evidence;
   test.call_result = 0xbad00001;
-  Check(!CanRelaxRequirements(test));
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   test = evidence;
   test.feature = 1;
-  Check(!CanRelaxRequirements(test));
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   test = evidence;
   test.minimum_architecture = 0x1b0;
-  Check(!CanRelaxRequirements(test));
+  Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
 
   for (auto flags : {1u, 2u, 8u, 16u, 6u, 12u, 0xffffffffu}) {
     test = evidence;
     test.flags = flags;
-    Check(!CanRelaxRequirements(test));
+    Check(!CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
   }
 
   test = evidence;
   test.flags = 0;
-  Check(CanRelaxRequirements(test));
+  Check(CanRelaxRequirements(test, &mfgunlock::architecture::kAmpere));
 }
 
 Bytes Synthetic() {
@@ -184,6 +191,8 @@ int main(int argc, char** argv) {
     Policy();
     Composition(Synthetic());
     Composition(Synthetic(), true);
+    Composition(Synthetic(), false, mfgunlock::architecture::kTuring);
+    Composition(Synthetic(), true, mfgunlock::architecture::kTuring);
 
     if (argc == 3) {
       Composition(Read(argv[1]));

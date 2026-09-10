@@ -1,5 +1,5 @@
 /*
- * Temporal (midpoint) correction for DLSS-G frame interpolation on Ada.
+ * Temporal (midpoint) correction for DLSS-G frame interpolation on Ada and retargeted providers.
  * SPDX-License-Identifier: MIT
  *
  * ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@
  *
  * The catch: the fatbin also carries a precompiled sm_89 cubin, and the driver
  * would load that in preference to JIT-ing our edited PTX. So the rebuilt
- * fatbin is TRUNCATED after the sm_89 PTX entry, dropping the cubin and forcing
+ * fatbin is TRUNCATED after the selected PTX entry, dropping the cubin and forcing
  * the JIT path. The PTX entry is re-emitted uncompressed (flags 0x41).
  *
  * Credit: the technique -- the midpoint diagnosis, the injected PTX, and the
@@ -60,6 +60,7 @@ constexpr size_t kOuterHeader = 16;
 constexpr uint32_t kPtxKind = 1;
 constexpr uint32_t kAdaArch = 89;
 constexpr uint32_t kAmpereArch = 86;
+constexpr uint32_t kTuringArch = 75;
 constexpr uint64_t kUncompressedFlags = 0x41;
 
 // Structural expectations. NVIDIA renamed every kernel in 310.9, but the D157
@@ -145,9 +146,9 @@ inline bool Lz4BlockDecompress(const uint8_t* src, size_t src_size, uint8_t* dst
   return in == src_size && out == dst_size;
 }
 
-// Locates the sm_89 PTX entry inside a fatbin by walking its entry list rather
+// Locates the supported PTX entry inside a fatbin by walking its entry list rather
 // than trusting fixed offsets.
-inline bool FindAdaPtxEntry(const uint8_t* fat, size_t fat_size, size_t& entry_offset) {
+inline bool FindCompatiblePtxEntry(const uint8_t* fat, size_t fat_size, size_t& entry_offset) {
   if (fat_size < kOuterHeader || ReadU32(fat) != kFatbinMagic) return false;
   if (ReadU16(fat + 6) != kOuterHeader) return false;
   const uint64_t declared = ReadU64(fat + 8);
@@ -160,8 +161,8 @@ inline bool FindAdaPtxEntry(const uint8_t* fat, size_t fat_size, size_t& entry_o
     const uint64_t payload = ReadU64(fat + p + 8);
     if (hdr < 64 || payload == 0) return false;
     if (p + hdr + payload > fat_size) return false;
-        const uint32_t arch = ReadU32(fat + p + 28);
-    if (kind == kPtxKind && (arch == kAdaArch || arch == kAmpereArch)) {
+    const uint32_t arch = ReadU32(fat + p + 28);
+    if (kind == kPtxKind && (arch == kAdaArch || arch == kAmpereArch || arch == kTuringArch)) {
       entry_offset = p;
       return true;
     }
@@ -170,14 +171,14 @@ inline bool FindAdaPtxEntry(const uint8_t* fat, size_t fat_size, size_t& entry_o
   return false;
 }
 
-// Decompress the Ada PTX, rewrite the blend weights, and re-emit a truncated
+// Decompress the selected PTX, rewrite the blend weights, and re-emit a truncated
 // fatbin that ends after it.
 inline bool BuildTemporalFatbin(const uint8_t* fat, size_t fat_size,
                                 const TemporalProfile& profile,
                                 std::vector<uint8_t>& out, std::string& why) {
   size_t entry = 0;
-  if (!FindAdaPtxEntry(fat, fat_size, entry)) {
-        why = "no sm_89/sm_86 PTX entry";
+  if (!FindCompatiblePtxEntry(fat, fat_size, entry)) {
+    why = "no compatible temporal PTX entry";
     return false;
   }
 
@@ -307,11 +308,11 @@ inline bool BuildTemporalFatbin(const uint8_t* fat, size_t fat_size,
 
 // Kernel names confirm that a slot belongs to the expected descriptor family,
 // but do not uniquely identify its temporal program. Identify that program by
-// the exact sm_89 PTX size as well, then validate its internal signatures before
+// the exact PTX size as well, then validate its internal signatures before
 // rebuilding it.
 inline const TemporalProfile* FindTemporalProfile(const uint8_t* fat, size_t fat_size) {
   size_t entry = 0;
-  if (!FindAdaPtxEntry(fat, fat_size, entry)) return nullptr;
+  if (!FindCompatiblePtxEntry(fat, fat_size, entry)) return nullptr;
   const uint64_t raw = ReadU64(fat + entry + 56);
   for (const auto& profile : kTemporalProfiles) {
     if (raw == profile.ptx_bytes) return &profile;

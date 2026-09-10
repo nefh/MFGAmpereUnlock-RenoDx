@@ -163,6 +163,17 @@ used by itself. When using it together with RenoDX DLSS5, first read the
 version-specific guidance below instead of mixing individual DLLs from
 different packages.
 
+`Auto` is the default profile, so no architecture entry is needed. It reads the
+NVIDIA adapter's architecture and selects Ada, Ampere, or Turing. To override it,
+set `Architecture=Ada`, `Architecture=Ampere`, or `Architecture=Turing` under
+`[RenoDX.MFGUnlock]`. Profile changes take effect after restarting the game.
+Turing runtime reports are welcome.
+
+The backport capability hooks need the addon during ReShade startup. On a first
+launch without an `[ADDON] LoadFromDllMain` entry, MFG Unlock adds itself to that
+list without replacing other addons. Restart the game once when prompted; later
+launches are automatic.
+
 ## Using with RenoDX DLSS5
 
 MFG Unlock and the RenoDX DLSS5 addon can work together, but compatibility may
@@ -263,11 +274,12 @@ game.
 
 ## Settings
 
-Written to your `ReShade.ini` under `[RenoDX.MFGUnlock]`:
+Settings use `[RenoDX.MFGUnlock]` in `ReShade.ini`. Missing entries use the defaults:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `Enabled` | `1` | Master switch for the whole addon |
+| `Architecture` | `Auto` | Detects Ada, Ampere, or Turing; explicit values are case-insensitive and applied at startup |
 | `MaxCount` | `4` | The `DLSSG.MultiFrameCountMax` value reported to the runtime |
 | `ForceFlipMeteringOff` | `0` | Normally leave off. Enable only if 3x/4x freezes; this forces Streamline's legacy software pacing fallback and requires a game restart |
 | `TemporalFix` | `1` | The interpolation correction. Leave on |
@@ -325,17 +337,18 @@ opens ~~the two that matter~~ all three:
 
 1. `nvngx_dlssg.dll` exports `NVSDK_NGX_GetGPUArchitecture` as a hardcoded
    minimum architecture — `mov eax, 0x190` (Ada). ~~A 40-series card already clears
-   this, so it is left alone.~~ On Ampere, the addon lowers
-   this to `0x170`, retargets compatible provider PTX from `sm_89` to `sm_86`,
-   and prevents the Ada cubin from being selected.
+   this, so it is left alone.~~ The Ampere profile lowers this to `0x170` and
+   retargets compatible provider PTX from `sm_89` to `sm_86`; Turing uses `0x160`
+   and `sm_75`. Both hide the competing Ada cubin. The Ada profile needs no backport.
 2. `DLSSGInstanceManager::PopulateParameters` compares the NVAPI arch id against
    `0x1b0` (Blackwell) to decide whether to advertise a max frame count of 5 or 1.
 3. A second compare against the same constant feeds a runtime capability flag
    that drives generation itself.
 
-Ampere also has to pass the earlier Streamline/NGX adapter support check. The
-addon relaxes that check only for DLSS-G after a matching Ampere GPU and
-compatible provider have been identified.
+Ampere and Turing also have to pass the earlier Streamline/NGX adapter support
+check. The selected profile supplies the target architecture; the addon applies
+the compatibility override only in the bound adapter's DLSS-G scope after the
+provider is prepared. Explicit profiles do not require architecture detection.
 
 Patching (2) without (3) makes the options appear and then render black. The
 addon rewrites both compares, in both encodings, in memory only — NGX verifies

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -66,3 +67,12 @@ inline DWORD GetModuleFileNameA(HMODULE module,char* output,DWORD capacity){
  if(it->second.size()+1>capacity)return capacity;
  std::memcpy(output,it->second.c_str(),it->second.size()+1);return static_cast<DWORD>(it->second.size());
 }
+
+// The temporal composition test includes midpoint.hpp as well as ampere.hpp.
+constexpr DWORD MEM_RESERVE = 0x2000, MEM_RELEASE = 0x8000;
+inline const IMAGE_SECTION_HEADER* IMAGE_FIRST_SECTION(const IMAGE_NT_HEADERS64* nt) {
+  return reinterpret_cast<const IMAGE_SECTION_HEADER*>(
+      reinterpret_cast<const unsigned char*>(&nt->OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader);
+}
+inline void* VirtualAlloc(void*, size_t bytes, DWORD, DWORD) { return std::malloc(bytes); }
+inline BOOL VirtualFree(void* memory, size_t, DWORD) { std::free(memory); return 1; }

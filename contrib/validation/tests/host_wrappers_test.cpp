@@ -36,6 +36,8 @@ HMODULE Module(uintptr_t value) {
 
 NvPhysicalGpuHandle g_gpu = Module(0x100);
 LUID g_luid{10, 20};
+NvPhysicalGpuHandle g_second_gpu = Module(0x200);
+LUID g_second_luid{11, 20};
 unsigned int g_physical_count = 1;
 unsigned int g_architecture = ampere::kAmpereArchitecture;
 unsigned int g_implementation = 2;
@@ -44,12 +46,13 @@ NvAPI_Status g_arch_status = 0;
 
 NvAPI_Status EnumGpu(NvPhysicalGpuHandle* output, NvU32* count) {
   output[0] = g_gpu;
+  if (g_physical_count > 1) output[1] = g_second_gpu;
   *count = g_physical_count;
   return 0;
 }
 
-NvAPI_Status GpuLuid(NvPhysicalGpuHandle, LUID* output) {
-  *output = g_luid;
+NvAPI_Status GpuLuid(NvPhysicalGpuHandle gpu, LUID* output) {
+  *output = gpu == g_second_gpu ? g_second_luid : g_luid;
   return 0;
 }
 
@@ -211,7 +214,8 @@ void SetVersion(HMODULE module, unsigned int major, unsigned int minor) {
 }  // namespace
 
 int main() {
-  ampere::g_enabled = true;
+  mfgunlock::g_enabled = true;
+  architecture::Configure(Architecture::kAmpere);
   ampere::g_test_prepared_count = 1;
 
   auto& nvapi = ampere_ngx::GetNvapi();
@@ -223,14 +227,17 @@ int main() {
   IDXGIAdapter adapter{};
   adapter.desc.VendorId = ampere::kNvidiaVendorId;
   adapter.desc.AdapterLuid = g_luid;
-  Check(ampere_ngx::MatchAmpereAdapter(&adapter) == g_gpu, "physical LUID match");
+  g_arch_status = -10;
+  Check(ampere_ngx::MatchAdapter(&adapter) == g_gpu, "physical LUID match");
+  Check(g_arch_calls == 0, "explicit profile does not query architecture");
+  g_arch_status = 0;
 
   g_physical_count = 2;
-  Check(ampere_ngx::MatchAmpereAdapter(&adapter) == nullptr, "multi-GPU rejected");
+  Check(ampere_ngx::MatchAdapter(&adapter) == g_gpu, "bound adapter reused");
   g_physical_count = 1;
 
   adapter.desc.AdapterLuid.LowPart = 100;
-  Check(ampere_ngx::MatchAmpereAdapter(&adapter) == nullptr, "different LUID rejected");
+  Check(ampere_ngx::MatchAdapter(&adapter) == nullptr, "different LUID rejected");
   adapter.desc.AdapterLuid = g_luid;
 
   NV_GPU_ARCH_INFO arch_info{};
@@ -415,7 +422,7 @@ int main() {
   }
 
   sl::Preferences preferences{};
-  preferences.flags = 0x69;
+  preferences.flags = static_cast<sl::PreferenceFlags>(0x69);
   g_original_preferences = &preferences;
   const auto original_flags = preferences.flags;
   Check(ampere::caps::OnInit(preferences, sl::kSDKVersion, RealInit) == g_sl_result,
@@ -545,6 +552,109 @@ int main() {
   ampere::caps::Draw();
   Check(g_loads == 2 && g_startups == 2 && g_init_calls == 1,
         "lifecycle called exactly once");
+
+  // Tear down the entry hooks and check that native resolver results remain usable.
+  auto native_gateway = reinterpret_cast<ampere_caps::GatewayFn>(bound);
+  ampere::caps::Shutdown();
+  Check(!plugin.gateway_hook.installed.load() && !plugin.load_hook.installed.load() &&
+            !plugin.startup_hook.installed.load() && !plugin.shutdown_hook.installed.load(),
+        "lifecycle hooks detached");
+  Check(native_gateway("slDLSSGSetOptions") == RealGateway("slDLSSGSetOptions"),
+        "cached native gateway remains valid after detach");
+  Check(!runtime.entries_installed && ampere_ngx::g_bound_gpu.load() == nullptr,
+        "NGX hooks and adapter binding cleared");
+  ampere::ngx::g_shutting_down = false;
+
+  // Exercise the same real wrappers for both explicit backport profiles.
+  runtime.requirements = RealRequirements;
+  g_requirement_result = NVSDK_NGX_Result_Success;
+  g_requirement_flags = ampere::kAdapterUnsupported;
+  g_requirement_architecture = ampere::kAdaArchitecture;
+  g_architecture = ampere::kTuringArchitecture;
+  for (auto selected : {Architecture::kAmpere, Architecture::kTuring}) {
+    architecture::Configure(selected);
+    ampere_ngx::g_bound_gpu = nullptr;
+    const auto* profile = architecture::ActiveProfile();
+    const auto arch_calls_before = g_arch_calls;
+    ampere_ngx::Requirements<0>(&adapter, &discovery, &requirements);
+    Check(g_arch_calls == arch_calls_before, "manual NGX path does not detect architecture");
+    Check(requirements.MinHWArchitecture == profile->native_arch && requirements.FeatureSupported == 0,
+          "NGX uses explicit target");
+    {
+      ampere_ngx::ScopedArchQuery scope(g_gpu);
+      ampere_ngx::HookedGetArchInfo(g_gpu, &arch_info);
+      Check(arch_info.architecture == profile->exposed_arch, "scoped target exposure");
+    }
+    ampere_ngx::HookedGetArchInfo(g_gpu, &arch_info);
+    Check(arch_info.architecture == g_architecture, "real arch remains visible outside scope");
+    hook::UninstallAddress(ampere_ngx::g_arch_hook);
+  }
+
+  architecture::Configure(Architecture::kAda);
+  const auto calls_before_ada = g_arch_calls;
+  ampere_ngx::Requirements<0>(&adapter, &discovery, &requirements);
+  Check(requirements.FeatureSupported == g_requirement_flags &&
+            requirements.MinHWArchitecture == g_requirement_architecture,
+        "Ada leaves NGX requirements untouched");
+  Check(g_arch_calls == calls_before_ada, "Ada does not inspect hardware");
+
+  for (const auto* profile : {&architecture::kAda, &architecture::kAmpere, &architecture::kTuring}) {
+    architecture::Configure(Architecture::kAuto);
+    ampere_ngx::g_bound_gpu = nullptr;
+    g_architecture = profile->native_arch;
+    auto before = g_arch_calls;
+    Check(ampere_ngx::MatchAdapter(&adapter) == g_gpu, "Auto binds actual NGX adapter");
+    Check(architecture::ActiveProfile() == profile && g_arch_calls == before + 1,
+          "Auto reads original architecture once");
+    // The hook may expose Ada, but a repeated lookup must not detect that as the GPU.
+    {
+      ampere_ngx::ScopedArchQuery scope(g_gpu);
+      ampere_ngx::HookedGetArchInfo(g_gpu, &arch_info);
+      before = g_arch_calls;
+      Check(ampere_ngx::MatchAdapter(&adapter) == g_gpu && g_arch_calls == before &&
+                architecture::ActiveProfile() == profile,
+            "Auto uses cached identity inside spoof scope");
+    }
+  }
+  architecture::Configure(Architecture::kAuto);
+  ampere_ngx::g_bound_gpu = nullptr;
+  g_arch_status = -10;
+  Check(!ampere_ngx::MatchAdapter(&adapter) && architecture::NeedsDetection(),
+        "failed NVAPI query does not select a profile");
+  g_arch_status = 0;
+  g_architecture = 0x1b0;
+  Check(ampere_ngx::MatchAdapter(&adapter) == g_gpu && !architecture::ActiveProfile(),
+        "unknown Auto architecture has no fallback");
+  const auto previous_overrides = ampere::ngx::g_telemetry.overrides.load();
+  ampere_ngx::Requirements<0>(&adapter, &discovery, &requirements);
+  Check(ampere::ngx::g_telemetry.overrides.load() == previous_overrides &&
+            requirements.FeatureSupported == g_requirement_flags,
+        "unknown architecture leaves native requirements alone");
+
+  // Multi-GPU Auto waits for the actual device rather than choosing adapter 0.
+  architecture::Configure(Architecture::kAuto);
+  ampere_ngx::g_bound_gpu = nullptr;
+  g_physical_count = 2;
+  g_architecture = 0x160;
+  const auto calls_before_multi = g_arch_calls;
+  ampere_ngx::ProbeAdapterBeforeInit();
+  Check(architecture::NeedsDetection() && !ampere_ngx::g_bound_gpu.load() &&
+            g_arch_calls == calls_before_multi, "multi-GPU startup defers architecture detection");
+  adapter.desc.AdapterLuid = g_second_luid;
+  Check(ampere_ngx::MatchAdapter(&adapter) == g_second_gpu &&
+            architecture::ActiveProfile() == &architecture::kTuring,
+        "Auto binds requested second adapter");
+  adapter.desc.AdapterLuid = g_luid;
+  Check(!ampere_ngx::MatchAdapter(&adapter), "another adapter cannot replace the active binding");
+  g_physical_count = 1;
+
+  // An Ada profile must not add the backport lifecycle or architecture hooks.
+  architecture::Configure(Architecture::kAda);
+  ampere_caps::g_shutting_down = false;
+  const auto installs_before_ada = mock::installs;
+  Check(ampere::caps::Resolve(plugin_module, "slGetPluginFunction", Proc(RealGateway), nullptr) ==
+            Proc(RealGateway) && !ampere_caps::g_plugins[0].module &&
+            mock::installs == installs_before_ada, "Ada resolver remains native");
 
   std::cout << "host wrappers: " << g_checks
             << " checks PASS (mock APIs; no ABI/Detours/GPU test)\n";

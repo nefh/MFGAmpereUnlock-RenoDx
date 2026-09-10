@@ -1,7 +1,8 @@
 # Validation helpers
 
 This directory is not part of the runtime addon. It contains portable regression
-tests for the Ampere-specific code and a read-only provider inspector.
+tests for the architecture profiles, early-load list handling, provider transforms
+and native wrappers, plus a read-only provider inspector.
 
 On Linux/macOS with CMake and a C++20 compiler:
 
@@ -17,3 +18,13 @@ through `CMAKE_CXX_FLAGS`.
 `inspect_provider` reads a provider or standalone fatbin without loading or
 executing it. A positive result is structural qualification only; it is not a
 substitute for native Create/Evaluate and presentation validation on a GPU.
+
+The inspector accepts an optional target profile (default `Ampere`):
+
+```sh
+build.validation/inspect_provider /path/to/nvngx_dlssg.dll Turing
+```
+
+The temporal cases run against both the inspector helper and the runtime
+`midpoint.hpp`. The frame-count test exercises the real `framecount.hpp` using
+SDK doubles. Neither test installs machine-code hooks.

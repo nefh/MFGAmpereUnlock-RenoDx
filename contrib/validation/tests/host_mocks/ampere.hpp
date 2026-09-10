@@ -4,12 +4,10 @@
 #pragma once
 
 #include "mock_api.hpp"
+#include "architecture.hpp"
 
 namespace mfgunlock::ampere {
 
-inline std::atomic_bool g_enabled{false};
-inline std::atomic_bool g_device_confirmed{false};
-inline std::atomic_bool g_other_gpu{false};
 inline std::atomic_bool g_create_seen{false};
 inline unsigned int g_test_prepared_count = 0;
 inline unsigned int g_test_blocking_count = 0;

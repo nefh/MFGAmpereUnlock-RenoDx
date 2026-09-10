@@ -54,8 +54,11 @@ validation.
 
 `contrib/validation` contains tests for:
 
-- conservative fatbin parsing and sm_89 -> sm_86 PTX retargeting;
-- temporal-patch composition after the retarget;
+- profile parsing, default Auto, explicit selection and one-time hardware detection;
+- ReShade early-load list matching and non-destructive append behavior;
+- conservative fatbin parsing and sm_89 -> sm_86 / sm_75 PTX retargeting;
+- temporal-patch composition after retargeting, also using the real runtime header;
+- native frame-count behavior for Ada, disabled and unresolved profiles;
 - capability policy matrices and HAGS decoding;
 - Streamline/NGX wrapper behavior against deterministic API doubles;
 - live provider-state handling, including stale rejection records, active

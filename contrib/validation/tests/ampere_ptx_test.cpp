@@ -81,6 +81,13 @@ void UnitTests() {
   // One PTX literal and one architecture byte change in a single-image fatbin.
   Check(changed == 2);
 
+  // The Ampere profile must emit exactly the same bytes as the original patch.
+  auto ampere_expected = valid;
+  Put<uint32_t>(ampere_expected, 44, 86);
+  const auto literal_header = LiteralBlock(std::string(kPtx) + '\0').size() - kPtx.size() - 1;
+  ampere_expected[80 + literal_header + kPtx.find("sm_89") + 4] = '6';
+  Check(plan.replacement == ampere_expected);
+
   Check(ap::Retarget(plan.replacement, plan, reason) == ap::Result::kUnchanged);
 
   for (size_t bytes : {0u, 1u, 15u, 16u, 63u, 79u}) {
@@ -146,12 +153,39 @@ void UnitTests() {
         ap::Result::kRejected);
   Check(reason == "target literal is shared with another output byte");
 
+  Check(ap::Retarget(Container(prefix + "sm_89", &block), plan, reason,
+                     mfgunlock::architecture::kTuring) == ap::Result::kRejected);
+  Check(reason == "target literal is shared with another output byte");
+
+  Check(ap::Retarget(valid, plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRetargeted);
+  auto turing_expected = valid;
+  Put<uint32_t>(turing_expected, 44, 75);
+  turing_expected[80 + literal_header + kPtx.find("sm_89") + 3] = '7';
+  turing_expected[80 + literal_header + kPtx.find("sm_89") + 4] = '5';
+  Check(plan.replacement == turing_expected);
+  Check(ap::Retarget(plan.replacement, plan, reason,
+                     mfgunlock::architecture::kTuring) == ap::Result::kUnchanged);
+  Check(ap::Retarget(valid, plan, reason, mfgunlock::architecture::kAda) == ap::Result::kUnchanged);
+  Check(plan.replacement.empty());
+
+  for (const auto* instruction : {"cp.async.ca.shared.global", "mbarrier.init", "redux.sync.add",
+                                  "mma.sp.sync", "cvt.rn.bf16.f32", "mma.sync.aligned.m16n8k16"}) {
+    const auto input = Container(std::string(kPtx) + instruction + ";\n");
+    Check(ap::Retarget(input, plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRejected);
+    Check(ap::Retarget(input, plan, reason, mfgunlock::architecture::kAmpere) == ap::Result::kRetargeted);
+  }
+  Check(ap::Retarget(Container(std::string(kPtx) + "// cp.async; .tf32; mbarrier.init;\n"),
+                     plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRetargeted);
+  Check(ap::Retarget(Container(std::string(kPtx) + "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32;\n"),
+                     plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRetargeted);
+
   std::mt19937 random(13);
   for (unsigned int i = 0; i < 1000; ++i) {
     auto mutated = valid;
     mutated[random() % mutated.size()] ^=
         static_cast<unsigned char>(1 + random() % 255);
     (void)ap::Retarget(mutated, plan, reason);  // sanitizer smoke input
+    (void)ap::Retarget(mutated, plan, reason, mfgunlock::architecture::kTuring);
   }
 }
 

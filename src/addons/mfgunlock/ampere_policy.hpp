@@ -1,27 +1,28 @@
 /*
- * Ampere capability policy for native DLSS-G.
+ * Architecture capability policy for native DLSS-G.
  * SPDX-License-Identifier: MIT
  *
- * This file contains only side-effect-free admission rules. The runtime hooks
- * live in ampere_ngx.hpp; keeping the decisions here makes the fail-closed
- * behavior easy to test without loading NVAPI, NGX, or Streamline.
+ * Side-effect-free rules shared by the NGX/NVAPI hooks and portable tests.
  */
 #pragma once
 
 #include <cstdint>
 
+#include "./architecture.hpp"
+
 namespace mfgunlock::ampere {
 
-inline constexpr uint32_t kNvidiaVendorId = 0x10de;
-inline constexpr uint32_t kAmpereArchitecture = 0x170;
-inline constexpr uint32_t kAdaArchitecture = 0x190;
+using architecture::kNvidiaVendorId;
+using architecture::kTuringArchitecture;
+using architecture::kAmpereArchitecture;
+using architecture::kAdaArchitecture;
 inline constexpr uint32_t kDlssGFeatureId = 11;
 inline constexpr uint32_t kNgxSuccess = 1;
 inline constexpr uint32_t kAdapterUnsupported = 4;
 
 struct RequirementsEvidence {
   bool enabled;
-  bool ampere_adapter;
+  bool adapter_bound;
   unsigned int prepared_providers;
   uint32_t call_result;
   uint32_t feature;
@@ -29,45 +30,43 @@ struct RequirementsEvidence {
   uint32_t minimum_architecture;
 };
 
-inline const char* RequirementsDecision(const RequirementsEvidence& evidence) {
+inline const char* RequirementsDecision(const RequirementsEvidence& evidence,
+                                         const ArchitectureProfile* profile) {
   if (!evidence.enabled) return "disabled";
   if (evidence.feature != kDlssGFeatureId) return "not-DLSS-G";
   if (evidence.call_result != kNgxSuccess) return "original-call-failed";
-  if (!evidence.ampere_adapter) return "adapter-not-qualified";
+  if (!profile || !profile->NeedsRetarget()) return "no-backport";
+  if (!evidence.adapter_bound) return "adapter-not-bound";
   if (evidence.prepared_providers != 1) return "provider-not-ready-or-ambiguous";
   if (evidence.flags != 0 && evidence.flags != kAdapterUnsupported)
     return "other-requirements-preserved";
-  if (evidence.minimum_architecture != kAmpereArchitecture &&
-      evidence.minimum_architecture != kAdaArchitecture) {
+  if (evidence.minimum_architecture != profile->native_arch &&
+      evidence.minimum_architecture != profile->exposed_arch) {
     return "unknown-minimum-architecture";
   }
-  if (evidence.flags == 0 && evidence.minimum_architecture == kAmpereArchitecture)
+  if (evidence.flags == 0 && evidence.minimum_architecture == profile->native_arch)
     return "already-supported";
   return "architecture-override";
 }
 
-inline bool CanRelaxRequirements(const RequirementsEvidence& evidence) {
-  // AdapterUnsupported is not an architecture-only error. Only relax it after
-  // the real adapter is identified and exactly one provider has been prepared.
-  return evidence.enabled && evidence.ampere_adapter && evidence.prepared_providers == 1 &&
-         evidence.call_result == kNgxSuccess && evidence.feature == kDlssGFeatureId &&
+inline bool CanRelaxRequirements(const RequirementsEvidence& evidence,
+                                 const ArchitectureProfile* profile) {
+  // AdapterUnsupported also covers non-architecture failures. Preserve all
+  // other requirement flags and only override for the prepared DLSS-G provider.
+  return profile && profile->NeedsRetarget() && evidence.enabled && evidence.adapter_bound &&
+         evidence.prepared_providers == 1 && evidence.call_result == kNgxSuccess &&
+         evidence.feature == kDlssGFeatureId &&
          (evidence.flags == 0 || evidence.flags == kAdapterUnsupported) &&
-         (evidence.minimum_architecture == kAdaArchitecture ||
-          (evidence.minimum_architecture == kAmpereArchitecture &&
+         (evidence.minimum_architecture == profile->exposed_arch ||
+          (evidence.minimum_architecture == profile->native_arch &&
            evidence.flags == kAdapterUnsupported));
 }
 
-inline bool IsSupportedAmpere(uint32_t vendor, uint32_t architecture, uint32_t implementation) {
-  return vendor == kNvidiaVendorId && architecture == kAmpereArchitecture &&
-         (implementation == 2 || implementation == 4);
-}
-
-inline bool CanExposeAda(bool enabled, bool fg_requirements_scope, bool same_physical_gpu,
-                         bool provider_ready, int nvapi_result, uint32_t architecture,
-                         uint32_t implementation) {
-  return enabled && fg_requirements_scope && same_physical_gpu && provider_ready &&
-         nvapi_result == 0 &&
-         IsSupportedAmpere(kNvidiaVendorId, architecture, implementation);
+inline bool CanExposeArchitecture(bool enabled, bool fg_requirements_scope, bool same_physical_gpu,
+                                   bool provider_ready, int nvapi_result,
+                                   const ArchitectureProfile* profile) {
+  return profile && profile->NeedsRetarget() && enabled && fg_requirements_scope &&
+         same_physical_gpu && provider_ready && nvapi_result == 0;
 }
 
 // These helpers decode samples returned successfully by Windows. They do not

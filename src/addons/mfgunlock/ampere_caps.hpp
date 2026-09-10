@@ -1,5 +1,5 @@
 /*
- * Streamline lifecycle bridge for native Ampere DLSS-G.
+ * Streamline lifecycle bridge for native DLSS-G.
  * SPDX-License-Identifier: MIT
  */
 #pragma once
@@ -125,6 +125,7 @@ inline const std::vector<hook::HookItem> kObserverHooks = {
 };
 
 inline void InstallObservers() {
+  if (!g_enabled.load() || !architecture::NeedsBridge()) return;
   if (g_observers_installed.load() || g_observers_installing.test_and_set()) return;
   struct Guard {
     ~Guard() { g_observers_installing.clear(); }
@@ -173,10 +174,10 @@ inline void LifecyclePreflight() {
   // notification. Patch cached NGX exports before the native plugin builds
   // supportedAdapters, required tags, and the common needNGX flag.
   try {
-    if (!g_device_confirmed.load() && !g_other_gpu.load()) ngx::internal::ProbeAdapterBeforeInit();
+    ngx::internal::ProbeAdapterBeforeInit();
     InstallObservers();
     ngx::EnsureEntryHooks();
-    if (g_device_confirmed.load() && ngx::g_prepare_loaded_providers)
+    if (architecture::ActiveProfile() && ngx::g_prepare_loaded_providers)
       ngx::g_prepare_loaded_providers();
   } catch (...) {
     Log("DLSS-G preflight failed", true);
@@ -190,7 +191,7 @@ bool OnLoad(sl::param::IParameters* parameters, const char* loader_json, const c
   if (!real) return false;
   if (g_shutting_down.load(std::memory_order_acquire)) return real(parameters, loader_json, plugin_json);
   LifecyclePreflight();
-  ngx::internal::ScopedArchQuery scope(ngx::internal::g_single_gpu.load());
+  ngx::internal::ScopedArchQuery scope(ngx::internal::g_bound_gpu.load());
   const bool result = real(parameters, loader_json, plugin_json);
   if (!result) plugin.running.store(false);
   plugin.load_ok.store(result);
@@ -206,7 +207,7 @@ bool OnStartup(const char* json, void* device) {
   if (!real) return false;
   if (g_shutting_down.load(std::memory_order_acquire)) return real(json, device);
   LifecyclePreflight();
-  ngx::internal::ScopedArchQuery scope(ngx::internal::g_single_gpu.load());
+  ngx::internal::ScopedArchQuery scope(ngx::internal::g_bound_gpu.load());
   const bool result = real(json, device);
   plugin.startup_ok.store(result);
   plugin.running.store(result);
@@ -263,7 +264,7 @@ inline void ClearPluginRuntime(PluginRuntime& plugin) {
 }
 
 inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
-  if (!KnownStreamline(module)) return original;
+  if (!g_enabled.load() || !architecture::NeedsBridge() || !KnownStreamline(module)) return original;
   const auto gateway = reinterpret_cast<GatewayFn>(original);
 
   // The feature probe can execute vendor code. Keep it outside our registry
@@ -313,7 +314,7 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
 inline sl::Result OnInit(const sl::Preferences& pref, uint64_t sdk, PFun_slInit* next) {
   if (!next) return sl::Result::eErrorNotInitialized;
   if (internal::g_shutting_down.load(std::memory_order_acquire) ||
-      !g_enabled.load() || internal::g_init_depth != 0) return next(pref, sdk);
+      !g_enabled.load() || !architecture::NeedsBridge() || internal::g_init_depth != 0) return next(pref, sdk);
   ++internal::g_init_depth;
   struct Guard {
     ~Guard() { --internal::g_init_depth; }
@@ -339,7 +340,8 @@ inline sl::Result OnInit(const sl::Preferences& pref, uint64_t sdk, PFun_slInit*
 
 inline FARPROC Resolve(HMODULE module, const char* name, FARPROC original, const void* caller) {
   if (internal::g_shutting_down.load(std::memory_order_acquire) ||
-      !g_enabled.load() || !original || !name || reinterpret_cast<uintptr_t>(name) <= 0xffff)
+      !g_enabled.load() || !architecture::NeedsBridge() || !original || !name ||
+      reinterpret_cast<uintptr_t>(name) <= 0xffff)
     return original;
   // The addon's own Detours installer must always see the real export.
   MEMORY_BASIC_INFORMATION memory = {};
@@ -359,7 +361,7 @@ inline void Initialize(HMODULE self) {
   internal::g_shutting_down.store(false, std::memory_order_release);
   internal::g_self = self;
   if (!g_enabled.load()) return;
-  Log("Ampere support enabled");
+  Log(std::string("architecture: ") + architecture::Name(architecture::g_configured.load()));
 }
 
 inline void Shutdown() {
@@ -383,18 +385,17 @@ inline void Shutdown() {
 inline void Draw() {
   using namespace internal;
   ImGui::Separator();
-  ImGui::Text("Ampere support: %s", g_enabled.load() ? "ON" : "OFF");
-
-  if (g_device_confirmed.load()) {
-    const auto actual = ngx::internal::g_actual_arch.load();
-    const auto exposed = ngx::internal::g_exposed_arch.load();
-    if (exposed && exposed != actual)
-      ImGui::Text("GPU: Ampere (0x%X -> 0x%X)", actual, exposed);
-    else
-      ImGui::Text("GPU: Ampere (0x%X)", actual);
+  const auto configured = architecture::g_configured.load();
+  const auto active = architecture::g_active.load();
+  if (configured == Architecture::kAuto && active == Architecture::kAuto) {
+    ImGui::TextDisabled("Architecture: Auto (waiting)");
+  } else if (configured == Architecture::kAuto) {
+    ImGui::Text("Architecture: Auto -> %s", architecture::Name(active));
   } else {
-    ImGui::TextDisabled("GPU: waiting");
+    ImGui::Text("Architecture: %s", architecture::Name(active));
   }
+  const auto* profile = architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile || !profile->NeedsRetarget()) return;
 
   ModuleVersion plugin_version{};
   bool plugin_seen = false;

@@ -112,8 +112,8 @@ void Reset() {
   ampere::internal::g_registry_failed = false;
   ampere::internal::g_ignored_mappings = 0;
 
-  ampere::g_enabled = true;
-  ampere::g_device_confirmed = true;
+  mfgunlock::g_enabled = true;
+  mfgunlock::architecture::Configure(mfgunlock::Architecture::kAmpere);
   ampere::g_create_seen = false;
 
   mock::regions.clear();
@@ -129,7 +129,8 @@ void Reset() {
 bool Allowed() {
   return ampere::CanRelaxRequirements({true, true, ampere::PreparedProviderCount(),
                                        ampere::kNgxSuccess, ampere::kDlssGFeatureId,
-                                       ampere::kAdapterUnsupported, ampere::kAdaArchitecture});
+                                       ampere::kAdapterUnsupported, ampere::kAdaArchitecture},
+                                      mfgunlock::architecture::ActiveProfile());
 }
 
 }  // namespace
@@ -271,9 +272,54 @@ int main() {
 
     Reset();
     Image disabled(12);
-    ampere::g_enabled = false;
+    mfgunlock::g_enabled = false;
     Check(!ampere::PrepareProvider(disabled.module) && mock::protection_calls == 0,
           "disabled Ampere path makes no writes");
+
+    for (auto selected : {mfgunlock::Architecture::kAmpere, mfgunlock::Architecture::kTuring}) {
+      Reset();
+      mfgunlock::architecture::Configure(selected);
+      const auto* profile = mfgunlock::architecture::ActiveProfile();
+      Image target(100);
+      const auto before = target.bytes;
+      Check(ampere::PrepareProvider(target.module), "explicit profile prepares provider");
+      Check(target.bytes[0x1001] == static_cast<unsigned char>(profile->native_arch),
+            "minimum architecture follows profile");
+      Check(mfgunlock::fatbin::ReadU32(target.bytes.data() + 0x2000 + 44) == profile->target_sm,
+            "fatbin SM follows profile");
+      target.bytes[0x1100] = 0xb0;
+      target.bytes[0x1101] = 0xb0;
+      unsigned char* sites[] = {target.bytes.data() + 0x1100, target.bytes.data() + 0x1101};
+      Check(ampere::ApplyMfgComparisons(sites), "profile MFG comparison transaction");
+      Check(*sites[0] == static_cast<unsigned char>(profile->native_arch) &&
+                *sites[1] == static_cast<unsigned char>(profile->native_arch),
+            "MFG comparisons use native target, not spoofed Ada");
+      // Comparison sites are owned/restored by addon.cpp, not the provider transaction.
+      *sites[0] = before[0x1100];
+      *sites[1] = before[0x1101];
+      ampere::Restore();
+      Check(target.bytes == before, "profile restore is byte exact");
+    }
+
+    Reset();
+    mfgunlock::architecture::Configure(mfgunlock::Architecture::kAda);
+    Image ada(101);
+    const auto ada_before = ada.bytes;
+    Check(!ampere::PrepareProvider(ada.module) && ada.bytes == ada_before &&
+              mock::protection_calls == 0,
+          "Ada skips backport preparation");
+
+    Reset();
+    mfgunlock::architecture::Configure(mfgunlock::Architecture::kAuto);
+    Image automatic(102);
+    const auto automatic_before = automatic.bytes;
+    Check(!ampere::PrepareProvider(automatic.module) && automatic.bytes == automatic_before,
+          "pending Auto writes nothing");
+    mfgunlock::architecture::ResolveAuto(0x10de, 0x160, 2);
+    Check(ampere::PrepareProvider(automatic.module) && automatic.bytes[0x1001] == 0x60,
+          "resolved Auto uses Turing provider target");
+    ampere::Restore();
+    Check(automatic.bytes == automatic_before, "Auto provider restored");
 
     std::cout << "provider state: " << g_checks
               << " checks PASS (real ampere.hpp; simulated Windows memory)\n";

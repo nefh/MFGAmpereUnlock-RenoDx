@@ -1,8 +1,8 @@
 /*
- * NGX/NVAPI bridge for native Ampere DLSS-G.
+ * NGX/NVAPI bridge for native DLSS-G.
  * SPDX-License-Identifier: MIT
  *
- * Qualifies the Ampere adapter, scopes the Ada architecture exposure to DLSS-G
+ * Binds the game adapter, scopes the architecture exposure to DLSS-G
  * capability queries, and observes the native Create/Evaluate/Release path.
  */
 #pragma once
@@ -55,8 +55,8 @@ inline std::atomic_bool g_shutting_down{false};
 
 namespace internal {
 
-// Original NVAPI pointers are kept separately from the entry hook. Adapter
-// qualification must never consult our exposed architecture.
+// Original NVAPI pointers are kept separately from the entry hook. Architecture
+// detection must never consult our exposed architecture.
 using QueryFn = void*(__cdecl*)(NvU32);
 struct NvapiApi {
   decltype(&NvAPI_EnumPhysicalGPUs) enumerate = nullptr;
@@ -81,7 +81,7 @@ inline NvapiApi& GetNvapi() {
   });
   return api;
 }
-inline std::atomic<NvPhysicalGpuHandle> g_single_gpu{nullptr};
+inline std::atomic<NvPhysicalGpuHandle> g_bound_gpu{nullptr};
 inline std::atomic_uint32_t g_actual_arch{0};
 inline std::atomic_uint32_t g_actual_implementation{0};
 inline std::atomic_uint32_t g_luid_low{0};
@@ -118,10 +118,10 @@ inline NvAPI_Status __cdecl HookedGetArchInfo(NvPhysicalGpuHandle gpu, NV_GPU_AR
   const auto result = real(gpu, info);
   if (g_shutting_down.load(std::memory_order_acquire) ||
       !g_arch_scope || result != NVAPI_OK || !info) return result;
-  const auto actual = info->architecture;
-  if (CanExposeAda(g_enabled.load(), true, gpu == g_arch_scope,
-                   PreparedProviderCount() == 1, result, actual, info->implementation)) {
-    info->architecture = kAdaArchitecture;
+  const auto* profile = architecture::ActiveProfile();
+  if (CanExposeArchitecture(g_enabled.load(), true, gpu == g_arch_scope,
+                            PreparedProviderCount() == 1, result, profile)) {
+    info->architecture = profile->exposed_arch;
     g_arch_changes.fetch_add(1);
   }
   g_arch_calls.fetch_add(1);
@@ -171,75 +171,98 @@ inline void ReadHardwareScheduling(const LUID& luid) {
   FreeLibrary(gdi);
 }
 
-inline NvPhysicalGpuHandle MatchAmpereAdapter(IDXGIAdapter* adapter) {
+inline void EnsureArchitectureHook() {
+  const auto* profile = architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile || !profile->NeedsRetarget()) return;
+  auto& api = GetNvapi();
+  if (!api.ready || g_arch_hook.installed.load() || g_arch_installing.test_and_set()) return;
+  struct Guard {
+    ~Guard() { g_arch_installing.clear(); }
+  } guard;
+  if (g_arch_hook.installed.load()) return;
+  if (!hook::InstallAddress(g_arch_hook, reinterpret_cast<void*>(api.architecture),
+                            reinterpret_cast<void*>(&HookedGetArchInfo), "NVAPI")) {
+    Log("NVAPI hook failed", true);
+  }
+}
+
+inline SRWLOCK g_adapter_lock = SRWLOCK_INIT;
+
+inline NvPhysicalGpuHandle MatchAdapter(IDXGIAdapter* adapter) {
   if (!adapter) return nullptr;
   DXGI_ADAPTER_DESC desc = {};
-  if (FAILED(adapter->GetDesc(&desc)) || desc.VendorId != 0x10de) return nullptr;
+  if (FAILED(adapter->GetDesc(&desc)) || desc.VendorId != kNvidiaVendorId) return nullptr;
+
+  AcquireSRWLockExclusive(&g_adapter_lock);
+  struct Unlock {
+    ~Unlock() { ReleaseSRWLockExclusive(&g_adapter_lock); }
+  } unlock;
+  if (const auto bound = g_bound_gpu.load()) {
+    return desc.AdapterLuid.LowPart == g_luid_low.load() &&
+           static_cast<uint32_t>(desc.AdapterLuid.HighPart) == g_luid_high.load() ? bound : nullptr;
+  }
+
   auto& api = GetNvapi();
   if (!api.ready) return nullptr;
   NvPhysicalGpuHandle physical[NVAPI_MAX_PHYSICAL_GPUS] = {};
   NvU32 count = 0;
-  // A provider contains shared device code. Do not retarget it while a second
-  // NVIDIA adapter could select the same image.
-  if (api.enumerate(physical, &count) != NVAPI_OK || count != 1) return nullptr;
-  LUID luid = {};
-  NV_GPU_ARCH_INFO arch = {};
-  arch.version = NV_GPU_ARCH_INFO_VER;
-  const auto architecture = RealArchitecture();
-  if (api.adapter_id(physical[0], &luid) != NVAPI_OK ||
-      std::memcmp(&luid, &desc.AdapterLuid, sizeof(luid)) != 0 ||
-      !architecture || architecture(physical[0], &arch) != NVAPI_OK) {
+  if (api.enumerate(physical, &count) != NVAPI_OK || count == 0 || count > NVAPI_MAX_PHYSICAL_GPUS)
     return nullptr;
+  NvPhysicalGpuHandle matched = nullptr;
+  for (NvU32 i = 0; i < count; ++i) {
+    LUID luid = {};
+    if (api.adapter_id(physical[i], &luid) != NVAPI_OK ||
+        std::memcmp(&luid, &desc.AdapterLuid, sizeof(luid)) != 0) continue;
+    if (matched) return nullptr;
+    matched = physical[i];
   }
-  g_actual_arch.store(arch.architecture);
-  g_actual_implementation.store(arch.implementation);
-  if (!IsSupportedAmpere(desc.VendorId, arch.architecture, arch.implementation)) {
-    g_other_gpu.store(true);
-    return nullptr;
+  if (!matched) return nullptr;
+
+  // Only Auto queries the GPU architecture. Explicit profiles are authoritative.
+  if (architecture::NeedsDetection()) {
+    NV_GPU_ARCH_INFO arch = {};
+    arch.version = NV_GPU_ARCH_INFO_VER;
+    const auto real = RealArchitecture();
+    if (!real || real(matched, &arch) != NVAPI_OK) return nullptr;
+    g_actual_arch.store(arch.architecture);
+    g_actual_implementation.store(arch.implementation);
+    if (architecture::ResolveAuto(desc.VendorId, arch.architecture, arch.implementation)) {
+      Log(std::string("architecture: Auto -> ") + architecture::Name(architecture::g_active.load()));
+    }
   }
-  g_single_gpu.store(physical[0]);
-  g_luid_low.store(luid.LowPart);
-  g_luid_high.store(static_cast<uint32_t>(luid.HighPart));
-  g_other_gpu.store(false);
-  if (!g_device_confirmed.exchange(true)) {
-    ReadHardwareScheduling(luid);
-    std::stringstream message;
-    message << "Ampere GPU detected (arch=0x" << std::hex << arch.architecture
-            << ", impl=0x" << arch.implementation << ')';
-    Log(message.str());
-  }
-  return physical[0];
+  g_luid_low.store(desc.AdapterLuid.LowPart);
+  g_luid_high.store(static_cast<uint32_t>(desc.AdapterLuid.HighPart));
+  g_bound_gpu.store(matched);
+  ReadHardwareScheduling(desc.AdapterLuid);
+  return matched;
 }
 
 inline void ProbeAdapterBeforeInit() {
-  if (!g_enabled.load()) return;
-  HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
-  if (!dxgi) return;
-  using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
-  const auto create = reinterpret_cast<CreateFactoryFn>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
-  if (!create) return;
-  IDXGIFactory1* factory = nullptr;
-  if (FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return;
-  for (UINT i = 0; i < 16; ++i) {
-    IDXGIAdapter1* adapter = nullptr;
-    if (factory->EnumAdapters1(i, &adapter) != S_OK) break;
-    MatchAmpereAdapter(adapter);
-    adapter->Release();
-  }
-  factory->Release();
-  auto& api = GetNvapi();
-  if (api.ready && g_device_confirmed.load() && !g_arch_hook.installed.load() &&
-      !g_arch_installing.test_and_set()) {
-    struct Guard {
-      ~Guard() { g_arch_installing.clear(); }
-    } guard;
-    if (g_arch_hook.installed.load()) return;
-    if (!hook::InstallAddress(g_arch_hook, reinterpret_cast<void*>(api.architecture),
-                              reinterpret_cast<void*>(&HookedGetArchInfo),
-                              "NVAPI")) {
-      Log("NVAPI hook failed", true);
+  if (!g_enabled.load() || !architecture::NeedsBridge()) return;
+  if (!g_bound_gpu.load()) {
+    auto& api = GetNvapi();
+    NvPhysicalGpuHandle physical[NVAPI_MAX_PHYSICAL_GPUS] = {};
+    NvU32 count = 0;
+    // With multiple NVIDIA GPUs, wait for the actual NGX adapter rather than
+    // selecting whichever adapter happens to be enumerated first.
+    if (!api.ready || api.enumerate(physical, &count) != NVAPI_OK || count != 1) return;
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (!dxgi) return;
+    using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
+    const auto create = reinterpret_cast<CreateFactoryFn>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+    if (!create) return;
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) return;
+    for (UINT i = 0; i < 16; ++i) {
+      IDXGIAdapter1* adapter = nullptr;
+      if (factory->EnumAdapters1(i, &adapter) != S_OK) break;
+      const auto matched = MatchAdapter(adapter);
+      adapter->Release();
+      if (matched) break;
     }
+    factory->Release();
   }
+  if (g_bound_gpu.load()) EnsureArchitectureHook();
 }
 
 inline bool EqualsInsensitive(const wchar_t* a, const wchar_t* b) {
@@ -314,7 +337,7 @@ NVSDK_NGX_Result NVSDK_CONV Requirements(
   }
   const bool fg = discovery != nullptr && static_cast<uint32_t>(discovery->FeatureID) ==
       static_cast<uint32_t>(NVSDK_NGX_Feature_FrameGeneration);
-  if (!g_enabled.load(std::memory_order_relaxed) || !fg || g_in_requirements) {
+  if (!g_enabled.load(std::memory_order_relaxed) || !architecture::NeedsBridge() || !fg || g_in_requirements) {
     ScopedArchQuery no_spoof(nullptr);
     return real(adapter, discovery, output);
   }
@@ -324,12 +347,13 @@ NVSDK_NGX_Result NVSDK_CONV Requirements(
     ~Guard() { g_in_requirements = false; }
   } guard;
 
-  bool is_ampere = false;
+  bool adapter_bound = false;
   NvPhysicalGpuHandle physical_gpu = nullptr;
   try {
-    physical_gpu = MatchAmpereAdapter(adapter);
-    is_ampere = physical_gpu != nullptr;
-    if (is_ampere && g_prepare_loaded_providers != nullptr) g_prepare_loaded_providers();
+    physical_gpu = MatchAdapter(adapter);
+    EnsureArchitectureHook();
+    adapter_bound = physical_gpu != nullptr;
+    if (adapter_bound && g_prepare_loaded_providers != nullptr) g_prepare_loaded_providers();
   } catch (...) {
     Log("NGX requirements preflight failed", true);
   }
@@ -341,7 +365,7 @@ NVSDK_NGX_Result NVSDK_CONV Requirements(
   // callback prepares it synchronously; this second pass also covers providers
   // that predated the callback without tying admission to a particular callsite.
   try {
-    if (is_ampere && g_prepare_loaded_providers != nullptr) g_prepare_loaded_providers();
+    if (adapter_bound && g_prepare_loaded_providers != nullptr) g_prepare_loaded_providers();
   } catch (...) {
     Log("NGX requirements postflight failed", true);
   }
@@ -351,11 +375,12 @@ NVSDK_NGX_Result NVSDK_CONV Requirements(
   const uint32_t arch = valid ? output->MinHWArchitecture : 0;
   const auto provider_status = GetProviderStatus();
   const unsigned int prepared_providers = provider_status.QualifiedCount();
-  const bool change = valid && CanRelaxRequirements(
-      {true, is_ampere, prepared_providers, static_cast<uint32_t>(result),
-       static_cast<uint32_t>(NVSDK_NGX_Feature_FrameGeneration), flags, arch});
+  const auto* profile = architecture::ActiveProfile();
+  const RequirementsEvidence evidence{g_enabled.load(), adapter_bound, prepared_providers,
+      static_cast<uint32_t>(result), kDlssGFeatureId, flags, arch};
+  const bool change = valid && CanRelaxRequirements(evidence, profile);
   if (change) {
-    output->MinHWArchitecture = 0x170;
+    output->MinHWArchitecture = profile->native_arch;
     output->FeatureSupported = static_cast<decltype(output->FeatureSupported)>(0);
   }
 
@@ -363,14 +388,13 @@ NVSDK_NGX_Result NVSDK_CONV Requirements(
   g_telemetry.requirements_result.store(static_cast<uint32_t>(result));
   g_telemetry.flags.store(flags);
   g_telemetry.min_arch.store(arch);
-  g_telemetry.decision.store(RequirementsDecision({true, is_ampere, prepared_providers,
-      static_cast<uint32_t>(result), 11, flags, arch}));
-  if (valid && is_ampere && prepared_providers != 1) {
+  g_telemetry.decision.store(RequirementsDecision(evidence, profile));
+  if (valid && adapter_bound && prepared_providers != 1) {
     g_telemetry.decision.store(provider_status.Reason());
   }
   if (change) {
     const auto previous = g_telemetry.overrides.fetch_add(1);
-    if (previous == 0) Log("NGX frame-generation requirements adjusted for Ampere");
+    if (previous == 0) Log("NGX frame-generation requirements adjusted");
   } else if (result != NVSDK_NGX_Result_Success) {
     std::stringstream message;
     message << "NGX frame-generation requirements failed (0x" << std::hex
@@ -513,7 +537,7 @@ inline bool IsTargetName(const char* name) {
 // entry detours are installed later from slInit/native plugin lifecycle callbacks,
 // never while a DLL-load callback may hold the loader lock.
 inline FARPROC Resolve(HMODULE module, const char* name, FARPROC original) {
-  if (!g_enabled.load(std::memory_order_relaxed) || original == nullptr ||
+  if (!g_enabled.load(std::memory_order_relaxed) || !architecture::NeedsBridge() || original == nullptr ||
       !internal::IsTargetName(name) || !internal::IsNgxRuntime(module)) {
     return original;
   }
@@ -608,7 +632,8 @@ bool InstallEntryHooks(NgxRuntime& slot) {
 // Called only from slInit / real plugin lifecycle callbacks, never from the
 // LoadLibrary/GetProcAddress notification. Entry detours cover cached exports.
 inline void EnsureEntryHooks() {
-  if (g_shutting_down.load(std::memory_order_acquire) || !g_enabled.load()) return;
+  if (g_shutting_down.load(std::memory_order_acquire) || !g_enabled.load() ||
+      !architecture::NeedsBridge()) return;
   for (const auto* name : {L"_nvngx.dll", L"nvngx.dll"}) {
     HMODULE module = GetModuleHandleW(name);
     if (!module) continue;
@@ -636,7 +661,7 @@ inline void BeforeInit() {
   try {
     internal::ProbeAdapterBeforeInit();
     EnsureEntryHooks();
-    if (g_device_confirmed.load() && g_prepare_loaded_providers) g_prepare_loaded_providers();
+    if (architecture::ActiveProfile() && g_prepare_loaded_providers) g_prepare_loaded_providers();
   } catch (...) {
     Log("NGX preflight failed", true);
   }
@@ -692,7 +717,8 @@ inline void Shutdown() {
   }
   ReleaseSRWLockExclusive(&internal::g_resolver_lock);
   hook::UninstallAddress(internal::g_arch_hook);
-  internal::g_single_gpu.store(nullptr);
-  g_device_confirmed.store(false);
+  internal::g_bound_gpu.store(nullptr);
+  internal::g_luid_low.store(0);
+  internal::g_luid_high.store(0);
 }
 }  // namespace mfgunlock::ampere::ngx

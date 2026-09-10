@@ -1,11 +1,11 @@
 /*
- * PTX retargeting for known DLSS-G fatbin layouts used on Ampere.
+ * PTX retargeting for known DLSS-G fatbin layouts.
  * SPDX-License-Identifier: MIT
  *
  * The target change is intentionally narrow: only a verified `.target sm_89`
- * directive is rewritten to `sm_86`, and only when the corresponding LZ4 byte
- * is an independent literal. The complete block is decoded again afterwards to
- * prove that no other output byte changed.
+ * directive is rewritten to the selected SM, and only when the changed LZ4
+ * bytes are independent literals. A second decode verifies that no other byte
+ * changed.
  */
 #pragma once
 
@@ -13,6 +13,7 @@
 #include <string>
 #include <string_view>
 
+#include "./architecture.hpp"
 #include "./fatbin.hpp"
 
 namespace mfgunlock::ampere::ptx {
@@ -38,7 +39,8 @@ inline std::string_view Trim(std::string_view value) {
 
 // Preserve byte positions while blanking comments and strings. This prevents a
 // filename, quoted string, or comment containing "sm_89" from being retargeted.
-inline bool FindTargetDigit(std::span<const unsigned char> raw, size_t& digit) {
+inline bool FindTargetDigits(std::span<const unsigned char> raw, uint32_t target_sm,
+                              size_t& digit) {
   const auto nul = std::find(raw.begin(), raw.end(), 0);
   if (nul == raw.end()) return false;
 
@@ -104,7 +106,7 @@ inline bool FindTargetDigit(std::span<const unsigned char> raw, size_t& digit) {
     if (is_directive(".target")) {
       const auto target = Trim(line.substr(7));
       if (target != "sm_89" || ++targets != 1) return false;
-      digit = static_cast<size_t>(target.data() - text.data()) + 4;
+      digit = static_cast<size_t>(target.data() - text.data()) + 3;
     } else if (is_directive(".version")) {
       const auto version = Trim(line.substr(8));
       if (version.size() != 3 || version[0] != '8' || version[1] != '.' ||
@@ -118,8 +120,7 @@ inline bool FindTargetDigit(std::span<const unsigned char> raw, size_t& digit) {
     offset = end + 1;
   }
 
-  // These instructions require functionality outside the reviewed sm_86 path.
-  // This is a rejection filter, not a substitute for JIT or runtime validation.
+  // These instructions are outside the supported backport targets.
   constexpr std::string_view kUnsupported[] = {
       "wgmma.",
       "tcgen05.",
@@ -133,11 +134,25 @@ inline bool FindTargetDigit(std::span<const unsigned char> raw, size_t& digit) {
     if (text.find(token) != text.npos) return false;
   }
 
+  if (target_sm == 75) {
+    // PTX features introduced with Ampere cannot be enabled by changing .target.
+    constexpr std::string_view kSm80Instructions[] = {
+        "cp.async", "mbarrier.", "redux.sync", "mma.sp.", ".bf16", ".tf32",
+        "mma.sync.aligned.m16n8k16", "mma.sync.aligned.m16n8k32",
+        "mma.sync.aligned.m16n8k64", "mma.sync.aligned.m8n8k128",
+        "mma.sync.aligned.m16n8k128", "mma.sync.aligned.m16n8k256",
+        "mma.sync.aligned.m8n8k4.row.col.f64",
+    };
+    for (const auto token : kSm80Instructions) {
+      if (text.find(token) != text.npos) return false;
+    }
+  }
   return targets == 1 && versions == 1 && addresses == 1 &&
          text.find(".entry") != text.npos;
 }
 
-inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::string& reason) {
+inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::string& reason,
+                        const ArchitectureProfile& profile = architecture::kAmpere) {
   reason.clear();
 
   std::vector<fatbin::Entry> entries;
@@ -147,6 +162,13 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
     reason = message;
     return Result::kRejected;
   };
+
+  if (!profile.NeedsRetarget()) {
+    plan = {};
+    return Result::kUnchanged;
+  }
+  if (profile.target_sm != 86 && profile.target_sm != 75)
+    return reject("unsupported PTX target");
 
   if (!fatbin::Parse(bytes, entries, end)) return reject("invalid fatbin bounds/layout");
 
@@ -181,29 +203,36 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
   }
 
   size_t target_digit = 0;
-  if (!FindTargetDigit(raw, target_digit)) return reject("unreviewed PTX header/instructions");
-
-  size_t literal = 0;
-  if (!fatbin::Lz4BlockDecompress(compressed, entry.compressed_bytes, check.data(), check.size(),
-                                  target_digit, &literal) ||
-      literal >= entry.compressed_bytes || compressed[literal] != '9') {
-    return reject("target is not an independent LZ4 literal");
-  }
+  if (!FindTargetDigits(raw, profile.target_sm, target_digit))
+    return reject("unreviewed PTX header/instructions");
 
   std::vector<unsigned char> replacement(bytes.begin(), bytes.begin() + end);
-  replacement[entry.PayloadOffset() + literal] = '6';
+  const unsigned char digits[] = {
+      static_cast<unsigned char>('0' + profile.target_sm / 10),
+      static_cast<unsigned char>('0' + profile.target_sm % 10),
+  };
+  for (size_t i = 0; i < 2; ++i) {
+    if (raw[target_digit + i] == digits[i]) continue;
+    size_t literal = 0;
+    if (!fatbin::Lz4BlockDecompress(compressed, entry.compressed_bytes, check.data(), check.size(),
+                                    target_digit + i, &literal) ||
+        literal >= entry.compressed_bytes || compressed[literal] != raw[target_digit + i]) {
+      return reject("target is not an independent LZ4 literal");
+    }
+    replacement[entry.PayloadOffset() + literal] = digits[i];
+  }
   if (!fatbin::Lz4BlockDecompress(replacement.data() + entry.PayloadOffset(),
                                   entry.compressed_bytes, check.data(), check.size())) {
     return reject("edited LZ4 block invalid");
   }
 
-  raw[target_digit] = '6';
+  raw[target_digit] = digits[0];
+  raw[target_digit + 1] = digits[1];
   if (raw != check) return reject("target literal is shared with another output byte");
 
-  constexpr uint32_t kAmpereArchitecture = 86;
   const uint64_t visible_bytes = entry.End() - fatbin::kHeaderBytes;
-  std::memcpy(replacement.data() + entry.offset + 28, &kAmpereArchitecture,
-              sizeof(kAmpereArchitecture));
+  std::memcpy(replacement.data() + entry.offset + 28, &profile.target_sm,
+              sizeof(profile.target_sm));
   std::memcpy(replacement.data() + 8, &visible_bytes, sizeof(visible_bytes));
 
   plan.replacement = std::move(replacement);

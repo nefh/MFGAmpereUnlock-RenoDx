@@ -1,9 +1,9 @@
 /*
- * Native DLSS-G provider preparation for Ampere.
+ * Native DLSS-G provider preparation for the selected architecture.
  * SPDX-License-Identifier: MIT
  *
- * Retargets compatible sm_89 PTX to sm_86 in the mapped provider, hides the
- * matching sm_89 cubins, and lowers the provider architecture gate to Ampere.
+ * Retargets compatible sm_89 PTX in the mapped provider, hides the matching
+ * sm_89 cubins, and lowers the provider architecture gate to the selected GPU.
  */
 #pragma once
 
@@ -23,17 +23,11 @@
 
 namespace mfgunlock::ampere {
 
-inline std::atomic_bool g_enabled{false};
-inline std::atomic_bool g_device_confirmed{false};
 inline std::atomic_bool g_create_seen{false};
-inline std::atomic_bool g_other_gpu{false};
-inline bool UseAmperePath() {
-  return g_enabled.load(std::memory_order_relaxed) && !g_other_gpu.load(std::memory_order_acquire);
-}
 
 inline void Log(const std::string& message, bool warning = false) {
   reshade::log::message(warning ? reshade::log::level::warning : reshade::log::level::info,
-                        ("mfgunlock: ampere: " + message).c_str());
+                        ("mfgunlock: " + message).c_str());
 }
 
 namespace internal {
@@ -60,6 +54,7 @@ struct Provider {
   ImageIdentity identity;
   std::string path;
   std::string failure;
+  Architecture architecture = Architecture::kUnknown;
 };
 
 struct Rejection {
@@ -266,7 +261,9 @@ inline ProviderStatus GetProviderStatus() {
   for (const auto& provider : internal::g_providers) {
     // Prepared images are retained until process exit. Losing one, its gate or
     // an unfinished transaction is a real failure, not an expired rejection.
-    bool valid = provider.ready && !provider.patches.empty() &&
+    const auto* profile = architecture::ActiveProfile();
+    bool valid = profile && provider.architecture == profile->architecture &&
+                 provider.ready && !provider.patches.empty() &&
                  internal::IsCurrent(provider.module, provider.identity);
     if (valid) {
       const auto& gate = provider.patches.back();
@@ -297,7 +294,8 @@ inline unsigned int PreparedProviderCount() {
 // Called through the project's existing provider discovery/maintenance path.
 // No CUDA, NVAPI, module enumeration, downloads or compilation here.
 inline bool PrepareProviderImpl(HMODULE module) {
-  if (!g_enabled.load() || !g_device_confirmed.load() ||
+  const auto* profile = architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile || !profile->NeedsRetarget() ||
       internal::g_registry_failed.load() || module == nullptr) return false;
   if (!internal::IsImageMapping(module)) {
     internal::g_ignored_mappings.fetch_add(1);
@@ -309,7 +307,8 @@ inline bool PrepareProviderImpl(HMODULE module) {
   } unlock;
   for (const auto& provider : internal::g_providers) {
     if (provider.module != module) continue;
-    return provider.ready && !provider.patches.empty() &&
+    return provider.architecture == profile->architecture &&
+           provider.ready && !provider.patches.empty() &&
            internal::IsCurrent(module, provider.identity) &&
            internal::IsReadable(provider.patches.back().address, 1, module) &&
            *provider.patches.back().address == provider.patches.back().after;
@@ -403,7 +402,7 @@ inline bool PrepareProviderImpl(HMODULE module) {
       const size_t bytes = static_cast<size_t>(payload) + fatbin::kHeaderBytes;
       ptx::Plan plan;
       std::string reason;
-      const auto result = ptx::Retarget({start + at, bytes}, plan, reason);
+      const auto result = ptx::Retarget({start + at, bytes}, plan, reason, *profile);
       if (result == ptx::Result::kRejected) return reject(reason);
       if (result == ptx::Result::kRetargeted) {
         if (blocks.size() == 512 || bytes > 64 * 1024 * 1024 - total_bytes) {
@@ -417,7 +416,7 @@ inline bool PrepareProviderImpl(HMODULE module) {
     }
   }
   if (blocks.empty()) return reject("no supported sm_89 fatbins");
-  internal::Provider candidate{module, {}, false, 0, 0, identity, path, {}};
+  internal::Provider candidate{module, {}, false, 0, 0, identity, path, {}, profile->architecture};
   for (const auto& block : blocks) {
     if (std::memcmp(block.address, block.before.data(), block.before.size()) != 0) {
       return reject("image changed during preparation");
@@ -430,7 +429,7 @@ inline bool PrepareProviderImpl(HMODULE module) {
       }
     }
   }
-  candidate.patches.push_back({gate + 1, 0x90, 0x70});
+  candidate.patches.push_back({gate + 1, 0x90, static_cast<unsigned char>(profile->native_arch)});
   // Reserve all rollback storage before the first write. Keep the mapped image
   // alive while rollback pointers into it are stored. This process-lifetime
   // provider reference does not retain the addon and keeps unload restoration
@@ -463,7 +462,8 @@ inline bool PrepareProviderImpl(HMODULE module) {
   saved.ready = true;
   std::erase_if(internal::g_rejected, [module](const auto& entry) { return entry.module == module; });
   std::stringstream message;
-  message << "provider prepared: " << blocks.size() << " fatbins, "
+  message << "provider prepared: sm_89 -> sm_" << profile->target_sm << ", "
+          << blocks.size() << " fatbins, "
           << hidden_cubins << " cubins hidden";
   Log(message.str());
   return true;
@@ -475,19 +475,21 @@ inline bool PrepareProvider(HMODULE module) {
   } catch (...) {
     internal::g_registry_failed.store(true);
     reshade::log::message(reshade::log::level::error,
-        "mfgunlock: ampere: provider preparation failed");
+        "mfgunlock: provider preparation failed");
     return false;
   }
 }
 
-// Reuse the upstream's comparison scanner, but make the Ampere writes all-or-none.
+// Reuse the upstream's comparison scanner, but keep comparison writes all-or-none.
 // On success the caller records the sites in the upstream gate restoration list.
 inline bool ApplyMfgComparisons(std::span<unsigned char* const> sites) {
+  const auto* profile = architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile) return false;
   std::vector<internal::BytePatch> changes;
   changes.reserve(sites.size());
   for (auto* site : sites) {
     if (*site != 0xB0) return false;
-    changes.push_back({site, 0xB0, 0x70});
+    changes.push_back({site, 0xB0, static_cast<unsigned char>(profile->native_arch)});
   }
   size_t attempted = 0;
   for (auto& patch : changes) {

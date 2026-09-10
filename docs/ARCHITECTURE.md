@@ -1,21 +1,36 @@
 # Architecture
 
-MFGAmpereUnlock keeps MFGAdaUnlock's native NVIDIA execution path. The Ampere
-code exists to make a compatible provider and host capability path agree on the
-same physical GPU; it does not implement frame generation itself.
+MFGAmpereUnlock keeps MFGAdaUnlock's native NVIDIA execution path.
+`architecture.hpp` selects one profile for the existing provider, capability,
+temporal and frame-count code.
+
+| Profile | Provider minimum / MFG compares | PTX target | Scoped NVAPI architecture |
+| --- | --- | --- | --- |
+| Ada | `0x190` | `sm_89`, no backport | unchanged |
+| Ampere | `0x170` | `sm_86` | `0x190` |
+| Turing | `0x160` | `sm_75` | `0x190` |
+
+Missing `Architecture` selects Auto. Explicit profiles do not query the GPU
+architecture. `Auto` uses the original NVAPI result and caches the resolved
+profile. Unknown architectures remain unmodified; GA100 (`sm_80`) has no profile.
+The profile is fixed for the lifetime of the addon; changes require a restart.
+
+The backport capability hooks also need to be present during ReShade startup. If
+`[ADDON] LoadFromDllMain` does not already contain this addon, the first normal
+load appends it without replacing existing entries and asks for one game restart.
 
 ## Runtime order
 
 The important ordering is:
 
 ```text
-real DXGI/NVAPI adapter
+Architecture setting (default Auto) / one-time hardware detection
         |
         v
 provider discovery and structural qualification
         |
         v
-sm_89 PTX -> sm_86 mapped-image retarget
+sm_89 PTX -> selected SM (Ada skips retargeting)
 hide competing sm_89 cubin
 lower provider minimum-architecture gate
         |
@@ -50,8 +65,8 @@ They are conservative by design:
 - only executable PE images with the expected provider ABI are candidates;
 - the fatbin parser accepts only known container/header shapes;
 - the PTX retargeter accepts only known selectable image layouts;
-- the `.target sm_89` edit must map to an independent LZ4 literal;
-- a full second decode must match the expected sm_86 PTX byte-for-byte;
+- each changed digit in `.target sm_89` must map to an independent LZ4 literal;
+- a full second decode must match the expected target PTX byte-for-byte;
 - competing sm_89 cubins are hidden from the visible container when present;
 - the architecture export and MFG comparisons are verified before writes;
 - every write records its original byte and memory protection for rollback.
@@ -72,12 +87,15 @@ The bridge deliberately does not expose a fake GPU process-wide:
 - vendor/device identity remains real;
 - VRAM and CUDA capability remain real;
 - HAGS is read from Windows and never spoofed;
-- `NvAPI_GPU_GetArchInfo` is changed from Ampere (`0x170`) to Ada (`0x190`) only
-  inside the matching DLSS-G requirement/lifecycle scope;
+- backport profiles expose `0x190` through `NvAPI_GPU_GetArchInfo` only inside
+  the matching DLSS-G requirement/lifecycle scope;
 - unrelated NVAPI calls and other Streamline features see the original adapter.
 
 The NGX requirement relaxation is similarly narrow. It is considered only after
-one supported Ampere adapter and exactly one prepared provider have been proven.
+the game adapter has been associated by LUID and exactly one provider is prepared.
+This association scopes the hook; it does not confirm the manually selected
+architecture. Early discovery is used only with a single NVIDIA GPU. With more
+than one, the bridge waits for the adapter passed to NGX.
 Unknown flags, errors from the original call, unknown minimum architectures, or
 ambiguous providers are preserved.
 
@@ -112,20 +130,19 @@ load notification while the loader lock is held.
 ## Temporal correction and MFG
 
 MFGAdaUnlock's midpoint correction remains the source of truth for MFG temporal
-placement. The only Ampere-specific change to that logic is allowing the same
-known temporal program after its PTX target has already been retargeted to
-sm_86.
+placement. The same known temporal program is accepted after retargeting to either
+`sm_86` or `sm_75`. Both the PTX directive and the fatbin entry retain that target
+when the temporal program is rebuilt.
 
 The existing MFGAdaUnlock frame-count and pacing code remains in control of
 `numFramesToGenerate` and the optional software pacing fallback.
 
 ## Failure model
 
-The Ampere path is fail-closed. A failed or unknown stage never authorizes the
-next stage. Important examples:
+Profile selection does not bypass provider validation:
 
-- unknown GPU -> no Ampere capability override;
-- more than one NVIDIA physical GPU -> no override;
+- unknown architecture in Auto -> no backport or multiplier override;
+- unresolved adapter LUID -> no scoped capability override;
 - unknown provider ABI/layout -> no provider patch;
 - incomplete transaction -> rollback and block;
 - provider changed after qualification -> no override;
@@ -133,5 +150,6 @@ next stage. Important examples:
 - unknown NGX requirement flags -> preserve the original result;
 - new provider discovered after FG feature creation -> refuse late mutation.
 
-This bias is intentional: a missing option is preferable to silently executing
-an unverified provider configuration.
+The original `Enabled` switch controls all profiles. There is no separate
+backport enable flag. `Enabled=0` and unresolved profiles leave native game
+requests and state values unchanged.

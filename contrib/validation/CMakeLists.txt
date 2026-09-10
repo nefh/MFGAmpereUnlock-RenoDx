@@ -8,7 +8,7 @@ include(CTest)
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
-foreach(test ampere_ptx_test temporal_composition_test ampere_caps_test)
+foreach(test architecture_test early_load_test ampere_ptx_test temporal_composition_test ampere_caps_test)
   add_executable(${test} "${TEST_ROOT}/${test}.cpp")
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
@@ -24,16 +24,27 @@ if(NOT WIN32)
     get_filename_component(name "${header}" NAME)
     configure_file("${header}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
-  foreach(name ampere_caps.hpp ampere_ngx.hpp ampere_policy.hpp)
+  foreach(name architecture.hpp ampere_caps.hpp ampere_ngx.hpp ampere_policy.hpp framecount.hpp)
     configure_file("${REPO_ROOT}/src/addons/mfgunlock/${name}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   add_executable(host_wrappers_test "${TEST_ROOT}/host_wrappers_test.cpp")
   target_include_directories(host_wrappers_test PRIVATE "${mock_dir}")
   add_test(NAME host_wrappers_test COMMAND host_wrappers_test)
+
+  add_executable(framecount_profile_test "${TEST_ROOT}/framecount_profile_test.cpp")
+  target_include_directories(framecount_profile_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME framecount_profile_test COMMAND framecount_profile_test)
 endif()
 
 add_executable(provider_state_test "${TEST_ROOT}/provider_state_test.cpp")
 target_include_directories(provider_state_test PRIVATE "${TEST_ROOT}/provider_mocks")
 add_test(NAME provider_state_test COMMAND provider_state_test)
+
+# Run the same composition cases against the actual runtime transform, not only
+# the inspector's portable copy.
+add_executable(temporal_runtime_test "${TEST_ROOT}/temporal_composition_test.cpp")
+target_compile_definitions(temporal_runtime_test PRIVATE MFG_TEST_RUNTIME_MIDPOINT=1)
+target_include_directories(temporal_runtime_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME temporal_runtime_test COMMAND temporal_runtime_test)
 
 add_executable(inspect_provider "${CMAKE_CURRENT_SOURCE_DIR}/tools/inspect_provider.cpp")

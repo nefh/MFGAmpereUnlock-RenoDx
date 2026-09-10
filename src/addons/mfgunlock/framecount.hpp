@@ -23,7 +23,7 @@
  *
  * The lever is slDLSSGSetOptions. It is not exported: the app obtains it
  * through slGetFeatureFunction (which sl.interposer.dll does export), so we
- * hook that, hand back a wrapper, and raise numFramesToGenerate in transit.
+ * hook the native entry and raise numFramesToGenerate in transit.
  *
  * DLSSGOptions::numFramesToGenerate counts GENERATED frames, not total:
  * 2x -> 1, 3x -> 2, 4x -> 3 (sl_dlss_g.h). The struct is passed by const
@@ -45,6 +45,7 @@
 
 #include <include/reshade.hpp>
 
+#include "./architecture.hpp"
 #include "./ngx_hook.hpp"
 
 namespace mfgunlock::framecount {
@@ -96,9 +97,8 @@ inline std::atomic<unsigned long long> g_ota_flags_before{0};
 // that is the moment to make sure -- and to refuse to force if we cannot.
 inline void (*g_ensure_pacing)() = nullptr;
 inline bool (*g_pacing_ready)() = nullptr;
-// Optional Ampere admission check. Null preserves the existing Ada path.
-// It covers provider retargeting, the temporal program and MFG arch gates;
-// pacing remains owned by the existing g_ensure_pacing path below.
+// Readiness of provider retargeting, the temporal program and MFG arch gates.
+// Pacing remains owned by g_ensure_pacing below.
 inline bool (*g_multi_frame_ready)() = nullptr;
 inline std::atomic_bool g_declined_backend{false};
 inline sl::Result (*g_on_init)(const sl::Preferences&, uint64_t,
@@ -140,7 +140,8 @@ inline sl::Result HookedInit(const sl::Preferences& pref, uint64_t sdk_version) 
 }
 inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_version) {
   if (g_real_init == nullptr) return sl::Result::eErrorNotInitialized;
-  if (!g_force_ota.load(std::memory_order_relaxed)) return g_real_init(pref, sdk_version);
+  if (!g_enabled.load() || !architecture::ActiveProfile() ||
+      !g_force_ota.load(std::memory_order_relaxed)) return g_real_init(pref, sdk_version);
 
   constexpr uint64_t kOta = static_cast<uint64_t>(sl::PreferenceFlags::eAllowOTA) |
                             static_cast<uint64_t>(sl::PreferenceFlags::eLoadDownloadedPlugins);
@@ -174,12 +175,12 @@ inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_
 inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
                                    const sl::DLSSGOptions& options) {
   if (g_real_set_options == nullptr) return sl::Result::eErrorNotInitialized;
+  const auto* profile = architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile) return g_real_set_options(viewport, options);
 
-    const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
-  // A game can request native 3x/4x without our force-multiplier path. On
-  // Ampere, never pass that through until the provider and temporal backend
-  // are ready. Keep native 2x available as the first execution milestone.
-  if (g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
+  const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
+  // Backported providers need temporal correction before a native 3x/4x request.
+  if (profile->NeedsRetarget() && g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
       options.numFramesToGenerate > 1) {
     bool ready = g_multi_frame_ready();
     if (ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
@@ -191,8 +192,7 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
       if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
         reshade::log::message(
             reshade::log::level::warning,
-            "mfgunlock: Ampere multi-frame backend is not ready; clamping the native "
-            "request to one generated frame (2x).");
+            "mfgunlock: provider not ready for MFG; using 2x.");
       }
       auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
       const uint32_t requested = options.numFramesToGenerate;
@@ -223,14 +223,13 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     return result;
   }
 
-    const uint32_t desired = multiplier - 1;  // generated frames, not total
+  const uint32_t desired = multiplier - 1;  // generated frames, not total
   const uint32_t requested = options.numFramesToGenerate;
   if (desired > 1 && g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
     if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
       reshade::log::message(
           reshade::log::level::warning,
-          "mfgunlock: NOT forcing 3x+ on Ampere -- provider retargeting, temporal "
-          "correction or the MFG arch gates are not ready. Leaving the game's request alone.");
+          "mfgunlock: provider not ready for MFG; multiplier unchanged.");
     }
     return g_real_set_options(viewport, options);
   }
@@ -317,6 +316,8 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
 inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
                                  const sl::DLSSGOptions* options) {
   if (g_real_get_state == nullptr) return sl::Result::eErrorNotInitialized;
+  if (!g_enabled.load() || !architecture::ActiveProfile())
+    return g_real_get_state(viewport, state, options);
 
   const sl::Result result = g_real_get_state(viewport, state, options);
   const unsigned int raw_result = static_cast<unsigned int>(result);
@@ -362,7 +363,7 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   }
   if (result != sl::Result::eOk || state.structVersion < sl::kStructVersion2) return result;
 
-    const unsigned int reported = state.numFramesToGenerateMax;
+  const unsigned int reported = state.numFramesToGenerateMax;
   g_runtime_max_generated.store(reported, std::memory_order_relaxed);
   if (g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
     if (state.numFramesToGenerateMax > 1) state.numFramesToGenerateMax = 1;
