@@ -153,6 +153,8 @@ inline void* LockResource(HGLOBAL handle) {
 }
 
 struct ID3D12GraphicsCommandList {};
+using VkInstance = void*;
+using VkPhysicalDevice = void*;
 
 struct DXGI_ADAPTER_DESC {
   UINT VendorId = 0;
@@ -262,6 +264,9 @@ NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(
     ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*, const NVSDK_NGX_Parameter*,
     PFN_NVSDK_NGX_ProgressCallback);
 NVSDK_NGX_Result NVSDK_NGX_D3D12_ReleaseFeature(NVSDK_NGX_Handle*);
+NVSDK_NGX_Result NVSDK_NGX_VULKAN_GetFeatureRequirements(
+    VkInstance, VkPhysicalDevice, const NVSDK_NGX_FeatureDiscoveryInfo*,
+    NVSDK_NGX_FeatureRequirement*);
 
 namespace sl {
 using Feature = uint32_t;

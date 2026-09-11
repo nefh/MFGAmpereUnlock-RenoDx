@@ -115,20 +115,22 @@ replace or claim authorship of either original contribution.
 ## Tested Games
 
 The **Ada** column preserves the upstream MFGAdaUnlock test results.
-The **Ampere** column is intentionally sparse for now: Cyberpunk 2077 is the first validated title.
+The **Ampere** column contains results personally validated on an RTX 3090.
 **Ampere testers wanted:** if you try one of these games on an RTX 30-series card, let me know how it goes.
 
 | Game | Ampere | Ada | Comment |
 | --- | --- | --- | --- |
 | S.T.A.L.K.E.R. 2: Heart of Chornobyl | | Working | |
 | God of War Ragnarök | | Working | |
+| Hogwarts Legacy | Working | | |
 | Death Stranding 2: On the Beach | | Working | |
-| Clair Obscur: Expedition 33 | | Working | |
+| Clair Obscur: Expedition 33 | Working | Working | |
 | The Last of Us Part II Remastered | | Working | |
 | Resident Evil Requiem | | Working | |
 | Assassin's Creed IV: Black Flag | | Working | |
 | PRAGMATA | | Working | |
 | Cyberpunk 2077 | Working | Working | |
+| Portal with RTX | Partial | | Native DLSS-G/MFG loads on Ampere; RTX Remix frame pacing remains unresolved |
 | Alan Wake 2 | | Working | |
 | Dragon's Dogma 2 | | Working | |
 | The Blood of Dawnwalker | | Maybe | |
@@ -137,6 +139,7 @@ The **Ampere** column is intentionally sparse for now: Cyberpunk 2077 is the fir
 | Marvel's Spider-Man 2 | | Working | |
 | Mortal Shell II | | Working | |
 | Resonance: A Plague Tale Legacy | | Working | |
+| A Plague Tale: Requiem | Working | | Legacy Streamline 1.x |
 | Black Myth: Wukong | | Working | |
 | Assetto Corsa Rally | | Working | |
 | Indiana Jones and the Great Circle | | Working | Launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
@@ -149,7 +152,7 @@ The **Ampere** column is intentionally sparse for now: Cyberpunk 2077 is the fir
 | Horizon Forbidden West | | Working | |
 | 007 The First Light | | Working | |
 
-The Ada results are inherited from upstream MFGAdaUnlock. Ampere results are just a new, blank column.
+The Ada results are inherited from upstream MFGAdaUnlock. Ampere results are specific to this fork.
 These are the games personally tested with this fork; this is not a claim of
 universal compatibility. Results may vary with the game version, DLSS and
 Streamline versions, GPU, drivers, and configuration.

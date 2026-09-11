@@ -90,6 +90,15 @@ NVSDK_NGX_Result EntryRequirements(IDXGIAdapter* adapter,
   return RealRequirements(adapter, discovery, output);
 }
 
+unsigned int g_vulkan_requirement_calls = 0;
+
+NVSDK_NGX_Result RealVulkanRequirements(VkInstance, VkPhysicalDevice,
+                                        const NVSDK_NGX_FeatureDiscoveryInfo* discovery,
+                                        NVSDK_NGX_FeatureRequirement* output) {
+  ++g_vulkan_requirement_calls;
+  return RealRequirements(nullptr, discovery, output);
+}
+
 unsigned int g_creates = 0;
 unsigned int g_evaluates = 0;
 unsigned int g_releases = 0;
@@ -281,6 +290,7 @@ int main() {
 
   auto& runtime = ampere_ngx::g_slots[0];
   runtime.requirements = RealRequirements;
+  runtime.vulkan_requirements = RealVulkanRequirements;
   runtime.create = RealCreate;
   runtime.evaluate = RealEvaluate;
   runtime.release = RealRelease;
@@ -358,6 +368,16 @@ int main() {
         "entry trampoline preferred once");
   runtime.entry_requirements = nullptr;
 
+  ampere_ngx::g_bound_gpu = g_gpu;
+  g_requirement_flags = ampere::kAdapterUnsupported;
+  g_requirement_architecture = ampere::kAdaArchitecture;
+  const auto vulkan_calls_before = g_vulkan_requirement_calls;
+  ampere_ngx::VulkanRequirements<0>(nullptr, nullptr, &discovery, &requirements);
+  Check(g_vulkan_requirement_calls == vulkan_calls_before + 1 &&
+            requirements.FeatureSupported == 0 &&
+            requirements.MinHWArchitecture == ampere::kAmpereArchitecture,
+        "Vulkan NGX requirements use the same architecture policy");
+
   NVSDK_NGX_Handle* output_handle = nullptr;
   g_create_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
   Check(ampere_ngx::Create<0>(nullptr, NVSDK_NGX_Feature_FrameGeneration, nullptr,
@@ -429,22 +449,30 @@ int main() {
         "init error preserved");
   Check(preferences.flags == original_flags, "OTA flags preserved");
 
-  auto plugin_module = Module(0x1234);
-  SetVersion(plugin_module, 2, 7);
-  Check(ampere_caps::KnownStreamline(plugin_module), "v2.7 resource recognized");
-  SetVersion(plugin_module, 2, 12);
-  Check(ampere_caps::KnownStreamline(plugin_module), "v2.12 resource recognized");
-  SetVersion(plugin_module, 3, 0);
-  Check(!ampere_caps::KnownStreamline(plugin_module), "v3 refused");
+  hook::UninstallAddress(ampere_ngx::g_arch_hook);
+  constexpr uint64_t kOlderStreamlineSdk = (1ull << 48) | (5ull << 32) | 4ull;
+  Check(ampere::caps::OnInit(preferences, kOlderStreamlineSdk, RealInit) == g_sl_result &&
+            ampere_ngx::g_arch_hook.installed.load(),
+        "older Streamline slInit still runs capability preflight");
+  Check(preferences.flags == original_flags, "older Streamline preferences remain untouched");
 
-  SetVersion(plugin_module, 2, 12);
+  auto plugin_module = Module(0x1234);
+  SetVersion(plugin_module, 1, 5);
+  auto plugin_version = ampere_caps::ReadModuleVersion(plugin_module);
+  Check(plugin_version.major == 1 && plugin_version.minor == 5,
+        "older Streamline version remains diagnostic data");
+
   const auto full_resource = mock::resources[plugin_module];
   for (size_t size = 0; size < full_resource.size(); ++size) {
     mock::resources[plugin_module] = {full_resource.begin(), full_resource.begin() + size};
-    Check(!ampere_caps::KnownStreamline(plugin_module), "truncated version rejected");
+    plugin_version = ampere_caps::ReadModuleVersion(plugin_module);
+    Check(plugin_version.major == 0 && plugin_version.minor == 0,
+          "truncated version resource rejected safely");
   }
-  mock::resources[plugin_module] = full_resource;
+  mock::resources.erase(plugin_module);
 
+  // Version information is diagnostic only. The native function table is the
+  // admission check for the DLSS-G plugin, even without version metadata.
   auto bound = ampere_caps::BindPlugin(plugin_module, Proc(RealGateway));
   Check(bound == Proc(RealGateway), "native gateway pointer preserved");
   auto& plugin = ampere_caps::g_plugins[0];
@@ -510,6 +538,8 @@ int main() {
   mock::exports[{ngx_module, "NVSDK_NGX_D3D12_CreateFeature"}] = Proc(RealCreate);
   mock::exports[{ngx_module, "NVSDK_NGX_D3D12_EvaluateFeature"}] = Proc(RealEvaluate);
   mock::exports[{ngx_module, "NVSDK_NGX_D3D12_ReleaseFeature"}] = Proc(RealRelease);
+  mock::exports[{ngx_module, "NVSDK_NGX_VULKAN_GetFeatureRequirements"}] =
+      Proc(RealVulkanRequirements);
 
   auto resolved = ampere::ngx::Resolve(ngx_module, "NVSDK_NGX_D3D12_GetFeatureRequirements",
                                        Proc(RealRequirements));
@@ -524,7 +554,19 @@ int main() {
   mock::install_ok = true;
   ampere::ngx::EnsureEntryHooks();
   Check(runtime.entries_installed && runtime.entry_requirements != nullptr,
-        "entry coverage installed");
+        "D3D12 entry coverage installed");
+  Check(runtime.vulkan_requirements_installed && runtime.entry_vulkan_requirements != nullptr,
+        "Vulkan requirements entry installed");
+
+  auto vulkan_only_module = Module(0x7777);
+  mock::paths[vulkan_only_module] = L"X:\\fixture\\nvngx.dll";
+  mock::modules[L"nvngx.dll"] = vulkan_only_module;
+  mock::exports[{vulkan_only_module, "NVSDK_NGX_VULKAN_GetFeatureRequirements"}] =
+      Proc(RealVulkanRequirements);
+  ampere::ngx::EnsureEntryHooks();
+  Check(ampere_ngx::g_slots[1].vulkan_requirements_installed &&
+            !ampere_ngx::g_slots[1].entries_installed,
+        "Vulkan requirements do not depend on D3D12 exports");
 
   unsigned int install_calls = mock::installs;
   ampere::ngx::EnsureEntryHooks();
@@ -532,26 +574,39 @@ int main() {
 
   auto streamline_module = Module(0x8888);
   mock::modules[L"sl.interposer.dll"] = streamline_module;
-  SetVersion(streamline_module, 2, 7);
+  SetVersion(streamline_module, 1, 5);
+  Check(!ampere::caps::CanHookInit(streamline_module), "slInit requires the actual export");
+  mock::exports[{streamline_module, "slInit"}] = Proc(RealInit);
+  Check(ampere::caps::CanHookInit(streamline_module),
+        "slInit admission depends on the export, not the Streamline version");
   mock::exports[{streamline_module, "slIsFeatureSupported"}] = Proc(RealSupport);
-  mock::exports[{streamline_module, "slIsFeatureLoaded"}] = Proc(RealLoaded);
-  mock::exports[{streamline_module, "slGetFeatureRequirements"}] = Proc(RealSlRequirements);
-  mock::exports[{streamline_module, "slGetFeatureVersion"}] = Proc(RealVersion);
 
   ampere_caps::g_real_support = nullptr;
   ampere_caps::g_real_loaded = nullptr;
   ampere_caps::g_real_requirements = nullptr;
   ampere_caps::g_real_version = nullptr;
+  ampere_caps::g_observers_installed = false;
   ampere_caps::InstallObservers();
-  Check(ampere_caps::g_observers_installed.load(), "native SL observation detours installed");
+  Check(ampere_caps::g_observers_installed.load() && ampere_caps::g_real_support != nullptr &&
+            ampere_caps::g_real_loaded == nullptr && ampere_caps::g_real_requirements == nullptr &&
+            ampere_caps::g_real_version == nullptr,
+        "available Streamline observer installs without a version whitelist");
+
+  mock::exports[{streamline_module, "slIsFeatureLoaded"}] = Proc(RealLoaded);
+  mock::exports[{streamline_module, "slGetFeatureRequirements"}] = Proc(RealSlRequirements);
+  mock::exports[{streamline_module, "slGetFeatureVersion"}] = Proc(RealVersion);
+  ampere_caps::InstallObservers();
+  Check(ampere_caps::g_real_loaded != nullptr && ampere_caps::g_real_requirements != nullptr &&
+            ampere_caps::g_real_version != nullptr,
+        "later Streamline exports are picked up independently");
 
   install_calls = mock::installs;
   ampere_caps::InstallObservers();
   Check(mock::installs == install_calls, "SL observers install idempotent");
 
   ampere::caps::Draw();
-  Check(g_loads == 2 && g_startups == 2 && g_init_calls == 1,
-        "lifecycle called exactly once");
+  Check(g_loads == 2 && g_startups == 2 && g_init_calls == 2,
+        "lifecycle calls reach the native functions exactly once per invocation");
 
   // Tear down the entry hooks and check that native resolver results remain usable.
   auto native_gateway = reinterpret_cast<ampere_caps::GatewayFn>(bound);
@@ -561,9 +616,21 @@ int main() {
         "lifecycle hooks detached");
   Check(native_gateway("slDLSSGSetOptions") == RealGateway("slDLSSGSetOptions"),
         "cached native gateway remains valid after detach");
-  Check(!runtime.entries_installed && ampere_ngx::g_bound_gpu.load() == nullptr,
+  Check(!runtime.entries_installed && !runtime.vulkan_requirements_installed &&
+            ampere_ngx::g_bound_gpu.load() == nullptr,
         "NGX hooks and adapter binding cleared");
   ampere::ngx::g_shutting_down = false;
+
+  architecture::Configure(Architecture::kAuto);
+  g_physical_count = 1;
+  g_arch_status = 0;
+  g_architecture = ampere::kAmpereArchitecture;
+  const auto auto_detect_calls = g_arch_calls;
+  ampere::ngx::DetectArchitecture();
+  Check(architecture::ActiveProfile() == &architecture::kAmpere &&
+            ampere_ngx::g_bound_gpu.load() == nullptr &&
+            g_arch_calls == auto_detect_calls + 1,
+        "Auto detects a single NVIDIA GPU without Streamline or an NGX adapter binding");
 
   // Exercise the same real wrappers for both explicit backport profiles.
   runtime.requirements = RealRequirements;

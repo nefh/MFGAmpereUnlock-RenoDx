@@ -9,9 +9,8 @@
  * DetourUpdateThread is the documented answer: every thread that might be
  * executing the patched code must be registered with the transaction so Detours
  * can suspend it and fix up its instruction pointer. Registering only
- * GetCurrentThread() is correct only when the target is idle, and _nvngx.dll is
- * not idle -- we patch it from the ReShade present callback while the render
- * thread is calling DLSS through it.
+ * GetCurrentThread() is sufficient only when no other thread can execute the
+ * target. Late module discovery does not provide that guarantee.
  */
 
 #pragma once
@@ -73,7 +72,7 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
                     const char* module_label) {
   if (module == nullptr) return false;
 
-  std::vector<std::pair<void**, void*>> resolved;
+  std::vector<std::tuple<void**, void*, void*>> resolved;
   resolved.reserve(hooks.size());
   for (const auto& [name, real, replacement] : hooks) {
     FARPROC proc = GetProcAddress(module, name);
@@ -85,14 +84,13 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
       return false;
     }
     if (*real != nullptr) return false;  // already installed
-    *real = reinterpret_cast<void*>(proc);
-    resolved.emplace_back(real, replacement);
+    resolved.emplace_back(real, replacement, reinterpret_cast<void*>(proc));
   }
 
-  if (DetourTransactionBegin() != NO_ERROR) {
-    for (auto& [real, unused] : resolved) *real = nullptr;
-    return false;
-  }
+  if (DetourTransactionBegin() != NO_ERROR) return false;
+  // Publish only after every export has been resolved. A missing optional
+  // export must not leave an unhooked address looking like an installed hook.
+  for (auto& [real, replacement, address] : resolved) *real = address;
 
   auto threads = internal::OpenOtherThreads();
   bool threads_ok = true;
@@ -104,7 +102,7 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
   if (!threads_ok) {
     DetourTransactionAbort();
     for (HANDLE h : threads) CloseHandle(h);
-    for (auto& [real, unused] : resolved) *real = nullptr;
+    for (auto& [real, replacement, address] : resolved) *real = nullptr;
     reshade::log::message(
         reshade::log::level::error,
         "mfgunlock::hook: could not register every thread with the Detours "
@@ -114,7 +112,7 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
   }
 
   bool ok = true;
-  for (auto& [real, replacement] : resolved) {
+  for (auto& [real, replacement, address] : resolved) {
     if (DetourAttach(real, replacement) != NO_ERROR) {
       ok = false;
       break;
@@ -124,7 +122,7 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
   if (!ok || DetourTransactionCommit() != NO_ERROR) {
     if (!ok) DetourTransactionAbort();
     for (HANDLE h : threads) CloseHandle(h);
-    for (auto& [real, unused] : resolved) *real = nullptr;
+    for (auto& [real, replacement, address] : resolved) *real = nullptr;
     std::stringstream s;
     s << "mfgunlock::hook: failed to install hooks in " << module_label << ".";
     reshade::log::message(reshade::log::level::error, s.str().c_str());

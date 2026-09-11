@@ -1,39 +1,17 @@
 /*
- * Advertising and forcing the requested frame multiplier.
+ * DLSS-G frame-count policy.
  * SPDX-License-Identifier: MIT
  *
- * ---------------------------------------------------------------------------
- * WHY THIS EXISTS
- *
- * Two different kinds of game need two different things.
- *
- * Cyberpunk 2077 and GTA V Enhanced have their own 2x/3x/4x selector. Once the
- * runtime reports the added capacity, the game asks for 3x or 4x by itself.
- * Forcing anything would override the player's own choice, so this is OFF by
- * default. STALKER 2 also has a native selector, but builds it from
- * slDLSSGGetState::numFramesToGenerateMax. That return value is raised to the
- * wrapper ceiling verified by addon.cpp so 3x/4x actually appear in its menu.
- *
- * Deep Rock Galactic (and anything else where frame generation is just a
- * on/off toggle) will only ever ask for 1 generated frame, no matter how
- * capable the runtime claims to be. Nothing downstream can help: sl.dlss_g
- * loops numFramesToGenerate times, so a request of 1 produces exactly one
- * generated frame. This is the job the NVIDIA App does for 50-series users via
- * a driver registry setting -- overriding the request, not the capability.
- *
- * The lever is slDLSSGSetOptions. It is not exported: the app obtains it
- * through slGetFeatureFunction (which sl.interposer.dll does export), so we
- * hook the native entry and raise numFramesToGenerate in transit.
- *
- * DLSSGOptions::numFramesToGenerate counts GENERATED frames, not total:
- * 2x -> 1, 3x -> 2, 4x -> 3 (sl_dlss_g.h). The struct is passed by const
- * reference; the wrapper raises the value, calls through, and puts the caller's
- * field back exactly as it found it rather than leaving a surprise behind.
- * ---------------------------------------------------------------------------
+ * Capability advertising and request forcing are separate. Hosts with a native
+ * multiplier selector only need the verified maximum exposed through GetState;
+ * hosts with an on/off control can optionally have numFramesToGenerate raised
+ * at slDLSSGSetOptions. The caller-owned options structure is always restored
+ * before returning.
  */
 
 #pragma once
 
+#include <vector>
 #include <windows.h>
 
 #include <atomic>
@@ -52,49 +30,30 @@ namespace mfgunlock::framecount {
 
 // 0 = leave the game's request alone. 2..5 = force that multiplier.
 inline std::atomic<unsigned int> g_force_multiplier{0};
-inline std::atomic_bool g_hooked{false};
+inline std::atomic_bool g_feature_function_hooked{false};
+inline std::atomic_bool g_init_hooked{false};
 inline std::atomic_bool g_intercepted{false};
 inline std::atomic<unsigned int> g_last_requested{0};
 inline std::atomic<unsigned int> g_last_forced{0};
 inline std::atomic_bool g_declined_no_pacing{false};
 inline std::atomic<unsigned int> g_force_failed_for{0};
-inline std::atomic<unsigned int> g_last_result{0};
-inline std::atomic_bool g_native_request_seen{false};
-inline std::atomic<unsigned int> g_native_requested{0};
-inline std::atomic<unsigned int> g_native_result{0};
 inline std::atomic_bool g_state_seen{false};
-inline std::atomic<unsigned int> g_state_result{0};
 inline std::atomic<unsigned int> g_dlssg_status{0};
-inline std::atomic_bool g_status_ok_logged{false};
 inline std::atomic_bool g_failure_status_logged{false};
-inline std::atomic<unsigned int> g_actual_frames_presented{0};
-inline std::atomic<unsigned int> g_max_actual_frames_presented{0};
-inline std::atomic<unsigned long long> g_state_samples{0};
-inline std::atomic<unsigned int> g_seen_present_counts{0};
 
-// Published by addon.cpp only after the active Streamline wrapper's pacing and
-// hard ceiling have both been verified. Games such as STALKER 2 build their
-// native 2x/3x/4x selector from DLSSGState::numFramesToGenerateMax rather than
-// from the NGX parameter block, so the SetOptions hook alone cannot expose the
-// additional choices.
+// Published by addon.cpp after the active Streamline wrapper's pacing and hard
+// ceiling have been verified. Native multiplier selectors may read this value
+// from DLSSGState rather than from the NGX parameter block.
 inline std::atomic<unsigned int> g_advertised_max_generated{0};
 inline std::atomic_bool g_capacity_advertised{false};
 inline std::atomic<unsigned int> g_runtime_max_generated{0};
 
-// Whether to re-enable Streamline's OTA plugin loading at slInit.
-// OFF by default. GTA V Enhanced drops the OTA flags, and forcing them only
-// matters if a newer plugin would then load -- which crashes that game. Its
-// 2.9.1.0 plugin clamps to 3 generated frames (4x) and that is its real limit.
+// Optional compatibility path for hosts that suppress Streamline OTA plugins.
 inline std::atomic_bool g_force_ota{false};
-inline std::atomic_bool g_ota_forced{false};
-inline std::atomic<unsigned long long> g_ota_flags_before{0};
 
-// Asking for more than one generated frame while hardware flip metering is
-// still enabled is the frozen-presentation failure, and the ordering makes that
-// easy to walk into: the DLSS-G plugin is not loaded until the feature starts,
-// so the pacing patch cannot land until after the game has already been
-// configured. By the time slDLSSGSetOptions is called the plugin IS loaded, so
-// that is the moment to make sure -- and to refuse to force if we cannot.
+// More than one generated frame requires software pacing on backported
+// providers. slDLSSGSetOptions is the first point where the plugin is guaranteed
+// to be loaded, so verify pacing there before raising the request.
 inline void (*g_ensure_pacing)() = nullptr;
 inline bool (*g_pacing_ready)() = nullptr;
 // Readiness of provider retargeting, the temporal program and MFG arch gates.
@@ -120,24 +79,6 @@ inline std::atomic_bool g_entry_shutting_down{false};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
 
-// Which sl.dlss_g the game ends up using is decided here, not on disk.
-//
-// Streamline can load plugins the driver has downloaded into
-// C:\ProgramData\NVIDIA\NGX\models\sl_dlss_g_0\versions\... but only if the
-// app asks for it at slInit. Cyberpunk and Deep Rock Galactic do, which is why
-// both silently run a 2.12.129.0 plugin regardless of the (much older) copies
-// sitting in their folders. GTA V Enhanced does not, so it is stuck with
-// whatever is on disk beside it -- and that copy was clamped to 3 generated
-// frames.
-//
-// Both flags are in the SDK's own default; the app has to actively drop them.
-// Putting them back is a far better answer than shipping DLLs by hand, because
-// the driver then supplies a matched, signed, current plugin set.
-inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_version);
-inline sl::Result HookedInit(const sl::Preferences& pref, uint64_t sdk_version) {
-  return g_on_init ? g_on_init(pref, sdk_version, InitWithPreferences)
-                   : InitWithPreferences(pref, sdk_version);
-}
 inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_version) {
   if (g_real_init == nullptr) return sl::Result::eErrorNotInitialized;
   if (!g_enabled.load() || !architecture::ActiveProfile() ||
@@ -145,31 +86,24 @@ inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_
 
   constexpr uint64_t kOta = static_cast<uint64_t>(sl::PreferenceFlags::eAllowOTA) |
                             static_cast<uint64_t>(sl::PreferenceFlags::eLoadDownloadedPlugins);
-
   auto& mutable_pref = const_cast<sl::Preferences&>(pref);
-  const uint64_t before = static_cast<uint64_t>(mutable_pref.flags);
-  if ((before & kOta) == kOta) {
-    g_ota_flags_before.store(before, std::memory_order_relaxed);
-    reshade::log::message(reshade::log::level::info,
-                          "mfgunlock: slInit already requests OTA plugins; nothing to change.");
-    return g_real_init(pref, sdk_version);
-  }
+  const auto original = mutable_pref.flags;
+  if ((static_cast<uint64_t>(original) & kOta) == kOta) return g_real_init(pref, sdk_version);
 
-  mutable_pref.flags = static_cast<sl::PreferenceFlags>(before | kOta);
+  mutable_pref.flags = static_cast<sl::PreferenceFlags>(static_cast<uint64_t>(original) | kOta);
   const sl::Result result = g_real_init(pref, sdk_version);
-  mutable_pref.flags = static_cast<sl::PreferenceFlags>(before);
-
-  g_ota_flags_before.store(before, std::memory_order_relaxed);
-  g_ota_forced.store(result == sl::Result::eOk, std::memory_order_relaxed);
-
-  std::stringstream s;
-  s << "mfgunlock: slInit flags 0x" << std::hex << before << " -> 0x" << (before | kOta) << std::dec
-    << " (eAllowOTA | eLoadDownloadedPlugins) so the driver's OTA plugin set is used"
-    << (result == sl::Result::eOk ? "." : " -- but slInit returned an error, so this had no effect.");
+  mutable_pref.flags = original;
   reshade::log::message(result == sl::Result::eOk ? reshade::log::level::info
                                                   : reshade::log::level::warning,
-                        s.str().c_str());
+                       result == sl::Result::eOk
+                           ? "mfgunlock: Streamline OTA plugin loading enabled for this slInit call."
+                           : "mfgunlock: slInit failed after enabling Streamline OTA plugin loading.");
   return result;
+}
+
+inline sl::Result HookedInit(const sl::Preferences& pref, uint64_t sdk_version) {
+  return g_on_init ? g_on_init(pref, sdk_version, InitWithPreferences)
+                   : InitWithPreferences(pref, sdk_version);
 }
 
 inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
@@ -202,26 +136,8 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
       return result;
     }
   }
-  if (multiplier < 2 || options.mode == sl::DLSSGMode::eOff) {
-    const sl::Result result = g_real_set_options(viewport, options);
-    if (options.mode != sl::DLSSGMode::eOff) {
-      const unsigned int requested = options.numFramesToGenerate;
-      const unsigned int previous = g_native_requested.exchange(requested, std::memory_order_relaxed);
-      const unsigned int raw_result = static_cast<unsigned int>(result);
-      const unsigned int previous_result =
-          g_native_result.exchange(raw_result, std::memory_order_relaxed);
-      const bool first = !g_native_request_seen.exchange(true, std::memory_order_relaxed);
-      if (first || previous != requested || previous_result != raw_result) {
-        std::stringstream s;
-        s << "mfgunlock: native slDLSSGSetOptions requested numFramesToGenerate=" << requested
-          << " (" << (requested + 1) << "x) and returned sl::Result " << raw_result << ".";
-        reshade::log::message(result == sl::Result::eOk ? reshade::log::level::info
-                                                       : reshade::log::level::warning,
-                              s.str().c_str());
-      }
-    }
-    return result;
-  }
+  if (multiplier < 2 || options.mode == sl::DLSSGMode::eOff)
+    return g_real_set_options(viewport, options);
 
   const uint32_t desired = multiplier - 1;  // generated frames, not total
   const uint32_t requested = options.numFramesToGenerate;
@@ -254,24 +170,16 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     }
   }
 
-  // Raise it for the duration of the call, then restore. The caller owns this
-  // struct and may well reuse it; leaving it modified would be a side effect
-  // nobody asked for.
+  // The caller owns this structure, so restore it before returning.
   auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
   mutable_options.numFramesToGenerate = desired;
   sl::Result result = g_real_set_options(viewport, options);
   mutable_options.numFramesToGenerate = requested;
 
-  // A rejected call means frame generation just stays off, which looks exactly
-  // like "the mod broke FG". Never leave the game worse than we found it: if
-  // the runtime refuses the raised count, put the original request through so
-  // the player still gets the frame generation they asked for.
+  // Fall back to the original request if the raised count is rejected.
   if (result != sl::Result::eOk) {
-    // eErrorFeatureManagerInvalidState is not "your count is too high" -- it can
-    // simply mean DLSS-G was not ready yet. Retry once with the SAME raised
-    // count: if that succeeds the first failure was transient state, and
-    // dropping straight back to the game's request would have silently given up
-    // a working 4x. Only if the retry fails too is the count really refused.
+    // The feature manager can reject the first call while still initializing.
+    // Retry the same request once before treating the count as unsupported.
     mutable_options.numFramesToGenerate = desired;
     const sl::Result retry = g_real_set_options(viewport, options);
     mutable_options.numFramesToGenerate = requested;
@@ -284,7 +192,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
           << " on retry -- that first failure was feature-manager state, not the count.";
         reshade::log::message(reshade::log::level::info, s.str().c_str());
       }
-      g_last_result.store(static_cast<unsigned int>(retry), std::memory_order_relaxed);
       g_last_forced.store(desired, std::memory_order_relaxed);
       return retry;
     }
@@ -297,7 +204,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
         << requested << ". The count itself is being refused, not a transient state.";
       reshade::log::message(reshade::log::level::warning, s.str().c_str());
     }
-    g_last_result.store(static_cast<unsigned int>(retry), std::memory_order_relaxed);
     return g_real_set_options(viewport, options);
   }
 
@@ -308,7 +214,6 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
       << (requested + 1) << "x. slDLSSGSetOptions accepted it.";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  g_last_result.store(static_cast<unsigned int>(result), std::memory_order_relaxed);
   g_last_forced.store(desired, std::memory_order_relaxed);
   return result;
 }
@@ -320,45 +225,14 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
     return g_real_get_state(viewport, state, options);
 
   const sl::Result result = g_real_get_state(viewport, state, options);
-  const unsigned int raw_result = static_cast<unsigned int>(result);
-  g_state_result.store(raw_result, std::memory_order_relaxed);
   if (result == sl::Result::eOk) {
     const unsigned int status = static_cast<unsigned int>(state.status);
     g_dlssg_status.store(status, std::memory_order_relaxed);
-    const unsigned int presented = state.numFramesActuallyPresented;
-    const unsigned int previous =
-        g_actual_frames_presented.exchange(presented, std::memory_order_relaxed);
-    unsigned int observed_max = g_max_actual_frames_presented.load(std::memory_order_relaxed);
-    while (presented > observed_max &&
-           !g_max_actual_frames_presented.compare_exchange_weak(
-               observed_max, presented, std::memory_order_relaxed)) {
-    }
-    g_state_samples.fetch_add(1, std::memory_order_relaxed);
-    const bool first = !g_state_seen.exchange(true, std::memory_order_relaxed);
-    bool log_status = false;
-    if (status == 0) {
-      log_status = !g_status_ok_logged.exchange(true, std::memory_order_relaxed);
-    } else {
-      log_status = !g_failure_status_logged.exchange(true, std::memory_order_relaxed);
-    }
-    if (log_status) {
-      std::stringstream s;
-      s << "mfgunlock: slDLSSGGetState runtime status is 0x" << std::hex << status << std::dec
-        << (status == 0 ? " (OK)." : " (DLSS-G reported one or more failure flags).");
-      reshade::log::message(status == 0 ? reshade::log::level::info
-                                        : reshade::log::level::warning,
-                            s.str().c_str());
-    }
-    if (first || previous != presented) {
-      const unsigned int bit = presented < 32 ? (1u << presented) : 0u;
-      const unsigned int seen =
-          bit == 0 ? ~0u : g_seen_present_counts.fetch_or(bit, std::memory_order_relaxed);
-      if (first || (seen & bit) == 0) {
-        std::stringstream s;
-        s << "mfgunlock: slDLSSGGetState reports " << presented
-          << " frame(s) actually presented since its previous call.";
-        reshade::log::message(reshade::log::level::info, s.str().c_str());
-      }
+    g_state_seen.store(true, std::memory_order_relaxed);
+    if (status != 0 && !g_failure_status_logged.exchange(true, std::memory_order_relaxed)) {
+      std::stringstream message;
+      message << "mfgunlock: DLSS-G runtime status 0x" << std::hex << status;
+      reshade::log::message(reshade::log::level::warning, message.str().c_str());
     }
   }
   if (result != sl::Result::eOk || state.structVersion < sl::kStructVersion2) return result;
@@ -420,44 +294,53 @@ inline sl::Result HookedGetFeatureFunction(sl::Feature feature, const char* func
   return result;
 }
 
-inline const std::vector<hook::HookItem> kInterposerHooks = {
+inline const std::vector<hook::HookItem> kFeatureFunctionHook = {
     {"slGetFeatureFunction", reinterpret_cast<void**>(&g_real_get_feature_function),
      reinterpret_cast<void*>(&HookedGetFeatureFunction)},
 };
 
-// slInit is armed for OTA or an explicit native capability callback.
-inline const std::vector<hook::HookItem> kInterposerHooksWithOta = {
-    {"slGetFeatureFunction", reinterpret_cast<void**>(&g_real_get_feature_function),
-     reinterpret_cast<void*>(&HookedGetFeatureFunction)},
+// This is the SL 2.x signature. Legacy startup is handled by ampere_caps.hpp.
+inline const std::vector<hook::HookItem> kInitHook = {
     {"slInit", reinterpret_cast<void**>(&g_real_init), reinterpret_cast<void*>(&HookedInit)},
 };
 
-inline const std::vector<hook::HookItem>* g_installed_hooks = nullptr;
-
 }  // namespace internal
 
-// Must land before the game asks for the function pointer, which it does once
-// during DLSS-G setup -- hence installing from the earliest event we get rather
-// than waiting for a present.
+// Install before the host caches DLSS-G function pointers.
 inline void TryInstall() {
-  if (g_hooked.load(std::memory_order_acquire)) return;
+  static thread_local bool installing = false;
+  if (installing) return;
+  installing = true;
+  struct Guard {
+    ~Guard() { installing = false; }
+  } guard;
   HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
   if (interposer == nullptr) return;
-  if (GetProcAddress(interposer, "slGetFeatureFunction") == nullptr) return;
-  const bool observe_init = g_on_init && g_init_compatible && g_init_compatible(interposer);
-  const auto* hooks = (g_force_ota.load(std::memory_order_relaxed) || observe_init)
-                          ? &internal::kInterposerHooksWithOta
-                          : &internal::kInterposerHooks;
-  if (!hook::Install(interposer, *hooks, "sl.interposer.dll")) return;
-  internal::g_installed_hooks = hooks;
-  g_hooked.store(true, std::memory_order_release);
+
+  if (!g_feature_function_hooked.load(std::memory_order_acquire) &&
+      GetProcAddress(interposer, "slGetFeatureFunction") != nullptr &&
+      hook::Install(interposer, internal::kFeatureFunctionHook, "sl.interposer.dll")) {
+    g_feature_function_hooked.store(true, std::memory_order_release);
+  }
+
+  const bool compatible_init = g_init_compatible ? g_init_compatible(interposer)
+      : GetProcAddress(interposer, "slGetFeatureFunction") != nullptr;
+  const bool observe_init = g_on_init && compatible_init;
+  const bool alter_init = g_force_ota.load(std::memory_order_relaxed) && compatible_init;
+  if (!g_init_hooked.load(std::memory_order_acquire) && (observe_init || alter_init) &&
+      GetProcAddress(interposer, "slInit") != nullptr &&
+      hook::Install(interposer, internal::kInitHook, "sl.interposer.dll")) {
+    g_init_hooked.store(true, std::memory_order_release);
+  }
 }
 
 inline void Uninstall() {
   internal::g_entry_shutting_down.store(true, std::memory_order_release);
-  if (internal::g_installed_hooks != nullptr) hook::Uninstall(*internal::g_installed_hooks);
-  internal::g_installed_hooks = nullptr;
-  g_hooked.store(false, std::memory_order_release);
+  if (g_init_hooked.load(std::memory_order_acquire)) hook::Uninstall(internal::kInitHook);
+  if (g_feature_function_hooked.load(std::memory_order_acquire))
+    hook::Uninstall(internal::kFeatureFunctionHook);
+  g_init_hooked.store(false, std::memory_order_release);
+  g_feature_function_hooked.store(false, std::memory_order_release);
 
   hook::UninstallAddress(internal::g_get_state_entry);
   hook::UninstallAddress(internal::g_set_options_entry);

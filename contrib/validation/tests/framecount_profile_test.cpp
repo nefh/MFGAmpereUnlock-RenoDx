@@ -37,6 +37,10 @@ sl::Result Init(const sl::Preferences& pref, uint64_t) {
   g_seen_flags = static_cast<uint32_t>(pref.flags);
   return sl::Result::eOk;
 }
+sl::Result ObserveInit(const sl::Preferences& pref, uint64_t sdk,
+                       sl::Result (*next)(const sl::Preferences&, uint64_t)) {
+  return next(pref, sdk);
+}
 void Reset(Architecture mode) {
   architecture::Configure(mode);
   g_enabled = true;
@@ -119,5 +123,28 @@ int main() {
   fc::internal::InitWithPreferences(preferences, sl::kSDKVersion);
   Check(g_seen_flags != 0 && static_cast<uint32_t>(preferences.flags) == 0,
         "existing OTA option applies only during the native call");
+
+  // Streamline 1.x can expose slInit without slGetFeatureFunction. That still
+  // has to arm the capability preflight instead of rejecting the host.
+  const auto legacy_module = reinterpret_cast<HMODULE>(0x5151);
+  mock::modules[L"sl.interposer.dll"] = legacy_module;
+  mock::exports[{legacy_module, "slInit"}] = reinterpret_cast<FARPROC>(Init);
+  fc::g_on_init = ObserveInit;
+  fc::g_init_compatible = [](HMODULE) { return true; };
+  fc::g_force_ota = false;
+  fc::g_hooked = false;
+  fc::g_feature_function_hooked = false;
+  fc::g_init_hooked = false;
+  fc::internal::g_real_get_feature_function = nullptr;
+  fc::internal::g_real_init = nullptr;
+  mock::install_ok = true;
+  fc::TryInstall();
+  Check(fc::g_hooked.load() && fc::g_init_hooked.load() &&
+            !fc::g_feature_function_hooked.load() && fc::internal::g_real_init == Init,
+        "legacy Streamline installs slInit without slGetFeatureFunction");
+  fc::Uninstall();
+  Check(!fc::g_hooked.load() && !fc::g_init_hooked.load(),
+        "legacy Streamline hook unloads cleanly");
+
   std::printf("PASS frame-count profiles: %u checks\n", g_checks);
 }

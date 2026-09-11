@@ -66,7 +66,6 @@ struct Rejection {
 inline SRWLOCK g_lock = SRWLOCK_INIT;
 inline std::vector<Provider> g_providers;
 inline std::vector<Rejection> g_rejected;
-inline std::atomic_uint g_ignored_mappings{0};
 inline std::atomic_bool g_registry_failed{false};
 
 inline bool IsReadable(const void* pointer, size_t bytes, HMODULE allocation) {
@@ -234,25 +233,14 @@ inline bool Undo(Provider& provider) {
 struct ProviderStatus {
   unsigned ready = 0;
   unsigned blocked = 0;
-  unsigned expired_rejections = 0;
-  unsigned ignored_mappings = 0;
   bool busy = false;
   bool failed = false;
   unsigned int QualifiedCount() const {
     return busy || failed || blocked ? 0 : ready;
   }
-  const char* Reason() const {
-    if (busy) return "provider-registry-busy";
-    if (failed) return "provider-registry-failed";
-    if (blocked) return "active-provider-rejected-or-invalidated";
-    if (ready > 1) return "multiple-prepared-providers";
-    if (!ready) return "no-prepared-provider";
-    return "one-prepared-provider";
-  }
 };
 inline ProviderStatus GetProviderStatus() {
   ProviderStatus result;
-  result.ignored_mappings = internal::g_ignored_mappings.load();
   result.failed = internal::g_registry_failed.load();
   if (!TryAcquireSRWLockShared(&internal::g_lock)) {
     result.busy = true;
@@ -280,8 +268,6 @@ inline ProviderStatus GetProviderStatus() {
     // harmless. Only absence of an executable image expires this veto.
     if (internal::IsImageMapping(rejected.module)) {
       ++result.blocked;
-    } else {
-      ++result.expired_rejections;
     }
   }
   ReleaseSRWLockShared(&internal::g_lock);
@@ -297,10 +283,7 @@ inline bool PrepareProviderImpl(HMODULE module) {
   const auto* profile = architecture::ActiveProfile();
   if (!g_enabled.load() || !profile || !profile->NeedsRetarget() ||
       internal::g_registry_failed.load() || module == nullptr) return false;
-  if (!internal::IsImageMapping(module)) {
-    internal::g_ignored_mappings.fetch_add(1);
-    return false;
-  }
+  if (!internal::IsImageMapping(module)) return false;
   if (!TryAcquireSRWLockExclusive(&internal::g_lock)) return false;
   struct Unlock {
     ~Unlock() { ReleaseSRWLockExclusive(&internal::g_lock); }
@@ -344,10 +327,8 @@ inline bool PrepareProviderImpl(HMODULE module) {
   };
   const auto arch_export = GetProcAddress(module, "NVSDK_NGX_GetGPUArchitecture");
   const auto parameters_export = GetProcAddress(module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl");
-  if (!arch_export && !parameters_export) {
-    internal::g_ignored_mappings.fetch_add(1);
+  if (!arch_export && !parameters_export)
     return false;  // A matching filename alone is not an NGX provider.
-  }
   if (!internal::OwnCodeExport(image, module, "NVSDK_NGX_GetGPUArchitecture") ||
       !internal::OwnCodeExport(image, module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl"))
     return reject("incomplete or forwarded provider ABI");
