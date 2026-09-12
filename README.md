@@ -158,14 +158,18 @@ MFGAmpereUnlock keeps NVIDIA's native DLSS-G path and adapts the provider for th
 selected architecture:
 
 1. `Auto` detects Ada, Ampere, or Turing; an explicit profile can override it.
-2. Ada uses the native provider path. Ampere retargets compatible `sm_89` PTX to
-   `sm_86`; Turing retargets it to `sm_75`.
-3. Provider and fatbin layouts are validated before architecture gates or CUDA
-   payloads are changed in memory.
-4. Streamline and direct NGX capability paths expose Frame Generation after the
-   provider is prepared.
-5. The temporal fix preserves distinct generated-frame positions at higher
-   multipliers.
+2. On Ada, the DLSS-G provider already contains compatible `sm_89` code, so only
+   the architecture and MFG capability checks need to be adjusted.
+3. On Ampere and Turing, the provider's compatible `sm_89` PTX is additionally
+   retargeted to `sm_86` or `sm_75` so the NVIDIA driver can JIT-compile it for
+   those GPUs.
+4. Before changing anything, the addon checks that the loaded DLSS-G provider
+   and its embedded CUDA code match a layout it knows how to patch.
+5. Only after the provider is ready does the addon make Streamline or NGX report
+   Frame Generation as available for the selected GPU.
+6. At higher MFG multipliers, the temporal fix makes each generated frame use
+   its intended position between the two real frames instead of reusing the
+   same midpoint.
 
 Unknown provider layouts are left untouched.
 
