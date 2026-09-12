@@ -30,6 +30,7 @@
 #include "./loadhook.hpp"
 #include "./midpoint.hpp"
 #include "./streamline_bridge.hpp"
+#include "./validated_warp.hpp"
 namespace {
 
 constexpr const char* kConfigSection = "RenoDX.MFGUnlock";
@@ -43,7 +44,9 @@ using mfgunlock::g_enabled;
 std::atomic<unsigned int> g_max_count{4};
 std::atomic_bool g_force_flip_meter_off{false};
 std::atomic_bool g_temporal_fix{true};
+std::atomic_bool g_validated_warp_blend{false};
 std::atomic_bool g_raise_ceiling{false};
+std::atomic_bool g_dynamic_stack_validated{false};
 
 // Marker scans can match literals embedded in this addon, so never inspect the
 // addon's own image as a candidate provider.
@@ -281,6 +284,72 @@ void RestoreDlssgArchGate() {
   g_gate_patched.store(false, std::memory_order_release);
 }
 
+// --------------------------------------------------- validated warp blend
+// Optional Ampere-only quality patch for the exact 310.9.1 provider. The
+// replacement PTX is redirected through provider-owned descriptors and is
+// restored before the provider's in-place architecture patches on unload.
+
+struct ValidatedWarpModulePatch {
+  HMODULE module = nullptr;
+  std::vector<mfgunlock::validatedwarp::Redirect> redirects;
+  std::string provider_version;
+  std::string detail;
+};
+std::vector<ValidatedWarpModulePatch> g_validated_warp_modules;
+std::vector<HMODULE> g_validated_warp_rejected_modules;
+std::string g_validated_warp_detail;
+
+void PatchValidatedWarpInModule(HMODULE mod) {
+  if (mod == nullptr || !g_validated_warp_blend.load(std::memory_order_relaxed)) return;
+  const auto* profile = mfgunlock::architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile || profile->architecture != mfgunlock::Architecture::kAmpere)
+    return;
+  if (!mfgunlock::provider::PrepareProvider(mod)) return;
+  if (std::any_of(g_validated_warp_modules.begin(), g_validated_warp_modules.end(),
+                  [mod](const auto& patch) { return patch.module == mod; })) return;
+  if (std::find(g_validated_warp_rejected_modules.begin(),
+                g_validated_warp_rejected_modules.end(), mod) !=
+      g_validated_warp_rejected_modules.end()) return;
+
+  std::vector<mfgunlock::validatedwarp::Redirect> redirects;
+  mfgunlock::validatedwarp::Result result{};
+  std::string provider_version;
+  const bool applied = mfgunlock::validatedwarp::Apply(
+      mod, redirects, result, provider_version);
+  const std::string detail = result.detail;
+  if (!applied || !result.applied) {
+    g_validated_warp_rejected_modules.push_back(mod);
+    g_validated_warp_detail = detail;
+    std::stringstream message;
+    message << "mfgunlock: Validated Warp Blend not applied"
+            << (provider_version.empty() ? "" : " to DLSS-G " + provider_version)
+            << " -- " << (detail.empty() ? "provider/kernel did not match the validated profile" : detail)
+            << ".";
+    reshade::log::message(reshade::log::level::warning, message.str().c_str());
+    return;
+  }
+
+  g_validated_warp_detail = detail;
+  g_validated_warp_modules.push_back(
+      {mod, std::move(redirects), provider_version, detail});
+  std::stringstream message;
+  message << "mfgunlock: Validated Warp Blend applied to DLSS-G " << provider_version
+          << " on Ampere -- " << detail << ".";
+  reshade::log::message(reshade::log::level::info, message.str().c_str());
+}
+
+void TryPatchValidatedWarp() {
+  for (HMODULE mod : g_dlssg_modules) PatchValidatedWarpInModule(mod);
+}
+
+void RestoreValidatedWarp() {
+  for (auto& module : g_validated_warp_modules)
+    mfgunlock::validatedwarp::Restore(module.redirects);
+  g_validated_warp_modules.clear();
+  g_validated_warp_rejected_modules.clear();
+  g_validated_warp_detail.clear();
+}
+
 // ------------------------------------------------------ temporal (midpoint)
 //
 // Unlocking the multipliers gets the right NUMBER of generated frames; this
@@ -359,6 +428,9 @@ void ProcessLoadedDlssgModule(HMODULE mod) {
     return;
   }
   if (profile->NeedsRetarget()) {
+    if (profile->architecture == mfgunlock::Architecture::kAmpere &&
+        g_validated_warp_blend.load(std::memory_order_relaxed))
+      PatchValidatedWarpInModule(mod);
     if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
     PatchArchGatesInModule(mod);
   } else {
@@ -378,6 +450,9 @@ void RunProviderMaintenance() {
     return;
   }
   if (profile->NeedsRetarget()) {
+    if (profile->architecture == mfgunlock::Architecture::kAmpere &&
+        g_validated_warp_blend.load(std::memory_order_relaxed))
+      TryPatchValidatedWarp();
     if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
     TryPatchDlssgArchGate();
   } else {
@@ -723,6 +798,52 @@ void RestoreFlipMetering() {
   g_flip_meter_failed.store(false, std::memory_order_release);
 }
 
+bool IsVersion(const mfgunlock::streamline::internal::ModuleVersion& version,
+               unsigned int major, unsigned int minor, unsigned int build) {
+  return version.major == major && version.minor == minor &&
+         version.build == build;
+}
+
+bool DynamicRuntimeStackReady() {
+  if (g_dynamic_stack_validated.load(std::memory_order_acquire)) return true;
+  const auto* profile = mfgunlock::architecture::ActiveProfile();
+  if (!g_enabled.load() || !profile ||
+      profile->architecture != mfgunlock::Architecture::kAmpere) return false;
+
+  HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
+  if (!interposer || !IsVersion(mfgunlock::streamline::internal::ReadModuleVersion(interposer),
+                                2, 14, 1)) return false;
+
+  bool plugin_ok = false;
+  if (!TryAcquireSRWLockShared(&mfgunlock::streamline::internal::g_plugin_lock)) return false;
+  for (const auto& plugin : mfgunlock::streamline::internal::g_plugins) {
+    if (!plugin.module) continue;
+    if (IsVersion(plugin.version, 2, 14, 1)) {
+      plugin_ok = true;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&mfgunlock::streamline::internal::g_plugin_lock);
+  if (!plugin_ok) return false;
+
+  bool provider_ok = false;
+  if (!TryAcquireSRWLockShared(&mfgunlock::provider::internal::g_lock)) return false;
+  for (const auto& provider : mfgunlock::provider::internal::g_providers) {
+    if (!provider.ready) continue;
+    const auto version = mfgunlock::streamline::internal::ReadModuleVersion(provider.module);
+    if (IsVersion(version, 310, 9, 1)) {
+      provider_ok = true;
+      break;
+    }
+  }
+  ReleaseSRWLockShared(&mfgunlock::provider::internal::g_lock);
+  if (!provider_ok) return false;
+
+  g_dynamic_stack_validated.store(true, std::memory_order_release);
+  mfgunlock::provider::Log("validated Dynamic MFG runtime stack: Streamline 2.14.1 + DLSS-G 310.9.1");
+  return true;
+}
+
 void RefreshRuntime() {
   mfgunlock::ngx::BeforeInit();
   RunProviderMaintenance();
@@ -732,7 +853,9 @@ void RefreshRuntime() {
 }
 
 // Graphics initialization is also a finite fallback for already loaded modules.
-void OnInitDevice(reshade::api::device* /*device*/) {
+void OnInitDevice(reshade::api::device* device) {
+  if (device != nullptr && device->get_api() == reshade::api::device_api::d3d12)
+    mfgunlock::framecount::NotifyDynamicD3D12(true);
   RefreshRuntime();
 }
 
@@ -781,6 +904,17 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     g_enabled.store(enabled, std::memory_order_relaxed);
     reshade::set_config_value(nullptr, kConfigSection, "Enabled", enabled ? 1 : 0);
   }
+
+  static const char* kRuntimeModes[] = {
+      "Game default", "Prefer local runtime", "Force NVIDIA OTA runtime"};
+  int runtime_mode = static_cast<int>(
+      mfgunlock::framecount::g_runtime_selection_mode.load(std::memory_order_relaxed));
+  if (ImGui::Combo("Streamline runtime", &runtime_mode, kRuntimeModes, ARRAYSIZE(kRuntimeModes))) {
+    mfgunlock::framecount::g_runtime_selection_mode.store(
+        static_cast<unsigned int>(runtime_mode), std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "RuntimeSelectionMode", runtime_mode);
+  }
+  ImGui::TextDisabled("Restart required after changing the Streamline runtime policy.");
 
   int count = static_cast<int>(g_max_count.load(std::memory_order_relaxed));
   if (ImGui::SliderInt("Reported MultiFrameCountMax", &count,
@@ -853,6 +987,63 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   }
 
   ImGui::Separator();
+  bool dynamic_mfg = mfgunlock::framecount::g_dynamic_mfg_enabled.load(
+      std::memory_order_relaxed);
+  if (ImGui::Checkbox("NVIDIA Dynamic MFG", &dynamic_mfg)) {
+    mfgunlock::framecount::g_dynamic_mfg_enabled.store(dynamic_mfg,
+                                                       std::memory_order_relaxed);
+    mfgunlock::framecount::NotifyDynamicModeChanged();
+    reshade::set_config_value(nullptr, kConfigSection, "DynamicMFG",
+                              dynamic_mfg ? 1 : 0);
+  }
+  int dynamic_target = static_cast<int>(
+      mfgunlock::framecount::g_dynamic_target_fps.load(std::memory_order_relaxed));
+  if (dynamic_mfg && ImGui::SliderInt("Dynamic output target", &dynamic_target, 0, 480,
+                                     dynamic_target == 0 ? "display refresh" : "%d FPS")) {
+    mfgunlock::framecount::g_dynamic_target_fps.store(
+        static_cast<unsigned int>(dynamic_target), std::memory_order_relaxed);
+    mfgunlock::framecount::NotifyDynamicModeChanged();
+    reshade::set_config_value(nullptr, kConfigSection, "DynamicTargetFPS", dynamic_target);
+  }
+  ImGui::TextDisabled(
+      "Ampere + D3D12 + Streamline 2.14.1 + DLSS-G 310.9.1 only.\n"
+      "When accepted, NVIDIA owns multiplier selection and pacing; 0 follows display refresh.");
+  const auto* active_profile = mfgunlock::architecture::ActiveProfile();
+  if (!active_profile || active_profile->architecture != mfgunlock::Architecture::kAmpere) {
+    ImGui::TextDisabled("Dynamic MFG: Ampere profile required.");
+  } else if (!mfgunlock::framecount::g_dynamic_d3d12.load(std::memory_order_relaxed)) {
+    ImGui::TextDisabled("Dynamic MFG: waiting for a D3D12 device.");
+  } else if (!mfgunlock::framecount::DynamicStackReady()) {
+    ImGui::TextDisabled("Dynamic MFG: validated 2.14.1 / 310.9.1 runtime stack not active.");
+  } else if (!mfgunlock::framecount::g_dynamic_support_seen.load(std::memory_order_acquire)) {
+    ImGui::TextDisabled("Dynamic MFG: capability pending; toggle frame generation once.");
+  } else if (!mfgunlock::framecount::g_dynamic_supported.load(std::memory_order_relaxed)) {
+    ImGui::TextDisabled("Dynamic MFG: runtime reports unsupported.");
+  } else if (mfgunlock::framecount::g_dynamic_applied.load(std::memory_order_relaxed)) {
+    ImGui::TextUnformatted("Dynamic MFG: active.");
+  } else if (mfgunlock::framecount::g_dynamic_fell_back.load(std::memory_order_relaxed)) {
+    ImGui::Text("Dynamic MFG: rejected (sl::Result 0x%x); fixed mode restored.",
+                mfgunlock::framecount::g_dynamic_result.load(std::memory_order_relaxed));
+  } else if (dynamic_mfg) {
+    ImGui::TextDisabled("Dynamic MFG: ready; toggle frame generation off/on to submit it.");
+  }
+
+  ImGui::Separator();
+  bool warp = g_validated_warp_blend.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Validated Warp Blend (Ampere, 310.9.1)", &warp)) {
+    g_validated_warp_blend.store(warp, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", warp ? 1 : 0);
+  }
+  ImGui::TextDisabled("Quality patch; exact provider/kernel identity only. Restart required.");
+  if (!g_validated_warp_modules.empty()) {
+    ImGui::TextWrapped("Validated Warp Blend: active; %s.", g_validated_warp_detail.c_str());
+  } else if (warp && !g_validated_warp_detail.empty()) {
+    ImGui::TextWrapped("Validated Warp Blend: not applied; %s.", g_validated_warp_detail.c_str());
+  } else if (warp) {
+    ImGui::TextDisabled("Validated Warp Blend: pending restart/provider load.");
+  }
+
+  ImGui::Separator();
   bool temporal = g_temporal_fix.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Temporal fix (stops all frames landing at the midpoint)", &temporal)) {
     g_temporal_fix.store(temporal, std::memory_order_relaxed);
@@ -897,11 +1088,36 @@ void LoadConfig() {
   if (reshade::get_config_value(nullptr, kConfigSection, "TemporalFix", value)) {
     g_temporal_fix.store(value != 0, std::memory_order_relaxed);
   }
+  if (reshade::get_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", value)) {
+    g_validated_warp_blend.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "DynamicMFG", value)) {
+    mfgunlock::framecount::g_dynamic_mfg_enabled.store(value != 0,
+                                                       std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "DynamicTargetFPS", value)) {
+    if (value < 0) value = 0;
+    if (value > 480) value = 480;
+    mfgunlock::framecount::g_dynamic_target_fps.store(
+        static_cast<unsigned int>(value), std::memory_order_relaxed);
+  }
   if (reshade::get_config_value(nullptr, kConfigSection, "RaiseFrameCeiling", value)) {
     g_raise_ceiling.store(value != 0, std::memory_order_relaxed);
   }
-  if (reshade::get_config_value(nullptr, kConfigSection, "ForceOTAPlugins", value)) {
-    mfgunlock::framecount::g_force_ota.store(value != 0, std::memory_order_relaxed);
+  if (reshade::get_config_value(nullptr, kConfigSection, "RuntimeSelectionMode", value)) {
+    if (value < static_cast<int>(mfgunlock::framecount::RuntimeSelectionMode::kGameDefault) ||
+        value > static_cast<int>(mfgunlock::framecount::RuntimeSelectionMode::kForceOta)) {
+      value = static_cast<int>(mfgunlock::framecount::RuntimeSelectionMode::kGameDefault);
+    }
+    mfgunlock::framecount::g_runtime_selection_mode.store(
+        static_cast<unsigned int>(value), std::memory_order_relaxed);
+  } else if (reshade::get_config_value(nullptr, kConfigSection, "ForceOTAPlugins", value) &&
+             value != 0) {
+    // Backward-compatible migration for configurations written before the
+    // three-way runtime selector existed.
+    mfgunlock::framecount::g_runtime_selection_mode.store(
+        static_cast<unsigned int>(mfgunlock::framecount::RuntimeSelectionMode::kForceOta),
+        std::memory_order_relaxed);
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "ForceMultiplier", value)) {
     if (value != 0 && (value < 2 || value > 6)) value = 0;
@@ -937,13 +1153,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
                g_midpoint_patched.load(std::memory_order_acquire) &&
                g_gate_patched.load(std::memory_order_acquire);
       };
+      mfgunlock::framecount::g_dynamic_stack_ready = DynamicRuntimeStackReady;
       mfgunlock::ngx::g_capability_limit = []() -> unsigned int {
         return mfgunlock::framecount::g_multi_frame_ready() ? g_max_count.load() : 0;
       };
-      // The frame-count override must never ask for more generated frames than
-      // the pacing can deliver, and it is the only code that runs at a moment
-      // when the DLSS-G plugin is guaranteed loaded. Give it both a way to
-      // force the pacing patch and a way to check whether it took.
+      // The fixed-count compatibility path can request the legacy software
+      // pacing fallback after the DLSS-G plugin is loaded. Dynamic MFG returns
+      // before this path and keeps pacing under the current NVIDIA runtime.
       mfgunlock::framecount::g_ensure_pacing = []() { TryPatchFlipMetering(); };
       mfgunlock::framecount::g_pacing_ready = []() {
         return g_flip_meter_patched.load(std::memory_order_acquire);
@@ -954,6 +1170,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       // patched directly here without enumerating modules from Present.
       mfgunlock::loadhook::g_on_interposer_loaded = []() {
         mfgunlock::streamline::internal::InstallLegacyInitHook();
+        mfgunlock::streamline::internal::InstallSupportHook();
         mfgunlock::framecount::TryInstall();
       };
       mfgunlock::loadhook::g_on_ngx_loaded = mfgunlock::ngx::TryInstall;
@@ -961,6 +1178,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       mfgunlock::loadhook::TryInstall();
       mfgunlock::ngx::EnsureEntryHooks();
       mfgunlock::streamline::internal::InstallLegacyInitHook();
+      mfgunlock::streamline::internal::InstallSupportHook();
       RunProviderMaintenance();
       if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
       mfgunlock::framecount::TryInstall();
@@ -983,9 +1201,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       mfgunlock::framecount::g_on_init = nullptr;
       mfgunlock::framecount::g_init_compatible = nullptr;
       mfgunlock::framecount::g_multi_frame_ready = nullptr;
+      mfgunlock::framecount::g_dynamic_stack_ready = nullptr;
       mfgunlock::ngx::g_prepare_loaded_providers = nullptr;
       mfgunlock::streamline::Shutdown();
       mfgunlock::framecount::Uninstall();
+      RestoreValidatedWarp();
       RestoreMidpoint();
       RestoreDlssgArchGate();
       mfgunlock::provider::Restore();

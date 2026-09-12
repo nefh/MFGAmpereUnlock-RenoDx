@@ -46,6 +46,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <sstream>
 #include <vector>
 
@@ -386,7 +387,10 @@ inline bool Apply(HMODULE module, std::vector<Patch>& patches, void*& allocation
     for (size_t off = 0; off + sizeof(uint64_t) <= size; off += sizeof(uint64_t)) {
       uint64_t value = 0;
       std::memcpy(&value, sec + off, sizeof(value));
-      if (value < start || value >= start + image_size) continue;
+      if (value < start || image_size < internal::kOuterHeader ||
+          value > start + image_size - internal::kOuterHeader) {
+        continue;
+      }
       const auto* candidate = reinterpret_cast<const uint8_t*>(value);
       if (internal::ReadU32(candidate) != internal::kFatbinMagic) continue;
 
@@ -409,9 +413,13 @@ inline bool Apply(HMODULE module, std::vector<Patch>& patches, void*& allocation
       if (name_profile == nullptr) continue;
 
       const uint64_t declared = internal::ReadU64(candidate + 8);
+      if (declared > static_cast<uint64_t>((std::numeric_limits<size_t>::max)() -
+                                           internal::kOuterHeader)) {
+        continue;
+      }
       const size_t total = static_cast<size_t>(declared) + internal::kOuterHeader;
       if (total < 1024 || total > (16u << 20)) continue;
-      if (value + total > start + image_size) continue;
+      if (total > start + image_size - value) continue;
       const auto* fat_profile = internal::FindTemporalProfile(candidate, total);
       if (fat_profile == nullptr || fat_profile != name_profile) continue;
       if (fat == nullptr) {
@@ -469,15 +477,21 @@ inline bool Apply(HMODULE module, std::vector<Patch>& patches, void*& allocation
 }
 
 inline void Restore(std::vector<Patch>& patches, void*& allocation) {
+  bool restored = true;
   for (const auto& patch : patches) {
     DWORD old_protect = 0;
-    if (VirtualProtect(patch.slot, sizeof(uint64_t), PAGE_READWRITE, &old_protect) == 0) continue;
+    if (VirtualProtect(patch.slot, sizeof(uint64_t), PAGE_READWRITE, &old_protect) == 0) {
+      restored = false;
+      continue;
+    }
     *patch.slot = patch.original;
     DWORD ignored = 0;
     VirtualProtect(patch.slot, sizeof(uint64_t), old_protect, &ignored);
   }
   patches.clear();
-  if (allocation != nullptr) {
+  // Never release replacement memory while any live descriptor may still point
+  // at it. A process-lifetime leak is safer than a dangling provider pointer.
+  if (allocation != nullptr && restored) {
     VirtualFree(allocation, 0, MEM_RELEASE);
     allocation = nullptr;
   }

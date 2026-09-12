@@ -143,6 +143,22 @@ sl::Result RealInit(const sl::Preferences& preferences, uint64_t) {
   return g_sl_result;
 }
 
+unsigned int g_support_calls = 0;
+unsigned int g_support_architecture = 0;
+
+sl::Result RealSupport(sl::Feature feature, const sl::AdapterInfo&) {
+  ++g_support_calls;
+  if (feature != sl::kFeatureDLSS_G) return sl::Result::eErrorFeatureMissing;
+  NV_GPU_ARCH_INFO info{};
+  info.version = NV_GPU_ARCH_INFO_VER;
+  if (ngx_internal::HookedGetArchInfo(g_gpu, &info) != NVAPI_OK)
+    return sl::Result::eErrorAdapterNotSupported;
+  g_support_architecture = info.architecture;
+  return info.architecture == architecture::kAdaArchitecture
+      ? sl::Result::eOk
+      : sl::Result::eErrorAdapterNotSupported;
+}
+
 unsigned int g_legacy_init_calls = 0;
 int g_legacy_application_id = 0;
 bool g_legacy_result = true;
@@ -368,9 +384,23 @@ int main() {
 
   SetVersion(interposer, 2, 12);
   mock::exports[{interposer, "slGetFeatureFunction"}] = Proc(Unrelated);
+  mock::exports[{interposer, "slIsFeatureSupported"}] = Proc(RealSupport);
   Check(streamline_internal::GetInterposerAbi(interposer) == streamline_internal::InterposerAbi::kModern &&
             mfgunlock::streamline::CanHookInit(interposer),
         "modern Streamline ABI admitted separately");
+  streamline_internal::InstallSupportHook();
+  Check(streamline_internal::g_support_hooked.load() &&
+            streamline_internal::g_real_support == RealSupport,
+        "modern Streamline support hook installed");
+  sl::AdapterInfo adapter_info{};
+  g_support_architecture = 0;
+  Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
+            sl::Result::eOk && g_support_architecture == architecture::kAdaArchitecture,
+        "DLSS-G support query uses scoped architecture exposure");
+  g_support_architecture = 0;
+  Check(streamline_internal::HookedIsFeatureSupported(99, adapter_info) ==
+            sl::Result::eErrorFeatureMissing && g_support_architecture == 0,
+        "non-DLSS-G support query remains native");
 
   const auto plugin_module = Module(0x6161);
   mock::paths[plugin_module] = L"X:\\fixture\\sl.dlss_g.dll";

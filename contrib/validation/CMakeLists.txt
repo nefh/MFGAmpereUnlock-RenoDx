@@ -40,6 +40,10 @@ add_executable(provider_state_test "${TEST_ROOT}/provider_state_test.cpp")
 target_include_directories(provider_state_test PRIVATE "${TEST_ROOT}/provider_mocks")
 add_test(NAME provider_state_test COMMAND provider_state_test)
 
+add_executable(validated_warp_test "${TEST_ROOT}/validated_warp_test.cpp")
+target_include_directories(validated_warp_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME validated_warp_test COMMAND validated_warp_test)
+
 # Run the same composition cases against the actual runtime transform, not only
 # the inspector's portable copy.
 add_executable(temporal_runtime_test "${TEST_ROOT}/temporal_composition_test.cpp")

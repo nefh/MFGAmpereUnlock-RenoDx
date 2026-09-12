@@ -28,7 +28,7 @@
 
 namespace mfgunlock::framecount {
 
-// 0 = leave the game's request alone. 2..5 = force that multiplier.
+// 0 = leave the game's request alone. 2..6 = force that total multiplier.
 inline std::atomic<unsigned int> g_force_multiplier{0};
 inline std::atomic_bool g_feature_function_hooked{false};
 inline std::atomic_bool g_init_hooked{false};
@@ -48,8 +48,30 @@ inline std::atomic<unsigned int> g_advertised_max_generated{0};
 inline std::atomic_bool g_capacity_advertised{false};
 inline std::atomic<unsigned int> g_runtime_max_generated{0};
 
-// Optional compatibility path for hosts that suppress Streamline OTA plugins.
-inline std::atomic_bool g_force_ota{false};
+// NVIDIA Dynamic MFG is opt-in and only submitted after the current D3D12
+// runtime reports the v4 capability on the validated 2.14.1 / 310.9.1 stack.
+// The game-owned options structure is never extended or modified in place.
+inline std::atomic_bool g_dynamic_mfg_enabled{false};
+inline std::atomic<unsigned int> g_dynamic_target_fps{0};
+inline std::atomic_bool g_dynamic_d3d12{false};
+inline std::atomic_bool g_dynamic_support_seen{false};
+inline std::atomic_bool g_dynamic_supported{false};
+inline std::atomic_bool g_dynamic_probe_attempted{false};
+inline std::atomic_bool g_dynamic_applied{false};
+inline std::atomic_bool g_dynamic_fell_back{false};
+inline std::atomic_bool g_dynamic_runtime_declined{false};
+inline std::atomic<unsigned int> g_dynamic_result{0};
+inline bool (*g_dynamic_stack_ready)() = nullptr;
+
+// The game owns Streamline runtime selection by default. Explicit overrides
+// only change NVIDIA's documented OTA flags for the slInit call.
+enum class RuntimeSelectionMode : unsigned int {
+  kGameDefault = 0,
+  kPreferLocal = 1,
+  kForceOta = 2,
+};
+inline std::atomic<unsigned int> g_runtime_selection_mode{
+    static_cast<unsigned int>(RuntimeSelectionMode::kGameDefault)};
 
 // More than one generated frame requires software pacing on backported
 // providers. slDLSSGSetOptions is the first point where the plugin is guaranteed
@@ -79,25 +101,106 @@ inline std::atomic_bool g_entry_shutting_down{false};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
 
+inline bool DynamicStackReady() {
+  return g_dynamic_d3d12.load(std::memory_order_relaxed) &&
+         g_dynamic_stack_ready != nullptr && g_dynamic_stack_ready();
+}
+
+inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result) {
+  if (result != sl::Result::eOk || !DynamicStackReady() ||
+      state.structVersion < sl::kStructVersion4) {
+    return false;
+  }
+  if (state.bIsDynamicMFGSupported != sl::Boolean::eTrue &&
+      state.bIsDynamicMFGSupported != sl::Boolean::eFalse) {
+    return false;
+  }
+  const bool supported = state.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+  const bool previous = g_dynamic_supported.exchange(supported, std::memory_order_acq_rel);
+  const bool seen = g_dynamic_support_seen.exchange(true, std::memory_order_release);
+  if (!seen || previous != supported) {
+    reshade::log::message(
+        reshade::log::level::info,
+        supported
+            ? "mfgunlock: slDLSSGGetState confirms NVIDIA Dynamic MFG support on the validated runtime stack."
+            : "mfgunlock: slDLSSGGetState reports NVIDIA Dynamic MFG unsupported; fixed MFG remains active.");
+  }
+  return true;
+}
+
+inline bool BuildDynamicOptions(const sl::DLSSGOptions& source,
+                                sl::DLSSGOptions& destination) {
+  const size_t version = source.structVersion;
+  if (version < sl::kStructVersion1 || version > sl::kStructVersion5) return false;
+
+  destination = sl::DLSSGOptions{};
+  destination.next = source.next;
+  destination.structVersion = sl::kStructVersion5;
+
+  // Version 1.
+  destination.mode = source.mode == sl::DLSSGMode::eOff
+                         ? sl::DLSSGMode::eOff
+                         : sl::DLSSGMode::eDynamic;
+  destination.numFramesToGenerate = source.numFramesToGenerate;
+  destination.flags = source.flags;
+  destination.dynamicResWidth = source.dynamicResWidth;
+  destination.dynamicResHeight = source.dynamicResHeight;
+  destination.numBackBuffers = source.numBackBuffers;
+  destination.mvecDepthWidth = source.mvecDepthWidth;
+  destination.mvecDepthHeight = source.mvecDepthHeight;
+  destination.colorWidth = source.colorWidth;
+  destination.colorHeight = source.colorHeight;
+  destination.colorBufferFormat = source.colorBufferFormat;
+  destination.mvecBufferFormat = source.mvecBufferFormat;
+  destination.depthBufferFormat = source.depthBufferFormat;
+  destination.hudLessBufferFormat = source.hudLessBufferFormat;
+  destination.uiBufferFormat = source.uiBufferFormat;
+  destination.onErrorCallback = source.onErrorCallback;
+
+  if (version >= sl::kStructVersion2) destination.bReserved15 = source.bReserved15;
+  if (version >= sl::kStructVersion3)
+    destination.queueParallelismMode = source.queueParallelismMode;
+  if (version >= sl::kStructVersion4)
+    destination.enableUserInterfaceRecomposition = source.enableUserInterfaceRecomposition;
+  destination.dynamicTargetFrameRate = static_cast<float>(
+      g_dynamic_target_fps.load(std::memory_order_relaxed));
+  return true;
+}
+
 inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_version) {
   if (g_real_init == nullptr) return sl::Result::eErrorNotInitialized;
-  if (!g_enabled.load() || !architecture::ActiveProfile() ||
-      !g_force_ota.load(std::memory_order_relaxed)) return g_real_init(pref, sdk_version);
+  if (!g_enabled.load()) return g_real_init(pref, sdk_version);
+
+  const auto mode = static_cast<RuntimeSelectionMode>(
+      g_runtime_selection_mode.load(std::memory_order_relaxed));
+  if (mode == RuntimeSelectionMode::kGameDefault) return g_real_init(pref, sdk_version);
+
+  if (pref.structType != sl::Preferences::s_structType ||
+      pref.structVersion != sl::kStructVersion1) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        "mfgunlock: runtime selection ignored because sl::Preferences uses an unknown ABI.");
+    return g_real_init(pref, sdk_version);
+  }
 
   constexpr uint64_t kOta = static_cast<uint64_t>(sl::PreferenceFlags::eAllowOTA) |
                             static_cast<uint64_t>(sl::PreferenceFlags::eLoadDownloadedPlugins);
-  auto& mutable_pref = const_cast<sl::Preferences&>(pref);
-  const auto original = mutable_pref.flags;
-  if ((static_cast<uint64_t>(original) & kOta) == kOta) return g_real_init(pref, sdk_version);
+  const uint64_t before = static_cast<uint64_t>(pref.flags);
+  const uint64_t after = mode == RuntimeSelectionMode::kPreferLocal
+                             ? (before & ~kOta)
+                             : (before | kOta);
 
-  mutable_pref.flags = static_cast<sl::PreferenceFlags>(static_cast<uint64_t>(original) | kOta);
-  const sl::Result result = g_real_init(pref, sdk_version);
-  mutable_pref.flags = original;
+  sl::Preferences forwarded = pref;
+  forwarded.flags = static_cast<sl::PreferenceFlags>(after);
+  const sl::Result result = g_real_init(forwarded, sdk_version);
+
+  std::stringstream message;
+  message << "mfgunlock: Streamline runtime policy "
+          << (mode == RuntimeSelectionMode::kPreferLocal ? "prefer-local" : "force-OTA")
+          << " changed flags 0x" << std::hex << before << " -> 0x" << after;
   reshade::log::message(result == sl::Result::eOk ? reshade::log::level::info
                                                   : reshade::log::level::warning,
-                       result == sl::Result::eOk
-                           ? "mfgunlock: Streamline OTA plugin loading enabled for this slInit call."
-                           : "mfgunlock: slInit failed after enabling Streamline OTA plugin loading.");
+                        message.str().c_str());
   return result;
 }
 
@@ -111,6 +214,71 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
   if (g_real_set_options == nullptr) return sl::Result::eErrorNotInitialized;
   const auto* profile = architecture::ActiveProfile();
   if (!g_enabled.load() || !profile) return g_real_set_options(viewport, options);
+
+  if (options.mode == sl::DLSSGMode::eOff) {
+    g_dynamic_applied.store(false, std::memory_order_relaxed);
+    g_dynamic_runtime_declined.store(false, std::memory_order_relaxed);
+    return g_real_set_options(viewport, options);
+  }
+
+  const bool dynamic_requested =
+      g_dynamic_mfg_enabled.load(std::memory_order_relaxed) &&
+      !g_dynamic_runtime_declined.load(std::memory_order_relaxed);
+  if (dynamic_requested && DynamicStackReady() &&
+      g_dynamic_support_seen.load(std::memory_order_acquire) &&
+      g_dynamic_supported.load(std::memory_order_relaxed)) {
+    const bool backend_ready = !profile->NeedsRetarget() ||
+        (g_multi_frame_ready != nullptr && g_multi_frame_ready());
+    if (backend_ready) {
+      sl::DLSSGOptions dynamic_options{};
+      if (BuildDynamicOptions(options, dynamic_options)) {
+        sl::Result result = g_real_set_options(viewport, dynamic_options);
+        if (result != sl::Result::eOk) {
+          // Feature-manager startup can be transient. Retry the same validated
+          // request once, then preserve the game's fixed request as fallback.
+          result = g_real_set_options(viewport, dynamic_options);
+        }
+        g_dynamic_result.store(static_cast<unsigned int>(result),
+                               std::memory_order_relaxed);
+        if (result == sl::Result::eOk) {
+          if (!g_dynamic_applied.exchange(true, std::memory_order_relaxed)) {
+            std::stringstream message;
+            const unsigned int target =
+                g_dynamic_target_fps.load(std::memory_order_relaxed);
+            message << "mfgunlock: NVIDIA Dynamic MFG accepted (target "
+                    << (target == 0 ? "active-display refresh"
+                                    : std::to_string(target) + " FPS")
+                    << ").";
+            reshade::log::message(reshade::log::level::info,
+                                  message.str().c_str());
+          }
+          g_dynamic_fell_back.store(false, std::memory_order_relaxed);
+          return result;
+        }
+        g_dynamic_runtime_declined.store(true, std::memory_order_release);
+        g_dynamic_applied.store(false, std::memory_order_relaxed);
+        if (!g_dynamic_fell_back.exchange(true, std::memory_order_relaxed)) {
+          std::stringstream message;
+          message << "mfgunlock: NVIDIA Dynamic MFG was rejected with sl::Result "
+                  << static_cast<unsigned int>(result)
+                  << "; restoring the game's fixed mode.";
+          reshade::log::message(reshade::log::level::warning,
+                                message.str().c_str());
+        }
+      } else {
+        g_dynamic_runtime_declined.store(true, std::memory_order_release);
+        g_dynamic_result.store(
+            static_cast<unsigned int>(sl::Result::eErrorUnsupportedInterface),
+            std::memory_order_relaxed);
+        if (!g_dynamic_fell_back.exchange(true, std::memory_order_relaxed)) {
+          reshade::log::message(
+              reshade::log::level::warning,
+              "mfgunlock: Dynamic MFG was not submitted because the game supplied "
+              "an unknown DLSSGOptions ABI; fixed mode remains active.");
+        }
+      }
+    }
+  }
 
   const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
   // Backported providers need temporal correction before a native 3x/4x request.
@@ -150,10 +318,10 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     return g_real_set_options(viewport, options);
   }
   g_last_requested.store(requested, std::memory_order_relaxed);
-  if (requested >= desired) return g_real_set_options(viewport, options);
+  if (requested == desired) return g_real_set_options(viewport, options);
 
-  // More than one generated frame needs software pacing. The plugin is loaded
-  // by now, so this is our last and best chance to patch it.
+  // Fixed multi-frame compatibility can use the legacy software-pacing path.
+  // Dynamic MFG returns above and leaves pacing to the current NVIDIA runtime.
   if (desired > 1) {
     if (g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr) {
       g_ensure_pacing();
@@ -176,7 +344,7 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
   sl::Result result = g_real_set_options(viewport, options);
   mutable_options.numFramesToGenerate = requested;
 
-  // Fall back to the original request if the raised count is rejected.
+  // Fall back to the original request if the override is rejected.
   if (result != sl::Result::eOk) {
     // The feature manager can reject the first call while still initializing.
     // Retry the same request once before treating the count as unsupported.
@@ -209,9 +377,8 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
 
   if (!g_intercepted.exchange(true, std::memory_order_relaxed)) {
     std::stringstream s;
-    s << "mfgunlock: raising DLSS-G numFramesToGenerate from " << requested << " to " << desired
-      << " (" << multiplier << "x) -- the game only ever asks for "
-      << (requested + 1) << "x. slDLSSGSetOptions accepted it.";
+    s << "mfgunlock: forcing DLSS-G numFramesToGenerate from " << requested << " to " << desired
+      << " (" << multiplier << "x). slDLSSGSetOptions accepted it.";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
   g_last_forced.store(desired, std::memory_order_relaxed);
@@ -226,6 +393,20 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
 
   const sl::Result result = g_real_get_state(viewport, state, options);
   if (result == sl::Result::eOk) {
+    ObserveDynamicSupport(state, result);
+    if (!g_dynamic_support_seen.load(std::memory_order_acquire) &&
+        DynamicStackReady() && state.structVersion < sl::kStructVersion4 &&
+        !g_dynamic_probe_attempted.exchange(true, std::memory_order_acq_rel)) {
+      // Older games allocate the state ABI they were built against. Probe v4
+      // into addon-owned storage so no field beyond the caller's allocation is
+      // ever read or written. The original call/result above remains native.
+      sl::DLSSGState extended{};
+      extended.next = state.next;
+      extended.structVersion = sl::kStructVersion4;
+      const sl::Result probe = g_real_get_state(viewport, extended, options);
+      ObserveDynamicSupport(extended, probe);
+    }
+
     const unsigned int status = static_cast<unsigned int>(state.status);
     g_dlssg_status.store(status, std::memory_order_relaxed);
     g_state_seen.store(true, std::memory_order_relaxed);
@@ -306,6 +487,20 @@ inline const std::vector<hook::HookItem> kInitHook = {
 
 }  // namespace internal
 
+inline bool DynamicStackReady() { return internal::DynamicStackReady(); }
+
+inline void NotifyDynamicD3D12(bool d3d12) {
+  g_dynamic_d3d12.store(d3d12, std::memory_order_relaxed);
+}
+
+inline void NotifyDynamicModeChanged() {
+  g_dynamic_applied.store(false, std::memory_order_relaxed);
+  g_dynamic_fell_back.store(false, std::memory_order_relaxed);
+  g_dynamic_runtime_declined.store(false, std::memory_order_release);
+  g_dynamic_result.store(0, std::memory_order_relaxed);
+  g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
+}
+
 // Install before the host caches DLSS-G function pointers.
 inline void TryInstall() {
   static thread_local bool installing = false;
@@ -326,7 +521,10 @@ inline void TryInstall() {
   const bool compatible_init = g_init_compatible ? g_init_compatible(interposer)
       : GetProcAddress(interposer, "slGetFeatureFunction") != nullptr;
   const bool observe_init = g_on_init && compatible_init;
-  const bool alter_init = g_force_ota.load(std::memory_order_relaxed) && compatible_init;
+  const bool alter_init =
+      g_runtime_selection_mode.load(std::memory_order_relaxed) !=
+          static_cast<unsigned int>(RuntimeSelectionMode::kGameDefault) &&
+      compatible_init;
   if (!g_init_hooked.load(std::memory_order_acquire) && (observe_init || alter_init) &&
       GetProcAddress(interposer, "slInit") != nullptr &&
       hook::Install(interposer, internal::kInitHook, "sl.interposer.dll")) {

@@ -89,6 +89,17 @@ inline const std::vector<hook::HookItem> kLegacyHooks = {
      reinterpret_cast<void*>(&HookedLegacyInit)},
 };
 
+inline PFun_slIsFeatureSupported* g_real_support = nullptr;
+inline hook::ModuleIdentity g_support_identity{};
+inline std::atomic_bool g_support_hooked{false};
+inline std::atomic_flag g_support_installing = ATOMIC_FLAG_INIT;
+inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapter);
+
+inline const std::vector<hook::HookItem> kSupportHooks = {
+    {"slIsFeatureSupported", reinterpret_cast<void**>(&g_real_support),
+     reinterpret_cast<void*>(&HookedIsFeatureSupported)},
+};
+
 inline void InstallLegacyInitHook() {
   if (!g_enabled.load() || !architecture::NeedsBridge()) return;
   if (g_legacy_installing.test_and_set()) return;
@@ -161,6 +172,50 @@ inline void LifecyclePreflight() {
   } catch (...) {
     Log("DLSS-G preflight failed", true);
   }
+}
+
+inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapter) {
+  if (!g_real_support) return sl::Result::eErrorNotInitialized;
+  if (g_shutting_down.load(std::memory_order_acquire) || !g_enabled.load() ||
+      !architecture::NeedsBridge() || feature != sl::kFeatureDLSS_G)
+    return g_real_support(feature, adapter);
+
+  LifecyclePreflight();
+  const auto gpu = ngx::internal::g_bound_gpu.load(std::memory_order_acquire);
+  ngx::internal::ScopedArchQuery scope(gpu);
+  const auto result = g_real_support(feature, adapter);
+
+  static std::atomic_uint32_t last_result{0xffffffffu};
+  const auto value = static_cast<uint32_t>(result);
+  if (last_result.exchange(value, std::memory_order_relaxed) != value) {
+    std::stringstream message;
+    message << "Streamline DLSS-G support query returned 0x" << std::hex << value;
+    Log(message.str(), result != sl::Result::eOk);
+  }
+  return result;
+}
+
+inline void InstallSupportHook() {
+  if (!g_enabled.load() || !architecture::NeedsBridge()) return;
+  if (g_support_installing.test_and_set()) return;
+  struct Guard {
+    ~Guard() { g_support_installing.clear(); }
+  } guard;
+
+  HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
+  if (!module || GetInterposerAbi(module) != InterposerAbi::kModern) return;
+
+  if (g_support_identity.module && !hook::IsCurrent(g_support_identity)) {
+    g_support_identity = {};
+    g_real_support = nullptr;
+    g_support_hooked.store(false, std::memory_order_release);
+  }
+  if (g_support_hooked.load(std::memory_order_acquire)) return;
+  if (g_support_identity.module && g_support_identity.module != module) return;
+  if (GetProcAddress(module, "slIsFeatureSupported") == nullptr ||
+      !hook::CaptureModule(module, g_support_identity)) return;
+  if (hook::Install(module, kSupportHooks, "Streamline support"))
+    g_support_hooked.store(true, std::memory_order_release);
 }
 
 template <size_t I>
@@ -322,6 +377,7 @@ inline FARPROC Resolve(HMODULE module, const char* name, FARPROC original, const
   if (std::strncmp(name, "sl", 2) == 0 &&
       ngx::internal::IsModuleNamed(module, L"sl.interposer.dll")) {
     internal::InstallLegacyInitHook();
+    internal::InstallSupportHook();
     if (g_on_interposer_loaded) g_on_interposer_loaded();
   }
   ngx::Resolve(module, name, original);
@@ -343,10 +399,16 @@ inline void Shutdown() {
     internal::ClearPluginRuntime(*it);
   ReleaseSRWLockExclusive(&internal::g_plugin_lock);
   ngx::Shutdown();
+  if (internal::g_support_hooked.exchange(false) &&
+      hook::IsCurrent(internal::g_support_identity)) {
+    hook::Uninstall(internal::kSupportHooks);
+  }
   if (internal::g_legacy_init_hooked.exchange(false) &&
       hook::IsCurrent(internal::g_interposer_identity)) {
     hook::Uninstall(internal::kLegacyHooks);
   }
+  internal::g_support_identity = {};
+  internal::g_real_support = nullptr;
   internal::g_interposer_identity = {};
   internal::g_real_legacy_init = nullptr;
   internal::g_self = nullptr;
@@ -367,6 +429,12 @@ inline void Draw() {
   }
   const auto* profile = architecture::ActiveProfile();
   if (!g_enabled.load() || !profile || !profile->NeedsRetarget()) return;
+
+  if (HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll")) {
+    const auto version = ReadModuleVersion(interposer);
+    ImGui::Text("Streamline: %u.%u.%u.%u", version.major, version.minor,
+                version.build, version.revision);
+  }
 
   ModuleVersion plugin_version{};
   bool plugin_seen = false;

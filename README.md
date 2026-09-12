@@ -11,8 +11,6 @@ Ampere, and Turing** GPUs through a ReShade/RenoDX addon.
   </a>
 </p>
 
-[▶ DLSS MFG 4x on Ampere | RTX 3090 | Cyberpunk 2077](https://www.youtube.com/watch?v=RrrmVoKKQMs)
-
 Patches are applied to mapped process memory and reverted on unload. **No NVIDIA
 binaries are redistributed.**
 
@@ -31,10 +29,33 @@ binaries are redistributed.**
 
    **If omitted, MFG Unlock will append itself automatically; restart the game
    once afterwards for MFG to be detected.**
-5. Use a recent `nvngx_dlssg.dll` if the game ships an older provider without MFG
-   support. Back up the original first.
-6. Use the game's multiplier selector when available. Otherwise use **Force frame
+5. If 3x/4x/6x MFG is unavailable, update
+   [`nvngx_dlssg.dll`](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/)
+   to a recent version.
+6. For Dynamic MFG, replace the game's Streamline files with
+   [Streamline 2.14.1 with DLSS-G 310.9.1](https://www.nexusmods.com/site/mods/1282?tab=files)
+   only in games known to accept a Streamline update. This replacement works, for
+   example, in **Cyberpunk 2077**. Do not use it with legacy Streamline 1.x titles
+   such as **A Plague Tale: Requiem**.
+7. Use the game's multiplier selector when available. Otherwise use **Force frame
    multiplier** in the ReShade **MFG Unlock** panel.
+
+### Dynamic MFG and Validated Warp Blend
+
+Both features work on **Ampere (RTX 30)**. They are not supported on
+**Turing (RTX 20)** because Turing targets `sm_75`, while this path requires
+`sm_80` or newer.
+
+**Dynamic MFG** lets NVIDIA adjust the MFG multiplier dynamically to reach the
+selected output FPS. It makes sense to try in D3D12 games that work with current
+Streamline. Use Streamline **2.14.1**, DLSS-G **310.9.1**, and NVIDIA driver
+**595.41 or newer**. It works, for example, in **Cyberpunk 2077**.
+
+Enable **NVIDIA Dynamic MFG** in MFG Unlock. If the game loads another Streamline
+version, select **Prefer local runtime**.
+
+**Validated Warp Blend** is an Ampere quality patch for DLSS-G **310.9.1**.
+Enable it and restart the game.
 
 ## Tested Games
 
@@ -49,7 +70,7 @@ binaries are redistributed.**
 | Resident Evil Requiem | | | Working | |
 | Assassin's Creed IV: Black Flag | | | Working | |
 | PRAGMATA | | | Working | |
-| Cyberpunk 2077 | Working | | Working | |
+| Cyberpunk 2077 | Working | | Working | Dynamic MFG + Validated Warp Blend validated on Ampere with Streamline 2.14.1 / DLSS-G 310.9.1 |
 | Portal with RTX | Partial | | | Native DLSS-G/MFG loads on Ampere; RTX Remix frame pacing remains unresolved |
 | Alan Wake 2 | | | Working | |
 | Dragon's Dogma 2 | | | Working | |
@@ -59,7 +80,7 @@ binaries are redistributed.**
 | Marvel's Spider-Man 2 | | | Working | |
 | Mortal Shell II | | | Working | |
 | Resonance: A Plague Tale Legacy | | | Working | |
-| A Plague Tale: Requiem | Working | | | Legacy Streamline 1.x |
+| A Plague Tale: Requiem | Working | | | Legacy Streamline 1.x; do not replace with Streamline 2.x |
 | Black Myth: Wukong | | | Working | |
 | Assetto Corsa Rally | | | Working | |
 | Indiana Jones and the Great Circle | | | Working | Launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
@@ -88,7 +109,9 @@ binaries are redistributed.**
 - GeForce RTX 20-, 30-, or 40-series GPU.
 - ReShade with addon support.
 - A game with NVIDIA DLSS Frame Generation through Streamline or NGX.
-- A recent `nvngx_dlssg.dll` when the bundled provider lacks MFG support.
+- A recent `nvngx_dlssg.dll` when 3x/4x/6x MFG is unavailable.
+- For Dynamic MFG on Ampere: Direct3D 12, Streamline 2.14.1, DLSS 310.9.1, and
+  NVIDIA driver 595.41 or newer.
 
 ## Vulkan
 
@@ -126,11 +149,14 @@ Settings use `[RenoDX.MFGUnlock]` in `ReShade.ini`.
 | `Enabled` | `1` | Enables the addon |
 | `Architecture` | `Auto` | `Auto`, `Ada`, `Ampere`, or `Turing` |
 | `MaxCount` | `4` | Reported `DLSSG.MultiFrameCountMax` |
-| `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` forces a multiplier |
+| `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` forces that exact multiplier |
+| `DynamicMFG` | `0` | Enables native Dynamic MFG on the validated Ampere setup; takes priority over `ForceMultiplier` |
+| `DynamicTargetFPS` | `0` | Dynamic output target; `0` follows display refresh |
+| `ValidatedWarpBlend` | `0` | Ampere quality patch for DLSS-G 310.9.1; restart required |
 | `TemporalFix` | `1` | Corrects generated-frame temporal positions |
 | `ForceFlipMeteringOff` | `0` | Legacy software pacing fallback |
 | `RaiseFrameCeiling` | `0` | Raises an old Streamline plugin's compiled limit to 6x |
-| `ForceOTAPlugins` | `0` | Requests the driver's OTA plugin set |
+| `RuntimeSelectionMode` | `0` | `0` keeps the game policy, `1` prefers local Streamline plugins, `2` forces NVIDIA OTA flags |
 
 ## Troubleshooting
 
@@ -143,8 +169,15 @@ Settings use `[RenoDX.MFGUnlock]` in `ReShade.ini`.
 ### Only Automatic or 2x appears
 
 - Toggle Frame Generation off and on after reaching the graphics menu.
-- Confirm the expected DLSS-G provider is loaded.
-- Check the MFG Unlock panel for provider and Frame Generation status.
+- Confirm the expected `nvngx_dlssg.dll` version is loaded.
+- Check the MFG Unlock panel for DLSS-G and Frame Generation status.
+
+### Dynamic MFG is unavailable or Warp Blend is not applied
+
+- Confirm the MFG Unlock panel shows Streamline 2.14.1 and DLSS-G 310.9.1.
+- After enabling Dynamic MFG, toggle Frame Generation off/on in the game.
+- Validated Warp Blend requires a restart. Legacy Streamline 1.x games should
+  keep their existing fixed MFG path.
 
 ### 3x/4x freezes or pacing becomes unusable
 
@@ -173,9 +206,13 @@ selected architecture:
    and its embedded CUDA code match a layout it knows how to patch.
 5. Only after the provider is ready does the addon make Streamline or NGX report
    Frame Generation as available for the selected GPU.
-6. At higher MFG multipliers, the temporal fix makes each generated frame use
-   its intended position between the two real frames instead of reusing the
-   same midpoint.
+6. At higher MFG multipliers, the temporal fix preserves a distinct intended
+   temporal position for each generated frame.
+7. On the validated Ampere D3D12 stack, Dynamic MFG requests NVIDIA's native
+   `DLSSGMode::eDynamic`; NVIDIA selects the active multiplier and owns pacing.
+8. On the exact validated 310.9.1 provider, Validated Warp Blend ports the
+   MFGAdaUnlock quality path to Ampere by validating later-stage reprojection
+   candidates before blending accepted warped color.
 
 Unknown provider layouts are left untouched.
 
@@ -206,13 +243,13 @@ Prebuilt binaries are attached to [Releases](../../releases).
 
 - https://github.com/dashdogy/RTX40MFG-Unlock
   provided the foundational reverse engineering and original working ASI
-  implementation. Dashdogy diagnosed the midpoint compaction bug, demonstrated
-  the corrected slot-9 temporal program, established the verified
+  implementation. Dashdogy diagnosed the higher-multiplier temporal compaction
+  bug, demonstrated the corrected slot-9 temporal program, established the verified
   Streamline/NGX interception strategy, and showed how to apply the fix only to
   mapped process memory without modifying NVIDIA DLLs on disk.
 - Dashdogy's project is published under the
   [MIT License](https://github.com/dashdogy/RTX40MFG-Unlock/blob/main/LICENSE).
-  The implementation in `midpoint.hpp` remains independently written for the
+  The temporal correction implementation remains independently written for the
   ReShade-addon format and was verified by reproducing the original patcher's
   output digest byte-for-byte.
 - [Dreamt](https://github.com/ImDreamt) created the original ReShade/RenoDX addon
@@ -221,7 +258,11 @@ Prebuilt binaries are attached to [Releases](../../releases).
   [MFGAdaUnlock-RenoDx](https://github.com/mavismmg/MFGAdaUnlock-RenoDx) fork,
   extending the Ada implementation with broader game and DLSS-G provider
   compatibility, lifecycle and pacing fixes, Vulkan support, runtime diagnostics,
-  and compatibility testing.
+  Dynamic MFG, and the Validated Warp Blend path later ported here to Ampere.
+- Tony Joaca, author of DLSSG-Transfusion, publicly identified
+  `Kernel_BlendCandidatesFused` as the useful intervention point behind the
+  `qualityValidWarp` option. That public research informed MFGAdaUnlock's
+  Validated Warp Blend path, which this repository ports to Ampere.
 - Special thanks to [Coldwood1026](https://github.com/Coldwood1026) for sharing
   `ptx_out.zip` with the DLSS-G PTX and demonstrating successful cubin
   compilation for SM 8.6 and SM 7.5, providing the starting point for the

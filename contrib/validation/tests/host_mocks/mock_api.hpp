@@ -313,6 +313,7 @@ enum class Result : uint32_t {
   eErrorAdapterNotSupported = 7,
   eErrorFeatureMissing = 31,
   eErrorFeatureNotSupported = 32,
+  eErrorUnsupportedInterface = 33,
   eErrorOSDisabledHWS = 4,
 };
 
@@ -332,7 +333,11 @@ enum class PreferenceFlags : uint32_t {
   eAllowOTA = 1u << 5,
   eLoadDownloadedPlugins = 1u << 6,
 };
+constexpr uint32_t kStructVersion1 = 1;
 struct Preferences {
+  static constexpr uint32_t s_structType = 0x70726566;
+  uint32_t structType = s_structType;
+  uint32_t structVersion = kStructVersion1;
   PreferenceFlags flags{};
   const Feature* features = nullptr;
   size_t numFeatures = 0;
