@@ -110,7 +110,6 @@ void Reset() {
   ampere::internal::g_providers.clear();
   ampere::internal::g_rejected.clear();
   ampere::internal::g_registry_failed = false;
-  ampere::internal::g_ignored_mappings = 0;
 
   mfgunlock::g_enabled = true;
   mfgunlock::architecture::Configure(mfgunlock::Architecture::kAmpere);
@@ -160,7 +159,7 @@ int main() {
 
     rejected.Unmap();
     Check(ampere::GetProviderStatus().ready == 1 && ampere::GetProviderStatus().blocked == 0 &&
-              ampere::GetProviderStatus().expired_rejections == 1 && Allowed(),
+              Allowed(),
           "expired rejection does not poison ready provider");
 
     // A historical rejection must not veto a provider that is currently qualified.
@@ -245,9 +244,8 @@ int main() {
     Check(!ampere::PrepareProvider(reuse.module), "identity old generation rejected");
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(reuse.bytes.data() + 0x80);
     ++nt->FileHeader.TimeDateStamp;
-    Check(ampere::GetProviderStatus().expired_rejections == 0 &&
-              ampere::GetProviderStatus().blocked == 1 && !Allowed(),
-          "reused address stays unqualified, not an expired veto");
+    Check(ampere::GetProviderStatus().blocked == 1 && !Allowed(),
+          "reused address stays unqualified");
     reuse.bytes[0x1001] = 0x90;
     Check(ampere::PrepareProvider(reuse.module) && Allowed(),
           "remapped candidate must pass full preparation");

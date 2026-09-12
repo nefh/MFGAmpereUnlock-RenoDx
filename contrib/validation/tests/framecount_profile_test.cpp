@@ -132,19 +132,18 @@ int main() {
   fc::g_on_init = ObserveInit;
   fc::g_init_compatible = [](HMODULE) { return true; };
   fc::g_force_ota = false;
-  fc::g_hooked = false;
   fc::g_feature_function_hooked = false;
   fc::g_init_hooked = false;
   fc::internal::g_real_get_feature_function = nullptr;
   fc::internal::g_real_init = nullptr;
   mock::install_ok = true;
   fc::TryInstall();
-  Check(fc::g_hooked.load() && fc::g_init_hooked.load() &&
-            !fc::g_feature_function_hooked.load() && fc::internal::g_real_init == Init,
-        "legacy Streamline installs slInit without slGetFeatureFunction");
+  Check(fc::g_init_hooked.load() && !fc::g_feature_function_hooked.load() &&
+            fc::internal::g_real_init == Init,
+        "legacy-compatible host installs slInit without slGetFeatureFunction");
   fc::Uninstall();
-  Check(!fc::g_hooked.load() && !fc::g_init_hooked.load(),
-        "legacy Streamline hook unloads cleanly");
+  Check(!fc::g_init_hooked.load() && !fc::g_feature_function_hooked.load(),
+        "Streamline hooks unload cleanly");
 
   std::printf("PASS frame-count profiles: %u checks\n", g_checks);
 }

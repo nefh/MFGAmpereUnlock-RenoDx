@@ -11,14 +11,11 @@ namespace mfgunlock::ampere {
 inline std::atomic_bool g_create_seen{false};
 inline unsigned int g_test_prepared_count = 0;
 inline unsigned int g_test_blocking_count = 0;
-inline unsigned int g_test_expired_count = 0;
 inline std::vector<std::string> g_test_log;
 
 struct ProviderStatus {
   unsigned int ready = 0;
   unsigned int blocked = 0;
-  unsigned int expired_rejections = 0;
-  unsigned int ignored_mappings = 0;
   bool busy = false;
   bool failed = false;
 
@@ -26,14 +23,10 @@ struct ProviderStatus {
     return busy || failed || blocked ? 0 : ready;
   }
 
-  const char* Reason() const {
-    if (blocked) return "active-provider-rejected-or-invalidated";
-    return ready == 1 ? "one-prepared-provider" : "no-prepared-provider";
-  }
 };
 
 inline ProviderStatus GetProviderStatus() {
-  return {g_test_prepared_count, g_test_blocking_count, g_test_expired_count, 0, false, false};
+  return {g_test_prepared_count, g_test_blocking_count, false, false};
 }
 
 inline unsigned int PreparedProviderCount() {

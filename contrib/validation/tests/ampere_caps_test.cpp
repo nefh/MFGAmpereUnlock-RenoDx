@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "../../../src/addons/mfgunlock/ampere_policy.hpp"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 
 using namespace mfgunlock;
 using namespace mfgunlock::ampere;
@@ -29,8 +29,6 @@ int main() {
     Check(CanRelaxRequirements(evidence, profile), "retargeted minimum with unsupported flag");
     evidence.flags = 0;
     Check(!CanRelaxRequirements(evidence, profile), "already supported is unchanged");
-    Check(std::strcmp(RequirementsDecision(evidence, profile), "already-supported") == 0,
-          "native supported classification");
 
     for (uint32_t feature = 0; feature < 40; ++feature) {
       for (uint32_t flags = 0; flags < 64; ++flags) {
@@ -45,8 +43,6 @@ int main() {
                 (minimum == profile->exposed_arch || minimum == profile->native_arch)));
           Check(CanRelaxRequirements(evidence, profile) == expected,
                 "feature/flag/minimum matrix");
-          Check((std::strcmp(RequirementsDecision(evidence, profile), "architecture-override") == 0) == expected,
-                "diagnostics agree with policy");
         }
       }
     }
@@ -76,10 +72,16 @@ int main() {
     Check(!CanRelaxRequirements(base, profile), "native or unresolved profile leaves NGX unchanged");
     Check(!CanExposeArchitecture(true, true, true, true, 0, profile), "no architecture spoof");
   }
-  for (uint32_t bits = 0; bits < 256; ++bits) {
-    Check(Hags27Enabled(bits) == ((bits & 1) != 0 && (bits & 2) != 0), "HAGS 2.7 decode");
-    Check(Hags29Enabled(bits) == ((bits & 3) != 0 && (bits & 4) != 0), "HAGS 2.9 decode");
-  }
-  Check(Hags27Enabled(0xb), "HAGS-enabled sample");
+
+  Check(CapabilityFrameCount(1, 3) == 3, "raise lower capability");
+  Check(CapabilityFrameCount(3, 3) == 3, "preserve equal capability");
+  Check(CapabilityFrameCount(5, 3) == 5, "never reduce native capability");
+  Check(CapabilityFrameCount(-1, 3) == -1, "preserve invalid capability");
+  Check(CapabilityFrameCount(1, 0) == 1, "zero limit leaves capability unchanged");
+  Check(CapabilityFrameCount(1, static_cast<unsigned int>(INT_MAX)) == INT_MAX,
+        "maximum signed limit accepted");
+  Check(CapabilityFrameCount(1, static_cast<unsigned int>(INT_MAX) + 1u) == 1,
+        "out-of-range limit rejected");
+
   std::printf("PASS capability policy: %u checks\n", g_checks);
 }

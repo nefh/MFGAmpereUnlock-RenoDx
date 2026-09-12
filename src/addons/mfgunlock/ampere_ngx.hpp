@@ -485,7 +485,6 @@ NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle) {
   const auto real = slot.entry_release;
   if (!real) return NVSDK_NGX_Result_FAIL_InvalidParameter;
   if (g_shutting_down.load(std::memory_order_acquire)) return real(handle);
-  const bool fg = IsTracked(slot, handle);
   const NVSDK_NGX_Result result = real(handle);
   if (result == NVSDK_NGX_Result_Success && handle != nullptr) {
     AcquireSRWLockExclusive(&slot.handles_lock);

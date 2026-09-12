@@ -46,6 +46,9 @@ constexpr HRESULT S_OK = 0;
 
 struct SRWLOCK {};
 
+inline bool TryAcquireSRWLockExclusive(SRWLOCK*) {
+  return true;
+}
 inline void AcquireSRWLockExclusive(SRWLOCK*) {}
 inline void ReleaseSRWLockExclusive(SRWLOCK*) {}
 inline void AcquireSRWLockShared(SRWLOCK*) {}
@@ -237,6 +240,7 @@ LONG D3DKMTCloseAdapter(const D3DKMT_CLOSEADAPTER*);
 
 enum NVSDK_NGX_Result : uint32_t {
   NVSDK_NGX_Result_Success = 1,
+  NVSDK_NGX_Result_FAIL_FeatureNotSupported = 0xbad00001,
   NVSDK_NGX_Result_FAIL_InvalidParameter = 0xbad00005,
 };
 enum NVSDK_NGX_Feature : uint32_t {
@@ -250,7 +254,33 @@ struct NVSDK_NGX_FeatureRequirement {
   unsigned int MinHWArchitecture = 0;
   char MinOSVersion[255]{};
 };
-struct NVSDK_NGX_Parameter {};
+struct NVSDK_NGX_Parameter {
+  std::map<std::string, uint32_t> values;
+  unsigned int writes = 0;
+  bool writable = true;
+
+  void Set(const char* name, unsigned int value) {
+    ++writes;
+    if (writable && name) values[name] = value;
+  }
+  void Set(const char* name, int value) {
+    Set(name, static_cast<unsigned int>(value));
+  }
+  NVSDK_NGX_Result Get(const char* name, unsigned int* output) const {
+    if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    const auto found = values.find(name);
+    if (found == values.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    *output = found->second;
+    return NVSDK_NGX_Result_Success;
+  }
+  NVSDK_NGX_Result Get(const char* name, int* output) const {
+    if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    const auto found = values.find(name);
+    if (found == values.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    *output = static_cast<int>(found->second);
+    return NVSDK_NGX_Result_Success;
+  }
+};
 struct NVSDK_NGX_Handle {
   unsigned int value = 0;
 };
@@ -258,6 +288,10 @@ using PFN_NVSDK_NGX_ProgressCallback = void (*)(float, bool&);
 
 NVSDK_NGX_Result NVSDK_NGX_D3D12_GetFeatureRequirements(
     IDXGIAdapter*, const NVSDK_NGX_FeatureDiscoveryInfo*, NVSDK_NGX_FeatureRequirement*);
+NVSDK_NGX_Result NVSDK_NGX_D3D12_GetCapabilityParameters(NVSDK_NGX_Parameter**);
+NVSDK_NGX_Result NVSDK_NGX_D3D12_GetParameters(NVSDK_NGX_Parameter**);
+NVSDK_NGX_Result NVSDK_NGX_VULKAN_GetCapabilityParameters(NVSDK_NGX_Parameter**);
+NVSDK_NGX_Result NVSDK_NGX_VULKAN_GetParameters(NVSDK_NGX_Parameter**);
 NVSDK_NGX_Result NVSDK_NGX_D3D12_CreateFeature(
     ID3D12GraphicsCommandList*, NVSDK_NGX_Feature, NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
 NVSDK_NGX_Result NVSDK_NGX_D3D12_EvaluateFeature(
