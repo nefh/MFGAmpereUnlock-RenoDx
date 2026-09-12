@@ -3,7 +3,13 @@
 Enables native NVIDIA DLSS Frame Generation / Multi Frame Generation on **Ada,
 Ampere, and Turing** GPUs through a ReShade/RenoDX addon.
 
-![MFGAmpereUnlock running on an RTX 3090](docs/media/ampere-screenshot.png)
+<p align="center">
+  <a href="docs/media/ampere-screenshot.jpg">
+    <img src="docs/media/ampere-screenshot.jpg"
+         alt="MFGAmpereUnlock running on an RTX 3090"
+         width="900">
+  </a>
+</p>
 
 [▶ DLSS MFG 4x on Ampere | RTX 3090 | Cyberpunk 2077](https://www.youtube.com/watch?v=RrrmVoKKQMs)
 
