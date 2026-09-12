@@ -11,8 +11,6 @@ Ampere, and Turing** GPUs through a ReShade/RenoDX addon.
   </a>
 </p>
 
-[▶ DLSS MFG 4x on Ampere | RTX 3090 | Cyberpunk 2077](https://www.youtube.com/watch?v=RrrmVoKKQMs)
-
 Patches are applied to mapped process memory and reverted on unload. **No NVIDIA
 binaries are redistributed.**
 
