@@ -19,9 +19,12 @@ namespace sl::param {
 struct IParameters;
 }
 
-#include "./ampere_ngx.hpp"
+#include "./ngx_bridge.hpp"
+#include "./provider.hpp"
 
-namespace mfgunlock::ampere::caps {
+namespace mfgunlock::streamline {
+using provider::GetProviderStatus;
+using provider::Log;
 inline void (*g_on_interposer_loaded)() = nullptr;
 namespace internal {
 inline HMODULE g_self = nullptr;
@@ -389,22 +392,22 @@ inline void Draw() {
   ModuleVersion provider_version{};
   bool provider_ready = false;
   std::string provider_error;
-  if (TryAcquireSRWLockShared(&ampere::internal::g_lock)) {
-    for (const auto& provider : ampere::internal::g_providers) {
+  if (TryAcquireSRWLockShared(&provider::internal::g_lock)) {
+    for (const auto& provider : provider::internal::g_providers) {
       if (!provider.ready) continue;
       provider_ready = true;
       provider_version = ReadModuleVersion(provider.module);
       break;
     }
     if (!provider_ready && provider_status.blocked) {
-      for (const auto& rejected : ampere::internal::g_rejected) {
-        if (!ampere::internal::IsImageMapping(rejected.module) ||
-            !ampere::internal::IsCurrent(rejected.module, rejected.identity)) continue;
+      for (const auto& rejected : provider::internal::g_rejected) {
+        if (!provider::internal::IsImageMapping(rejected.module) ||
+            !provider::internal::IsCurrent(rejected.module, rejected.identity)) continue;
         provider_error = rejected.reason;
         break;
       }
     }
-    ReleaseSRWLockShared(&ampere::internal::g_lock);
+    ReleaseSRWLockShared(&provider::internal::g_lock);
   }
   if (provider_ready) {
     ImGui::Text("Provider: %u.%u.%u.%u", provider_version.major, provider_version.minor,
@@ -426,4 +429,4 @@ inline void Draw() {
     ImGui::TextDisabled("Frame generation: waiting");
   }
 }
-}  // namespace mfgunlock::ampere::caps
+}  // namespace mfgunlock::streamline

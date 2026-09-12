@@ -2,13 +2,15 @@
 // Runs the production provider registry against simulated Windows memory and
 // loader operations. No NVIDIA DLL is loaded and no GPU code is executed.
 
-#include "../../../src/addons/mfgunlock/ampere.hpp"
-#include "../../../src/addons/mfgunlock/ampere_policy.hpp"
+#include "../../../src/addons/mfgunlock/provider.hpp"
+#include "../../../src/addons/mfgunlock/capability_policy.hpp"
 
 #include <iostream>
 #include <stdexcept>
 
-namespace ampere = mfgunlock::ampere;
+namespace provider = mfgunlock::provider;
+namespace policy = mfgunlock::policy;
+namespace architecture = mfgunlock::architecture;
 namespace mock = provider_mock;
 
 using Bytes = std::vector<unsigned char>;
@@ -66,7 +68,7 @@ struct Image {
     if (!valid_gate) bytes[0x1001] = 0xb0;
 
     // One minimal compressed PTX container. This is the same validated layout
-    // used by ampere_ptx_test.
+    // used by ptx_retarget_test.
     std::string ptx =
         ".version 8.7\n"
         ".target sm_89\n"
@@ -107,13 +109,13 @@ struct Image {
 };
 
 void Reset() {
-  ampere::internal::g_providers.clear();
-  ampere::internal::g_rejected.clear();
-  ampere::internal::g_registry_failed = false;
+  provider::internal::g_providers.clear();
+  provider::internal::g_rejected.clear();
+  provider::internal::g_registry_failed = false;
 
   mfgunlock::g_enabled = true;
   mfgunlock::architecture::Configure(mfgunlock::Architecture::kAmpere);
-  ampere::g_create_seen = false;
+  provider::g_create_seen = false;
 
   mock::regions.clear();
   mock::exports.clear();
@@ -126,9 +128,9 @@ void Reset() {
 }
 
 bool Allowed() {
-  return ampere::CanRelaxRequirements({true, true, ampere::PreparedProviderCount(),
-                                       ampere::kNgxSuccess, ampere::kDlssGFeatureId,
-                                       ampere::kAdapterUnsupported, ampere::kAdaArchitecture},
+  return policy::CanRelaxRequirements({true, true, provider::PreparedProviderCount(),
+                                       policy::kNgxSuccess, policy::kDlssGFeatureId,
+                                       policy::kAdapterUnsupported, architecture::kAdaArchitecture},
                                       mfgunlock::architecture::ActiveProfile());
 }
 
@@ -139,140 +141,140 @@ int main() {
     Reset();
     Image ready(1);
     const auto original = ready.bytes;
-    Check(ampere::PrepareProvider(ready.module), "initial provider preparation");
-    Check(ampere::PreparedProviderCount() == 1 && Allowed(),
+    Check(provider::PrepareProvider(ready.module), "initial provider preparation");
+    Check(provider::PreparedProviderCount() == 1 && Allowed(),
           "single prepared provider admitted");
     Check(ready.bytes[0x1001] == 0x70, "minimum arch written last");
 
     auto writes = mock::protection_calls;
-    Check(ampere::PrepareProvider(ready.module) && mock::protection_calls == writes,
+    Check(provider::PrepareProvider(ready.module) && mock::protection_calls == writes,
           "preparation idempotent");
 
     Image rejected(2, false);
-    Check(!ampere::PrepareProvider(rejected.module), "unrecognized genuine provider rejected");
-    Check(ampere::GetProviderStatus().ready == 1 && ampere::GetProviderStatus().blocked == 1 &&
+    Check(!provider::PrepareProvider(rejected.module), "unrecognized genuine provider rejected");
+    Check(provider::GetProviderStatus().ready == 1 && provider::GetProviderStatus().blocked == 1 &&
               !Allowed(),
           "live rejected provider vetoes");
-    Check(!ampere::internal::g_rejected.front().path.empty() &&
-              !ampere::internal::g_rejected.front().reason.empty(),
+    Check(!provider::internal::g_rejected.front().path.empty() &&
+              !provider::internal::g_rejected.front().reason.empty(),
           "rejection identifies module and reason");
 
     rejected.Unmap();
-    Check(ampere::GetProviderStatus().ready == 1 && ampere::GetProviderStatus().blocked == 0 &&
+    Check(provider::GetProviderStatus().ready == 1 && provider::GetProviderStatus().blocked == 0 &&
               Allowed(),
           "expired rejection does not poison ready provider");
 
     // A historical rejection must not veto a provider that is currently qualified.
-    const unsigned int old_count = ampere::internal::g_rejected.empty() ? 1u : 0u;
-    Check(old_count == 0 && ampere::PreparedProviderCount() == 1,
+    const unsigned int old_count = provider::internal::g_rejected.empty() ? 1u : 0u;
+    Check(old_count == 0 && provider::PreparedProviderCount() == 1,
           "historical global veto is distinguishable from the live registry");
-    Check(ampere::PrepareProvider(ready.module),
+    Check(provider::PrepareProvider(ready.module),
           "historical rejection cannot block idempotent reuse");
 
     auto tagged = reinterpret_cast<HMODULE>(reinterpret_cast<uintptr_t>(ready.module) | 1u);
     writes = mock::protection_calls;
-    Check(!ampere::PrepareProvider(tagged) && mock::protection_calls == writes && Allowed(),
+    Check(!provider::PrepareProvider(tagged) && mock::protection_calls == writes && Allowed(),
           "tagged resource ignored without writes");
 
     Image data(3);
     for (auto& region : mock::regions) {
       if (region.base == data.module) region.type = MEM_MAPPED;
     }
-    Check(!ampere::PrepareProvider(data.module) && Allowed(),
+    Check(!provider::PrepareProvider(data.module) && Allowed(),
           "data mapping ignored without global veto");
 
     Image nonprovider(4);
     mock::exports.erase({nonprovider.module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl"});
     mock::exports.erase({nonprovider.module, "NVSDK_NGX_GetGPUArchitecture"});
-    Check(!ampere::PrepareProvider(nonprovider.module) && Allowed(),
+    Check(!provider::PrepareProvider(nonprovider.module) && Allowed(),
           "filename-only false positive ignored");
 
     Image forwarded(5);
     mock::exports[{forwarded.module, "NVSDK_NGX_GetGPUArchitecture"}] =
         reinterpret_cast<FARPROC>(ready.bytes.data() + 0x1000);
-    Check(!ampere::PrepareProvider(forwarded.module) && !Allowed(),
+    Check(!provider::PrepareProvider(forwarded.module) && !Allowed(),
           "unresolved forwarded ABI blocks, never patched");
     forwarded.Unmap();
 
     Image incomplete(13);
     mock::exports.erase({incomplete.module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl"});
-    Check(!ampere::PrepareProvider(incomplete.module) && !Allowed(),
+    Check(!provider::PrepareProvider(incomplete.module) && !Allowed(),
           "partial provider ABI is a real blocker");
 
     auto* reused_header = reinterpret_cast<IMAGE_NT_HEADERS64*>(incomplete.bytes.data() + 0x80);
     ++reused_header->FileHeader.TimeDateStamp;
-    Check(ampere::GetProviderStatus().ready == 1 && ampere::GetProviderStatus().blocked == 1 &&
+    Check(provider::GetProviderStatus().ready == 1 && provider::GetProviderStatus().blocked == 1 &&
               !Allowed(),
           "new image at rejected address cannot authorize the other ready provider");
     incomplete.Unmap();
 
     Image retry(6);
     mock::retain_ok = false;
-    Check(!ampere::PrepareProvider(retry.module) && !Allowed(),
+    Check(!provider::PrepareProvider(retry.module) && !Allowed(),
           "unretained real provider blocks");
     mock::retain_ok = true;
-    Check(ampere::PrepareProvider(retry.module), "same provider can be fully requalified");
-    Check(ampere::GetProviderStatus().blocked == 0 && ampere::GetProviderStatus().ready == 2 &&
+    Check(provider::PrepareProvider(retry.module), "same provider can be fully requalified");
+    Check(provider::GetProviderStatus().blocked == 0 && provider::GetProviderStatus().ready == 2 &&
               !Allowed(),
           "two prepared providers remain ambiguous");
-    Check(ampere::internal::g_rejected.size() == 3,
+    Check(provider::internal::g_rejected.size() == 3,
           "only successful transaction retires its own rejection");
 
-    ampere::Restore();
+    provider::Restore();
     Check(ready.bytes == original, "restore original provider bytes");
 
     Reset();
     Image failing(7);
     mock::fail_protection_call = 2;
     const auto clean = failing.bytes;
-    Check(!ampere::PrepareProvider(failing.module),
+    Check(!provider::PrepareProvider(failing.module),
           "post-write protection failure rejects transaction");
-    Check(failing.bytes == clean && ampere::GetProviderStatus().blocked == 1 && !Allowed(),
+    Check(failing.bytes == clean && provider::GetProviderStatus().blocked == 1 && !Allowed(),
           "rollback verified and failed transaction blocks");
-    Check(!ampere::internal::g_providers.front().failure.empty(),
+    Check(!provider::internal::g_providers.front().failure.empty(),
           "transaction failure has diagnostic");
 
     Reset();
     Image mismatch(8);
-    Check(ampere::PrepareProvider(mismatch.module), "prepare for invalidation test");
+    Check(provider::PrepareProvider(mismatch.module), "prepare for invalidation test");
     mismatch.bytes[0x1001] = 0x90;
-    Check(ampere::GetProviderStatus().blocked == 1 && !Allowed(),
+    Check(provider::GetProviderStatus().blocked == 1 && !Allowed(),
           "external gate modification cannot pass");
 
     Reset();
     Image reuse(9, false);
-    Check(!ampere::PrepareProvider(reuse.module), "identity old generation rejected");
+    Check(!provider::PrepareProvider(reuse.module), "identity old generation rejected");
     auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(reuse.bytes.data() + 0x80);
     ++nt->FileHeader.TimeDateStamp;
-    Check(ampere::GetProviderStatus().blocked == 1 && !Allowed(),
+    Check(provider::GetProviderStatus().blocked == 1 && !Allowed(),
           "reused address stays unqualified");
     reuse.bytes[0x1001] = 0x90;
-    Check(ampere::PrepareProvider(reuse.module) && Allowed(),
+    Check(provider::PrepareProvider(reuse.module) && Allowed(),
           "remapped candidate must pass full preparation");
-    Check(ampere::internal::g_rejected.empty(),
+    Check(provider::internal::g_rejected.empty(),
           "successful new generation clears old rejection");
 
     mock::force_lock_busy = true;
-    Check(ampere::GetProviderStatus().busy && !Allowed(), "registry lock contention fails closed");
+    Check(provider::GetProviderStatus().busy && !Allowed(), "registry lock contention fails closed");
     mock::force_lock_busy = false;
 
     Reset();
     Image bad(10);
     bad.bytes[0] = 0;
-    Check(!ampere::PrepareProvider(bad.module) && ampere::GetProviderStatus().failed && !Allowed(),
+    Check(!provider::PrepareProvider(bad.module) && provider::GetProviderStatus().failed && !Allowed(),
           "malformed executable never silently ignored");
 
     Reset();
     Image late(11);
-    ampere::g_create_seen = true;
-    Check(!ampere::PrepareProvider(late.module) && !Allowed(),
+    provider::g_create_seen = true;
+    Check(!provider::PrepareProvider(late.module) && !Allowed(),
           "new provider after Create refused");
 
     Reset();
     Image disabled(12);
     mfgunlock::g_enabled = false;
-    Check(!ampere::PrepareProvider(disabled.module) && mock::protection_calls == 0,
-          "disabled Ampere path makes no writes");
+    Check(!provider::PrepareProvider(disabled.module) && mock::protection_calls == 0,
+          "disabled backport path makes no writes");
 
     for (auto selected : {mfgunlock::Architecture::kAmpere, mfgunlock::Architecture::kTuring}) {
       Reset();
@@ -280,7 +282,7 @@ int main() {
       const auto* profile = mfgunlock::architecture::ActiveProfile();
       Image target(100);
       const auto before = target.bytes;
-      Check(ampere::PrepareProvider(target.module), "explicit profile prepares provider");
+      Check(provider::PrepareProvider(target.module), "explicit profile prepares provider");
       Check(target.bytes[0x1001] == static_cast<unsigned char>(profile->native_arch),
             "minimum architecture follows profile");
       Check(mfgunlock::fatbin::ReadU32(target.bytes.data() + 0x2000 + 44) == profile->target_sm,
@@ -288,14 +290,14 @@ int main() {
       target.bytes[0x1100] = 0xb0;
       target.bytes[0x1101] = 0xb0;
       unsigned char* sites[] = {target.bytes.data() + 0x1100, target.bytes.data() + 0x1101};
-      Check(ampere::ApplyMfgComparisons(sites), "profile MFG comparison transaction");
+      Check(provider::ApplyMfgComparisons(sites), "profile MFG comparison transaction");
       Check(*sites[0] == static_cast<unsigned char>(profile->native_arch) &&
                 *sites[1] == static_cast<unsigned char>(profile->native_arch),
             "MFG comparisons use native target, not spoofed Ada");
       // Comparison sites are owned/restored by addon.cpp, not the provider transaction.
       *sites[0] = before[0x1100];
       *sites[1] = before[0x1101];
-      ampere::Restore();
+      provider::Restore();
       Check(target.bytes == before, "profile restore is byte exact");
     }
 
@@ -303,7 +305,7 @@ int main() {
     mfgunlock::architecture::Configure(mfgunlock::Architecture::kAda);
     Image ada(101);
     const auto ada_before = ada.bytes;
-    Check(!ampere::PrepareProvider(ada.module) && ada.bytes == ada_before &&
+    Check(!provider::PrepareProvider(ada.module) && ada.bytes == ada_before &&
               mock::protection_calls == 0,
           "Ada skips backport preparation");
 
@@ -311,16 +313,16 @@ int main() {
     mfgunlock::architecture::Configure(mfgunlock::Architecture::kAuto);
     Image automatic(102);
     const auto automatic_before = automatic.bytes;
-    Check(!ampere::PrepareProvider(automatic.module) && automatic.bytes == automatic_before,
+    Check(!provider::PrepareProvider(automatic.module) && automatic.bytes == automatic_before,
           "pending Auto writes nothing");
     mfgunlock::architecture::ResolveAuto(0x10de, 0x160, 2);
-    Check(ampere::PrepareProvider(automatic.module) && automatic.bytes[0x1001] == 0x60,
+    Check(provider::PrepareProvider(automatic.module) && automatic.bytes[0x1001] == 0x60,
           "resolved Auto uses Turing provider target");
-    ampere::Restore();
+    provider::Restore();
     Check(automatic.bytes == automatic_before, "Auto provider restored");
 
     std::cout << "provider state: " << g_checks
-              << " checks PASS (real ampere.hpp; simulated Windows memory)\n";
+              << " checks PASS (real provider.hpp; simulated Windows memory)\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';

@@ -25,11 +25,22 @@
 #include <sstream>
 #include <type_traits>
 
-#include "./ampere.hpp"
-#include "./ampere_policy.hpp"
+#include "./provider.hpp"
+#include "./capability_policy.hpp"
 #include "./ngx_hook.hpp"
 
-namespace mfgunlock::ampere::ngx {
+namespace mfgunlock::ngx {
+
+using architecture::kNvidiaVendorId;
+using policy::CanExposeArchitecture;
+using policy::CanRelaxRequirements;
+using policy::CapabilityFrameCount;
+using policy::RequirementsEvidence;
+using policy::kDlssGFeatureId;
+using provider::GetProviderStatus;
+using provider::Log;
+using provider::PreparedProviderCount;
+using provider::g_create_seen;
 
 // Set by addon.cpp. This deliberately reuses the addon's existing provider
 // inventory and maintenance lock instead of maintaining a second module model.
@@ -728,4 +739,4 @@ inline void Shutdown() {
   internal::g_luid_low.store(0);
   internal::g_luid_high.store(0);
 }
-}  // namespace mfgunlock::ampere::ngx
+}  // namespace mfgunlock::ngx

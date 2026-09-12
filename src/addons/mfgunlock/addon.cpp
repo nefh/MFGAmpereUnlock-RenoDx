@@ -29,7 +29,7 @@
 #include "./framecount.hpp"
 #include "./loadhook.hpp"
 #include "./midpoint.hpp"
-#include "./ampere_caps.hpp"
+#include "./streamline_bridge.hpp"
 namespace {
 
 constexpr const char* kConfigSection = "RenoDX.MFGUnlock";
@@ -174,7 +174,7 @@ void PatchArchGatesInModule(HMODULE mod) {
   const auto* profile = mfgunlock::architecture::ActiveProfile();
   if (!g_enabled.load() || !profile) return;
   const bool retarget = profile->NeedsRetarget();
-  if (retarget && (!mfgunlock::ampere::PrepareProvider(mod) || !HasTemporalPatch(mod))) return;
+  if (retarget && (!mfgunlock::provider::PrepareProvider(mod) || !HasTemporalPatch(mod))) return;
   if (std::find(g_gate_modules.begin(), g_gate_modules.end(), mod) != g_gate_modules.end()) return;
   if (std::find(g_gate_rejected_modules.begin(), g_gate_rejected_modules.end(), mod) !=
       g_gate_rejected_modules.end()) {
@@ -224,11 +224,11 @@ void PatchArchGatesInModule(HMODULE mod) {
   if (retarget) {
     g_gate_sites.reserve(g_gate_sites.size() + found.size());
     g_gate_modules.reserve(g_gate_modules.size() + 1);
-    if (!mfgunlock::ampere::ApplyMfgComparisons(found)) return;
+    if (!mfgunlock::provider::ApplyMfgComparisons(found)) return;
     for (unsigned char* site : found) g_gate_sites.push_back({site, kArchOld});
     g_gate_modules.push_back(mod);
     g_gate_patched.store(true, std::memory_order_release);
-    mfgunlock::ampere::Log("MFG comparison gates opened after PTX and temporal preparation");
+    mfgunlock::provider::Log("MFG comparison gates opened after PTX and temporal preparation");
     return;
   }
   const size_t sites_before = g_gate_sites.size();
@@ -305,7 +305,7 @@ void PatchMidpointInModule(HMODULE mod) {
   if (mod == nullptr) return;
   const auto* profile = mfgunlock::architecture::ActiveProfile();
   if (!g_enabled.load() || !profile) return;
-  if (profile->NeedsRetarget() && !mfgunlock::ampere::PrepareProvider(mod)) return;
+  if (profile->NeedsRetarget() && !mfgunlock::provider::PrepareProvider(mod)) return;
   const auto already_patched = std::find_if(
       g_midpoint_modules.begin(), g_midpoint_modules.end(),
       [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
@@ -724,7 +724,7 @@ void RestoreFlipMetering() {
 }
 
 void RefreshRuntime() {
-  mfgunlock::ampere::ngx::BeforeInit();
+  mfgunlock::ngx::BeforeInit();
   RunProviderMaintenance();
   if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
   mfgunlock::framecount::TryInstall();
@@ -749,7 +749,7 @@ void EnsureEarlyLoadConfig() {
   if (!reshade::get_config_value(nullptr, kAddonSection, kEarlyLoadKey, nullptr, &value_size)) {
     reshade::set_config_value(nullptr, kAddonSection, kEarlyLoadKey, kAddonFileName);
     g_early_load_restart_required.store(true, std::memory_order_release);
-    mfgunlock::ampere::Log("early loading configured; restart the game once");
+    mfgunlock::provider::Log("early loading configured; restart the game once");
     return;
   }
 
@@ -765,7 +765,7 @@ void EnsureEarlyLoadConfig() {
   reshade::set_config_value(nullptr, kAddonSection, kEarlyLoadKey,
                             merged.data(), merged.size());
   g_early_load_restart_required.store(true, std::memory_order_release);
-  mfgunlock::ampere::Log("early loading configured; restart the game once");
+  mfgunlock::provider::Log("early loading configured; restart the game once");
 }
 
 // ---------------------------------------------------------------- overlay
@@ -775,7 +775,7 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::Text("Restart the game once to enable early loading.");
     ImGui::Separator();
   }
-  mfgunlock::ampere::caps::Draw();
+  mfgunlock::streamline::Draw();
   bool enabled = g_enabled.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Enable multi-frame override", &enabled)) {
     g_enabled.store(enabled, std::memory_order_relaxed);
@@ -885,7 +885,7 @@ void LoadConfig() {
       : mfgunlock::architecture::Parse(has_architecture ? architecture_name : nullptr);
   mfgunlock::architecture::Configure(selected);
   if (selected == mfgunlock::Architecture::kUnknown)
-    mfgunlock::ampere::Log("invalid Architecture setting", true);
+    mfgunlock::provider::Log("invalid Architecture setting", true);
   if (reshade::get_config_value(nullptr, kConfigSection, "MaxCount", value)) {
     if (value < static_cast<int>(kMinCount)) value = static_cast<int>(kMinCount);
     if (value > static_cast<int>(kMaxCount)) value = static_cast<int>(kMaxCount);
@@ -923,21 +923,21 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       if (!reshade::register_addon(h_module)) return FALSE;
       LoadConfig();
       EnsureEarlyLoadConfig();
-      mfgunlock::ampere::caps::Initialize(g_self_module);
-      mfgunlock::ampere::ngx::g_prepare_loaded_providers = RunProviderMaintenance;
-      mfgunlock::ampere::caps::g_on_interposer_loaded = mfgunlock::framecount::TryInstall;
-      mfgunlock::loadhook::g_on_get_proc_address = mfgunlock::ampere::caps::Resolve;
-      mfgunlock::framecount::g_on_init = mfgunlock::ampere::caps::OnInit;
-      mfgunlock::framecount::g_init_compatible = mfgunlock::ampere::caps::CanHookInit;
+      mfgunlock::streamline::Initialize(g_self_module);
+      mfgunlock::ngx::g_prepare_loaded_providers = RunProviderMaintenance;
+      mfgunlock::streamline::g_on_interposer_loaded = mfgunlock::framecount::TryInstall;
+      mfgunlock::loadhook::g_on_get_proc_address = mfgunlock::streamline::Resolve;
+      mfgunlock::framecount::g_on_init = mfgunlock::streamline::OnInit;
+      mfgunlock::framecount::g_init_compatible = mfgunlock::streamline::CanHookInit;
       mfgunlock::framecount::g_multi_frame_ready = []() {
         const auto* profile = mfgunlock::architecture::ActiveProfile();
         if (!g_enabled.load() || !profile) return false;
         if (!profile->NeedsRetarget()) return true;
-        return mfgunlock::ampere::PreparedProviderCount() == 1 &&
+        return mfgunlock::provider::PreparedProviderCount() == 1 &&
                g_midpoint_patched.load(std::memory_order_acquire) &&
                g_gate_patched.load(std::memory_order_acquire);
       };
-      mfgunlock::ampere::ngx::g_capability_limit = []() -> unsigned int {
+      mfgunlock::ngx::g_capability_limit = []() -> unsigned int {
         return mfgunlock::framecount::g_multi_frame_ready() ? g_max_count.load() : 0;
       };
       // The frame-count override must never ask for more generated frames than
@@ -953,14 +953,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       // providers are found by that one shared scan; anything mapped later is
       // patched directly here without enumerating modules from Present.
       mfgunlock::loadhook::g_on_interposer_loaded = []() {
-        mfgunlock::ampere::caps::internal::InstallLegacyInitHook();
+        mfgunlock::streamline::internal::InstallLegacyInitHook();
         mfgunlock::framecount::TryInstall();
       };
-      mfgunlock::loadhook::g_on_ngx_loaded = mfgunlock::ampere::ngx::TryInstall;
+      mfgunlock::loadhook::g_on_ngx_loaded = mfgunlock::ngx::TryInstall;
       mfgunlock::loadhook::g_on_dlssg_loaded = ProcessLoadedDlssgModule;
       mfgunlock::loadhook::TryInstall();
-      mfgunlock::ampere::ngx::EnsureEntryHooks();
-      mfgunlock::ampere::caps::internal::InstallLegacyInitHook();
+      mfgunlock::ngx::EnsureEntryHooks();
+      mfgunlock::streamline::internal::InstallLegacyInitHook();
       RunProviderMaintenance();
       if (g_force_flip_meter_off.load(std::memory_order_relaxed)) TryPatchFlipMetering();
       mfgunlock::framecount::TryInstall();
@@ -979,16 +979,16 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       mfgunlock::loadhook::g_on_dlssg_loaded = nullptr;
       mfgunlock::loadhook::g_on_interposer_loaded = nullptr;
       mfgunlock::loadhook::g_on_ngx_loaded = nullptr;
-      mfgunlock::ampere::ngx::g_capability_limit = nullptr;
+      mfgunlock::ngx::g_capability_limit = nullptr;
       mfgunlock::framecount::g_on_init = nullptr;
       mfgunlock::framecount::g_init_compatible = nullptr;
       mfgunlock::framecount::g_multi_frame_ready = nullptr;
-      mfgunlock::ampere::ngx::g_prepare_loaded_providers = nullptr;
-      mfgunlock::ampere::caps::Shutdown();
+      mfgunlock::ngx::g_prepare_loaded_providers = nullptr;
+      mfgunlock::streamline::Shutdown();
       mfgunlock::framecount::Uninstall();
       RestoreMidpoint();
       RestoreDlssgArchGate();
-      mfgunlock::ampere::Restore();
+      mfgunlock::provider::Restore();
       RestoreFrameCountCeiling();
       RestoreFlipMetering();
       reshade::unregister_addon(h_module);

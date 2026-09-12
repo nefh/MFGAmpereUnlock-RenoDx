@@ -16,7 +16,7 @@
 #include "./architecture.hpp"
 #include "./fatbin.hpp"
 
-namespace mfgunlock::ampere::ptx {
+namespace mfgunlock::ptx {
 
 enum class Result {
   kUnchanged,
@@ -242,4 +242,4 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
   return Result::kRetargeted;
 }
 
-}  // namespace mfgunlock::ampere::ptx
+}  // namespace mfgunlock::ptx

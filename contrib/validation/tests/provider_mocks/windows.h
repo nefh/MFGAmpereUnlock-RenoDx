@@ -68,7 +68,7 @@ inline DWORD GetModuleFileNameA(HMODULE module,char* output,DWORD capacity){
  std::memcpy(output,it->second.c_str(),it->second.size()+1);return static_cast<DWORD>(it->second.size());
 }
 
-// The temporal composition test includes midpoint.hpp as well as ampere.hpp.
+// The temporal composition test includes midpoint.hpp as well as provider.hpp.
 constexpr DWORD MEM_RESERVE = 0x2000, MEM_RELEASE = 0x8000;
 inline const IMAGE_SECTION_HEADER* IMAGE_FIRST_SECTION(const IMAGE_NT_HEADERS64* nt) {
   return reinterpret_cast<const IMAGE_SECTION_HEADER*>(

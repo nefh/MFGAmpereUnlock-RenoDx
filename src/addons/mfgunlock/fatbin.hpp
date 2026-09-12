@@ -1,5 +1,5 @@
 /*
- * Minimal CUDA fatbin parser used by the Ampere PTX retargeter.
+ * Minimal CUDA fatbin parser used by the DLSS-G PTX retargeter.
  * SPDX-License-Identifier: MIT
  *
  * NVIDIA does not publish this container format as a stable ABI. Every parser

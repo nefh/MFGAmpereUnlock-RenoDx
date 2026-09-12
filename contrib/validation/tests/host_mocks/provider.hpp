@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
 // Provider test double. Production provider behavior is covered separately by
-// provider_state_test and ampere_ptx_test.
+// provider_state_test and ptx_retarget_test.
 #pragma once
 
 #include "mock_api.hpp"
 #include "architecture.hpp"
 
-namespace mfgunlock::ampere {
+namespace mfgunlock::provider {
 
 inline std::atomic_bool g_create_seen{false};
 inline unsigned int g_test_prepared_count = 0;
@@ -68,4 +68,4 @@ inline std::vector<Provider> g_providers;
 inline std::vector<Rejection> g_rejected;
 
 }  // namespace internal
-}  // namespace mfgunlock::ampere
+}  // namespace mfgunlock::provider

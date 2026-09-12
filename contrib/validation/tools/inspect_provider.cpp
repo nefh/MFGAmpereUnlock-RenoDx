@@ -2,7 +2,7 @@
 // Read-only provider inspection. The file is parsed as data; it is never loaded
 // and no CUDA code is executed.
 
-#include "../../../src/addons/mfgunlock/ampere_ptx.hpp"
+#include "../../../src/addons/mfgunlock/ptx_retarget.hpp"
 #include "temporal_probe.hpp"
 
 #include <filesystem>
@@ -12,7 +12,7 @@
 #include <stdexcept>
 
 namespace fatbin = mfgunlock::fatbin;
-namespace ampere_ptx = mfgunlock::ampere::ptx;
+namespace ptx = mfgunlock::ptx;
 namespace temporal = mfgunlock::midpoint::internal;
 
 using Bytes = std::vector<unsigned char>;
@@ -143,12 +143,12 @@ int main(int argc, char** argv) {
         const size_t fatbin_bytes = 16 + static_cast<size_t>(payload_bytes);
         if (++total > 512) throw std::runtime_error("fatbin count limit");
 
-        ampere_ptx::Plan plan;
+        ptx::Plan plan;
         std::string detail;
-        const auto result = ampere_ptx::Retarget({candidate, fatbin_bytes}, plan, detail, *target_profile);
-        const bool accepted = result == ampere_ptx::Result::kRetargeted;
+        const auto result = ptx::Retarget({candidate, fatbin_bytes}, plan, detail, *target_profile);
+        const bool accepted = result == ptx::Result::kRetargeted;
         retargeted += accepted;
-        rejected += result == ampere_ptx::Result::kRejected;
+        rejected += result == ptx::Result::kRejected;
 
         bool temporal_compatible = false;
         if (accepted || !target_profile->NeedsRetarget()) {

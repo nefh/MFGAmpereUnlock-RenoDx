@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-#include "../../../src/addons/mfgunlock/ampere_policy.hpp"
-#include "../../../src/addons/mfgunlock/ampere_ptx.hpp"
+#include "../../../src/addons/mfgunlock/capability_policy.hpp"
+#include "../../../src/addons/mfgunlock/ptx_retarget.hpp"
 #if defined(MFG_TEST_RUNTIME_MIDPOINT)
 #include "../../../src/addons/mfgunlock/midpoint.hpp"
 #else
@@ -13,7 +13,7 @@
 #include <stdexcept>
 
 namespace fb = mfgunlock::fatbin;
-namespace ap = mfgunlock::ampere::ptx;
+namespace ptx = mfgunlock::ptx;
 namespace temporal = mfgunlock::midpoint::internal;
 
 using Bytes = std::vector<unsigned char>;
@@ -92,8 +92,8 @@ void Composition(const Bytes& raw, bool mixed = false,
   std::string reason;
   Check(temporal::BuildTemporalFatbin(fatbin.data(), fatbin.size(), *profile, ada, reason));
 
-  ap::Plan retargeted;
-  Check(ap::Retarget(fatbin, retargeted, reason, target_profile) == ap::Result::kRetargeted);
+  ptx::Plan retargeted;
+  Check(ptx::Retarget(fatbin, retargeted, reason, target_profile) == ptx::Result::kRetargeted);
 
   Bytes composed;
   const size_t visible_bytes =
@@ -126,7 +126,7 @@ void Composition(const Bytes& raw, bool mixed = false,
 }
 
 void Policy() {
-  using namespace mfgunlock::ampere;
+  using namespace mfgunlock::policy;
 
   RequirementsEvidence evidence{true, true, 1, kNgxSuccess, kDlssGFeatureId,
                                 kAdapterUnsupported, kAdaArchitecture};

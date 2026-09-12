@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-#include "../../../src/addons/mfgunlock/ampere_ptx.hpp"
+#include "../../../src/addons/mfgunlock/ptx_retarget.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -9,7 +9,7 @@
 #include <stdexcept>
 
 namespace fb = mfgunlock::fatbin;
-namespace ap = mfgunlock::ampere::ptx;
+namespace ptx = mfgunlock::ptx;
 
 using Bytes = std::vector<unsigned char>;
 
@@ -67,10 +67,10 @@ Bytes Container(std::string text, const Bytes* payload = nullptr) {
 
 void UnitTests() {
   std::string reason;
-  ap::Plan plan;
+  ptx::Plan plan;
   const auto valid = Container(std::string(kPtx));
 
-  Check(ap::Retarget(valid, plan, reason) == ap::Result::kRetargeted);
+  Check(ptx::Retarget(valid, plan, reason) == ptx::Result::kRetargeted);
   Check(plan.replacement.size() == valid.size());
   Check(fb::ReadU32(plan.replacement.data() + 44) == 86);
 
@@ -88,44 +88,44 @@ void UnitTests() {
   ampere_expected[80 + literal_header + kPtx.find("sm_89") + 4] = '6';
   Check(plan.replacement == ampere_expected);
 
-  Check(ap::Retarget(plan.replacement, plan, reason) == ap::Result::kUnchanged);
+  Check(ptx::Retarget(plan.replacement, plan, reason) == ptx::Result::kUnchanged);
 
   for (size_t bytes : {0u, 1u, 15u, 16u, 63u, 79u}) {
-    Check(ap::Retarget(std::span(valid).first(bytes), plan, reason) ==
-          ap::Result::kRejected);
+    Check(ptx::Retarget(std::span(valid).first(bytes), plan, reason) ==
+          ptx::Result::kRejected);
   }
   for (size_t bytes = 80; bytes < valid.size(); ++bytes) {
-    Check(ap::Retarget(std::span(valid).first(bytes), plan, reason) ==
-          ap::Result::kRejected);
+    Check(ptx::Retarget(std::span(valid).first(bytes), plan, reason) ==
+          ptx::Result::kRejected);
   }
 
   for (const char* tail : {"\n.target sm_89\n", "\n.version 8.8\n", "\n/* open",
                            "\nwgmma.mma_async;\n"}) {
-    Check(ap::Retarget(Container(std::string(kPtx) + tail), plan, reason) ==
-          ap::Result::kRejected);
+    Check(ptx::Retarget(Container(std::string(kPtx) + tail), plan, reason) ==
+          ptx::Result::kRejected);
   }
 
-  Check(ap::Retarget(Container("/* .target sm_120 */\n" + std::string(kPtx) +
+  Check(ptx::Retarget(Container("/* .target sm_120 */\n" + std::string(kPtx) +
                                "// .target sm_120\n"),
-                     plan, reason) == ap::Result::kRetargeted);
-  Check(ap::Retarget(Container(".file 1 \".target sm_120\"\n" + std::string(kPtx)),
-                     plan, reason) == ap::Result::kRetargeted);
+                     plan, reason) == ptx::Result::kRetargeted);
+  Check(ptx::Retarget(Container(".file 1 \".target sm_120\"\n" + std::string(kPtx)),
+                     plan, reason) == ptx::Result::kRetargeted);
 
   auto no_nul = valid;
   Put<uint64_t>(no_nul, 72, kPtx.size());
-  Check(ap::Retarget(no_nul, plan, reason) == ap::Result::kRejected);
+  Check(ptx::Retarget(no_nul, plan, reason) == ptx::Result::kRejected);
 
   auto bad_arch = valid;
   Put<uint32_t>(bad_arch, 44, 75);
-  Check(ap::Retarget(bad_arch, plan, reason) == ap::Result::kUnchanged);
+  Check(ptx::Retarget(bad_arch, plan, reason) == ptx::Result::kUnchanged);
 
   auto bad_flags = valid;
   Put<uint64_t>(bad_flags, 56, 0x2040);
-  Check(ap::Retarget(bad_flags, plan, reason) == ap::Result::kRejected);
+  Check(ptx::Retarget(bad_flags, plan, reason) == ptx::Result::kRejected);
 
   auto overflow = valid;
   Put<uint64_t>(overflow, 24, UINT64_MAX);
-  Check(ap::Retarget(overflow, plan, reason) == ap::Result::kRejected);
+  Check(ptx::Retarget(overflow, plan, reason) == ptx::Result::kRejected);
 
   Bytes bad_offset{0, 0, 0};
   Bytes bad_offset_output(5);
@@ -149,43 +149,43 @@ void UnitTests() {
   block.push_back(static_cast<unsigned char>(distance >> 8));
   block.push_back(0x10);
   block.push_back(0);
-  Check(ap::Retarget(Container(prefix + "sm_89", &block), plan, reason) ==
-        ap::Result::kRejected);
+  Check(ptx::Retarget(Container(prefix + "sm_89", &block), plan, reason) ==
+        ptx::Result::kRejected);
   Check(reason == "target literal is shared with another output byte");
 
-  Check(ap::Retarget(Container(prefix + "sm_89", &block), plan, reason,
-                     mfgunlock::architecture::kTuring) == ap::Result::kRejected);
+  Check(ptx::Retarget(Container(prefix + "sm_89", &block), plan, reason,
+                     mfgunlock::architecture::kTuring) == ptx::Result::kRejected);
   Check(reason == "target literal is shared with another output byte");
 
-  Check(ap::Retarget(valid, plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRetargeted);
+  Check(ptx::Retarget(valid, plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRetargeted);
   auto turing_expected = valid;
   Put<uint32_t>(turing_expected, 44, 75);
   turing_expected[80 + literal_header + kPtx.find("sm_89") + 3] = '7';
   turing_expected[80 + literal_header + kPtx.find("sm_89") + 4] = '5';
   Check(plan.replacement == turing_expected);
-  Check(ap::Retarget(plan.replacement, plan, reason,
-                     mfgunlock::architecture::kTuring) == ap::Result::kUnchanged);
-  Check(ap::Retarget(valid, plan, reason, mfgunlock::architecture::kAda) == ap::Result::kUnchanged);
+  Check(ptx::Retarget(plan.replacement, plan, reason,
+                     mfgunlock::architecture::kTuring) == ptx::Result::kUnchanged);
+  Check(ptx::Retarget(valid, plan, reason, mfgunlock::architecture::kAda) == ptx::Result::kUnchanged);
   Check(plan.replacement.empty());
 
   for (const auto* instruction : {"cp.async.ca.shared.global", "mbarrier.init", "redux.sync.add",
                                   "mma.sp.sync", "cvt.rn.bf16.f32", "mma.sync.aligned.m16n8k16"}) {
     const auto input = Container(std::string(kPtx) + instruction + ";\n");
-    Check(ap::Retarget(input, plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRejected);
-    Check(ap::Retarget(input, plan, reason, mfgunlock::architecture::kAmpere) == ap::Result::kRetargeted);
+    Check(ptx::Retarget(input, plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRejected);
+    Check(ptx::Retarget(input, plan, reason, mfgunlock::architecture::kAmpere) == ptx::Result::kRetargeted);
   }
-  Check(ap::Retarget(Container(std::string(kPtx) + "// cp.async; .tf32; mbarrier.init;\n"),
-                     plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRetargeted);
-  Check(ap::Retarget(Container(std::string(kPtx) + "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32;\n"),
-                     plan, reason, mfgunlock::architecture::kTuring) == ap::Result::kRetargeted);
+  Check(ptx::Retarget(Container(std::string(kPtx) + "// cp.async; .tf32; mbarrier.init;\n"),
+                     plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRetargeted);
+  Check(ptx::Retarget(Container(std::string(kPtx) + "mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32;\n"),
+                     plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRetargeted);
 
   std::mt19937 random(13);
   for (unsigned int i = 0; i < 1000; ++i) {
     auto mutated = valid;
     mutated[random() % mutated.size()] ^=
         static_cast<unsigned char>(1 + random() % 255);
-    (void)ap::Retarget(mutated, plan, reason);  // sanitizer smoke input
-    (void)ap::Retarget(mutated, plan, reason, mfgunlock::architecture::kTuring);
+    (void)ptx::Retarget(mutated, plan, reason);  // sanitizer smoke input
+    (void)ptx::Retarget(mutated, plan, reason, mfgunlock::architecture::kTuring);
   }
 }
 
@@ -198,9 +198,9 @@ void Corpus(const std::filesystem::path& path, const std::filesystem::path& outp
 
     std::ifstream input(item.path(), std::ios::binary);
     Bytes bytes{std::istreambuf_iterator<char>(input), {}};
-    ap::Plan plan;
+    ptx::Plan plan;
     std::string reason;
-    if (ap::Retarget(bytes, plan, reason) != ap::Result::kRetargeted) {
+    if (ptx::Retarget(bytes, plan, reason) != ptx::Result::kRetargeted) {
       throw std::runtime_error(item.path().string() + ": " + reason);
     }
 
@@ -223,7 +223,7 @@ int main(int argc, char** argv) {
       Corpus(argv[1], argv[2]);
     } else if (argc != 1) {
       throw std::runtime_error(
-          "usage: ampere_ptx_test [fatbin_directory output_directory]");
+          "usage: ptx_retarget_test [fatbin_directory output_directory]");
     }
     std::cout << "assertions=" << g_cases << ", mutation_smoke_inputs=1000\n";
     return 0;

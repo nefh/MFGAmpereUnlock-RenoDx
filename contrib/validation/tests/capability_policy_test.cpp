@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: MIT
-#include "../../../src/addons/mfgunlock/ampere_policy.hpp"
+#include "../../../src/addons/mfgunlock/capability_policy.hpp"
 
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 
 using namespace mfgunlock;
-using namespace mfgunlock::ampere;
+using namespace mfgunlock::policy;
 
 namespace {
 unsigned int g_checks = 0;

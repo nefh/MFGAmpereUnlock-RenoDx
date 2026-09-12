@@ -299,7 +299,7 @@ inline const std::vector<hook::HookItem> kFeatureFunctionHook = {
      reinterpret_cast<void*>(&HookedGetFeatureFunction)},
 };
 
-// This is the SL 2.x signature. Legacy startup is handled by ampere_caps.hpp.
+// This is the SL 2.x signature. Legacy startup is handled by streamline_bridge.hpp.
 inline const std::vector<hook::HookItem> kInitHook = {
     {"slInit", reinterpret_cast<void**>(&g_real_init), reinterpret_cast<void*>(&HookedInit)},
 };

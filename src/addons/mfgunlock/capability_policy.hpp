@@ -11,7 +11,7 @@
 
 #include "./architecture.hpp"
 
-namespace mfgunlock::ampere {
+namespace mfgunlock::policy {
 
 using architecture::kNvidiaVendorId;
 using architecture::kTuringArchitecture;
@@ -59,4 +59,4 @@ inline int CapabilityFrameCount(int reported, unsigned int limit) {
 }
 
 
-}  // namespace mfgunlock::ampere
+}  // namespace mfgunlock::policy

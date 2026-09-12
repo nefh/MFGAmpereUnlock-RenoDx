@@ -19,9 +19,9 @@
 
 #include <include/reshade.hpp>
 
-#include "./ampere_ptx.hpp"
+#include "./ptx_retarget.hpp"
 
-namespace mfgunlock::ampere {
+namespace mfgunlock::provider {
 
 inline std::atomic_bool g_create_seen{false};
 
@@ -497,4 +497,4 @@ inline void Restore() {
   internal::g_registry_failed.store(false);
   ReleaseSRWLockExclusive(&internal::g_lock);
 }
-}  // namespace mfgunlock::ampere
+}  // namespace mfgunlock::provider
