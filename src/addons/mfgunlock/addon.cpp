@@ -14,6 +14,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cwchar>
 #include <cstring>
@@ -26,10 +27,12 @@
 #include <include/reshade.hpp>
 
 #include "./early_load.hpp"
+#include "./fg_preset.hpp"
 #include "./framecount.hpp"
 #include "./loadhook.hpp"
 #include "./midpoint.hpp"
 #include "./streamline_bridge.hpp"
+#include "./ui_candidate.hpp"
 #include "./validated_warp.hpp"
 namespace {
 
@@ -45,8 +48,88 @@ std::atomic<unsigned int> g_max_count{4};
 std::atomic_bool g_force_flip_meter_off{false};
 std::atomic_bool g_temporal_fix{true};
 std::atomic_bool g_validated_warp_blend{false};
+std::atomic_bool g_show_debug_options{false};
+std::atomic_int g_validated_warp_mode{
+    static_cast<int>(mfgunlock::validatedwarp::Mode::kValidatedWarp)};
 std::atomic_bool g_raise_ceiling{false};
 std::atomic_bool g_dynamic_stack_validated{false};
+std::atomic<reshade::api::swapchain*> g_primary_swapchain{nullptr};
+std::atomic<uint64_t> g_primary_swapchain_area{0};
+std::atomic<uint32_t> g_primary_output_width{0};
+std::atomic<uint32_t> g_primary_output_height{0};
+std::atomic_bool g_ui_candidate_d3d12{false};
+
+constexpr size_t kMaxUiRuntimeCandidates = 64;
+constexpr size_t kMaxKnownSwapchainBuffers = 16;
+constexpr uint64_t kUiCandidateMaxAgeMs = 250;
+
+struct UiRuntimeCandidate {
+  bool used = false;
+  bool swapchain = false;
+  bool already_tagged = false;
+  bool state_known = false;
+  bool last_clear_transparent = false;
+  reshade::api::resource resource{};
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t view_format = 0;
+  uint32_t state = 0;
+  uint32_t rtv_binds_since_clear = 0;
+  uint32_t rtv_binds = 0;
+  uint32_t transparent_clears = 0;
+  uint32_t current_late_writes = 0;
+  uint32_t last_late_writes = 0;
+  uint64_t clear_serial = 0;
+  uint64_t evaluated_clear_serial = 0;
+  uint64_t injected_clear_serial = 0;
+  uint64_t hudless_clear_serial = 0;
+  uint64_t last_clear_ms = 0;
+};
+
+struct UiCandidateDebugSnapshot {
+  bool present = false;
+  bool stable = false;
+  bool safe = false;
+  bool ambiguous = false;
+  bool overflow = false;
+  bool family_valid = false;
+  bool swapchain = false;
+  bool already_tagged = false;
+  bool state_known = false;
+  bool transparent_clear = false;
+  uint64_t resource = 0;
+  uint64_t clear_serial = 0;
+  uint64_t age_ms = 0;
+  uint64_t family_age_ms = 0;
+  uint64_t family_handoffs = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t state = 0;
+  uint32_t stable_frames = 0;
+  uint32_t rtv_binds_after_clear = 0;
+  uint32_t reject_reasons = mfgunlock::uicandidate::kStale;
+  uint32_t late_writes = 0;
+  uint32_t family_width = 0;
+  uint32_t family_height = 0;
+  uint32_t family_format = 0;
+};
+
+SRWLOCK g_ui_candidate_lock = SRWLOCK_INIT;
+std::array<UiRuntimeCandidate, kMaxUiRuntimeCandidates> g_ui_candidates{};
+std::array<uint64_t, kMaxKnownSwapchainBuffers> g_known_swapchain_buffers{};
+bool g_ui_candidate_overflow = false;
+bool g_ui_candidate_ambiguous = false;
+uint64_t g_ui_selected_resource = 0;
+uint64_t g_ui_selected_clear_serial = 0;
+uint32_t g_ui_selected_stable_frames = 0;
+bool g_ui_candidate_family_valid = false;
+uint32_t g_ui_candidate_family_width = 0;
+uint32_t g_ui_candidate_family_height = 0;
+uint32_t g_ui_candidate_family_format = 0;
+uint64_t g_ui_candidate_family_last_seen_ms = 0;
+uint64_t g_ui_candidate_family_handoffs = 0;
 
 // Marker scans can match literals embedded in this addon, so never inspect the
 // addon's own image as a candidate provider.
@@ -294,6 +377,7 @@ struct ValidatedWarpModulePatch {
   std::vector<mfgunlock::validatedwarp::Redirect> redirects;
   std::string provider_version;
   std::string detail;
+  mfgunlock::validatedwarp::Mode mode = mfgunlock::validatedwarp::Mode::kValidatedWarp;
 };
 std::vector<ValidatedWarpModulePatch> g_validated_warp_modules;
 std::vector<HMODULE> g_validated_warp_rejected_modules;
@@ -304,7 +388,6 @@ void PatchValidatedWarpInModule(HMODULE mod) {
   const auto* profile = mfgunlock::architecture::ActiveProfile();
   if (!g_enabled.load() || !profile || profile->architecture != mfgunlock::Architecture::kAmpere)
     return;
-  if (!mfgunlock::provider::PrepareProvider(mod)) return;
   if (std::any_of(g_validated_warp_modules.begin(), g_validated_warp_modules.end(),
                   [mod](const auto& patch) { return patch.module == mod; })) return;
   if (std::find(g_validated_warp_rejected_modules.begin(),
@@ -314,14 +397,18 @@ void PatchValidatedWarpInModule(HMODULE mod) {
   std::vector<mfgunlock::validatedwarp::Redirect> redirects;
   mfgunlock::validatedwarp::Result result{};
   std::string provider_version;
+  const auto mode = mfgunlock::validatedwarp::ConfiguredMode(
+      g_show_debug_options.load(std::memory_order_relaxed),
+      g_validated_warp_mode.load(std::memory_order_relaxed));
   const bool applied = mfgunlock::validatedwarp::Apply(
-      mod, redirects, result, provider_version);
+      mod, redirects, result, provider_version, mode, mfgunlock::provider::PrepareProvider);
   const std::string detail = result.detail;
   if (!applied || !result.applied) {
     g_validated_warp_rejected_modules.push_back(mod);
-    g_validated_warp_detail = detail;
+    if (g_validated_warp_modules.empty()) g_validated_warp_detail = detail;
     std::stringstream message;
-    message << "mfgunlock: Validated Warp Blend not applied"
+    message << "mfgunlock: Warp diagnostic " << mfgunlock::validatedwarp::ModeName(mode)
+            << " not applied"
             << (provider_version.empty() ? "" : " to DLSS-G " + provider_version)
             << " -- " << (detail.empty() ? "provider/kernel did not match the validated profile" : detail)
             << ".";
@@ -331,9 +418,10 @@ void PatchValidatedWarpInModule(HMODULE mod) {
 
   g_validated_warp_detail = detail;
   g_validated_warp_modules.push_back(
-      {mod, std::move(redirects), provider_version, detail});
+      {mod, std::move(redirects), provider_version, detail, mode});
   std::stringstream message;
-  message << "mfgunlock: Validated Warp Blend applied to DLSS-G " << provider_version
+  message << "mfgunlock: Warp diagnostic " << mfgunlock::validatedwarp::ModeName(mode)
+          << " applied to DLSS-G " << provider_version
           << " on Ampere -- " << detail << ".";
   reshade::log::message(reshade::log::level::info, message.str().c_str());
 }
@@ -437,6 +525,7 @@ void ProcessLoadedDlssgModule(HMODULE mod) {
     PatchArchGatesInModule(mod);
     if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
   }
+  mfgunlock::fgpreset::TryInstall(mod);
 }
 
 void RunProviderMaintenance() {
@@ -459,6 +548,15 @@ void RunProviderMaintenance() {
     TryPatchDlssgArchGate();
     if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
   }
+  for (HMODULE mod : g_dlssg_modules) mfgunlock::fgpreset::TryInstall(mod);
+}
+
+// A preset edit must not apply unrelated pending Warp/temporal changes live.
+void InstallPresetForLoadedProviders() {
+  if (!mfgunlock::architecture::ActiveProfile()) return;
+  AcquireSRWLockExclusive(&g_provider_maintenance_lock);
+  for (HMODULE mod : g_dlssg_modules) mfgunlock::fgpreset::TryInstall(mod);
+  ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
 }
 
 void RestoreMidpoint() {
@@ -852,15 +950,578 @@ void RefreshRuntime() {
   mfgunlock::loadhook::TryInstall();
 }
 
+bool UiCandidateObservationEnabled() {
+  return g_show_debug_options.load(std::memory_order_relaxed) ||
+         mfgunlock::framecount::g_ui_candidate_injection_enabled.load(
+             std::memory_order_relaxed);
+}
+
+bool IsUiCandidateFormat(reshade::api::format resource_format,
+                         reshade::api::format view_format) {
+  const auto unorm = reshade::api::format::r8g8b8a8_unorm;
+  const auto srgb = reshade::api::format::r8g8b8a8_unorm_srgb;
+  return resource_format == view_format &&
+         (resource_format == unorm || resource_format == srgb);
+}
+
+bool IsTransparentClear(const float color[4]) {
+  return color != nullptr && color[0] == 0.0f && color[1] == 0.0f &&
+         color[2] == 0.0f && color[3] == 0.0f;
+}
+
+bool ToD3D12ResourceState(reshade::api::resource_usage usage, uint32_t& state) {
+  if (usage == reshade::api::resource_usage::undefined) return false;
+  if (usage == reshade::api::resource_usage::general ||
+      usage == reshade::api::resource_usage::present) {
+    state = 0;
+    return true;
+  }
+  const uint32_t value = static_cast<uint32_t>(usage);
+  if ((value & 0x80000000u) != 0) return false;
+  state = value;
+  return true;
+}
+
+bool IsKnownSwapchainBufferLocked(uint64_t resource) {
+  return std::find(g_known_swapchain_buffers.begin(), g_known_swapchain_buffers.end(),
+                   resource) != g_known_swapchain_buffers.end();
+}
+
+UiRuntimeCandidate* FindUiRuntimeCandidateLocked(uint64_t resource) {
+  UiRuntimeCandidate* empty = nullptr;
+  for (auto& candidate : g_ui_candidates) {
+    if (candidate.used && candidate.resource.handle == resource) return &candidate;
+    if (!candidate.used && empty == nullptr) empty = &candidate;
+  }
+  return empty;
+}
+
+void ResetUiSelectionLocked() {
+  g_ui_selected_resource = 0;
+  g_ui_selected_clear_serial = 0;
+  g_ui_selected_stable_frames = 0;
+}
+
+void ResetUiFamilyLocked() {
+  g_ui_candidate_family_valid = false;
+  g_ui_candidate_family_width = 0;
+  g_ui_candidate_family_height = 0;
+  g_ui_candidate_family_format = 0;
+  g_ui_candidate_family_last_seen_ms = 0;
+}
+
+bool MatchesUiFamilyLocked(const UiRuntimeCandidate& candidate) {
+  return g_ui_candidate_family_valid &&
+      candidate.width == g_ui_candidate_family_width &&
+      candidate.height == g_ui_candidate_family_height &&
+      candidate.format == g_ui_candidate_family_format;
+}
+
+void EstablishUiFamilyLocked(const UiRuntimeCandidate& candidate, uint64_t now_ms) {
+  g_ui_candidate_family_valid = true;
+  g_ui_candidate_family_width = candidate.width;
+  g_ui_candidate_family_height = candidate.height;
+  g_ui_candidate_family_format = candidate.format;
+  g_ui_candidate_family_last_seen_ms = now_ms;
+}
+
+void ResetUiCandidateSelection() {
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  ResetUiSelectionLocked();
+  ResetUiFamilyLocked();
+  g_ui_candidate_ambiguous = false;
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+  mfgunlock::framecount::g_ui_candidate_format.store(0, std::memory_order_release);
+  mfgunlock::framecount::g_ui_candidate_options_synced.store(
+      false, std::memory_order_release);
+}
+
+void ClearUiRuntimeCandidates() {
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  for (auto& candidate : g_ui_candidates) candidate = {};
+  g_known_swapchain_buffers = {};
+  g_ui_candidate_overflow = false;
+  g_ui_candidate_ambiguous = false;
+  ResetUiSelectionLocked();
+  ResetUiFamilyLocked();
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+}
+
+void MarkSwapchainBuffers(reshade::api::swapchain* swapchain, bool present) {
+  if (swapchain == nullptr) return;
+  const uint32_t count = swapchain->get_back_buffer_count();
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  for (uint32_t index = 0; index < count; ++index) {
+    const uint64_t resource = swapchain->get_back_buffer(index).handle;
+    if (resource == 0) continue;
+    if (present) {
+      auto known = std::find(g_known_swapchain_buffers.begin(),
+                             g_known_swapchain_buffers.end(), resource);
+      if (known == g_known_swapchain_buffers.end()) {
+        auto empty = std::find(g_known_swapchain_buffers.begin(),
+                               g_known_swapchain_buffers.end(), uint64_t{0});
+        if (empty != g_known_swapchain_buffers.end()) *empty = resource;
+      }
+      for (auto& candidate : g_ui_candidates) {
+        if (candidate.used && candidate.resource.handle == resource)
+          candidate.swapchain = true;
+      }
+    } else {
+      for (auto& known : g_known_swapchain_buffers) {
+        if (known == resource) known = 0;
+      }
+    }
+  }
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+}
+
+void RecordUiCandidateView(reshade::api::command_list* cmd_list,
+                           reshade::api::resource_view view,
+                           bool clear, const float* clear_color = nullptr) {
+  if (!UiCandidateObservationEnabled() ||
+      !g_ui_candidate_d3d12.load(std::memory_order_relaxed) ||
+      cmd_list == nullptr || view.handle == 0) {
+    return;
+  }
+  auto* device = cmd_list->get_device();
+  if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12) return;
+  const auto resource = device->get_resource_from_view(view);
+  if (resource.handle == 0) return;
+  const auto desc = device->get_resource_desc(resource);
+  const auto view_desc = device->get_resource_view_desc(view);
+  if (desc.type != reshade::api::resource_type::texture_2d ||
+      !IsUiCandidateFormat(desc.texture.format, view_desc.format)) {
+    return;
+  }
+
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  UiRuntimeCandidate* candidate = FindUiRuntimeCandidateLocked(resource.handle);
+  if (candidate == nullptr) {
+    g_ui_candidate_overflow = true;
+    ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+    return;
+  }
+  if (!candidate->used) {
+    candidate->used = true;
+    candidate->resource = resource;
+    candidate->width = desc.texture.width;
+    candidate->height = desc.texture.height;
+    candidate->format = static_cast<uint32_t>(desc.texture.format);
+    candidate->view_format = static_cast<uint32_t>(view_desc.format);
+    candidate->swapchain = IsKnownSwapchainBufferLocked(resource.handle);
+  }
+
+  candidate->state_known = true;
+  candidate->state = static_cast<uint32_t>(reshade::api::resource_usage::render_target);
+  if (clear) {
+    if (candidate->hudless_clear_serial == candidate->clear_serial)
+      candidate->last_late_writes = candidate->current_late_writes;
+    else
+      candidate->last_late_writes = 0;
+    ++candidate->clear_serial;
+    candidate->rtv_binds_since_clear = 0;
+    candidate->current_late_writes = 0;
+    candidate->last_clear_transparent = IsTransparentClear(clear_color);
+    candidate->last_clear_ms = GetTickCount64();
+    if (candidate->last_clear_transparent) ++candidate->transparent_clears;
+  } else {
+    ++candidate->rtv_binds;
+    ++candidate->rtv_binds_since_clear;
+    if (candidate->hudless_clear_serial != 0 &&
+        candidate->hudless_clear_serial == candidate->clear_serial) {
+      ++candidate->current_late_writes;
+    }
+  }
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+}
+
+void OnBindUiCandidateRenderTargets(reshade::api::command_list* cmd_list,
+                                    uint32_t count,
+                                    const reshade::api::resource_view* rtvs,
+                                    reshade::api::resource_view) {
+  if (rtvs == nullptr) return;
+  for (uint32_t index = 0; index < count; ++index)
+    RecordUiCandidateView(cmd_list, rtvs[index], false);
+}
+
+bool OnClearUiCandidateRenderTarget(reshade::api::command_list* cmd_list,
+                                    reshade::api::resource_view rtv,
+                                    const float color[4], uint32_t,
+                                    const reshade::api::rect*) {
+  RecordUiCandidateView(cmd_list, rtv, true, color);
+  return false;
+}
+
+void OnUiCandidateBarrier(reshade::api::command_list*, uint32_t count,
+                          const reshade::api::resource* resources,
+                          const reshade::api::resource_usage*,
+                          const reshade::api::resource_usage* new_states) {
+  if (!UiCandidateObservationEnabled() || resources == nullptr || new_states == nullptr)
+    return;
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  for (uint32_t index = 0; index < count; ++index) {
+    if (resources[index].handle == 0) continue;
+    UiRuntimeCandidate* candidate = FindUiRuntimeCandidateLocked(resources[index].handle);
+    if (candidate == nullptr || !candidate->used) continue;
+    candidate->state_known = ToD3D12ResourceState(new_states[index], candidate->state);
+  }
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+}
+
+void OnDestroyUiCandidateResource(reshade::api::device* device,
+                                  reshade::api::resource resource) {
+  if (device == nullptr || device->get_api() != reshade::api::device_api::d3d12 ||
+      resource.handle == 0) {
+    return;
+  }
+  bool selected_destroyed = false;
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  for (auto& candidate : g_ui_candidates) {
+    if (!candidate.used || candidate.resource.handle != resource.handle) continue;
+    candidate = {};
+    if (g_ui_selected_resource == resource.handle) {
+      ResetUiSelectionLocked();
+      selected_destroyed = true;
+    }
+    break;
+  }
+  for (auto& known : g_known_swapchain_buffers) {
+    if (known == resource.handle) known = 0;
+  }
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+  if (selected_destroyed) {
+    mfgunlock::framecount::g_ui_candidate_active.store(
+        false, std::memory_order_relaxed);
+    mfgunlock::framecount::g_ui_pair_eligible.store(
+        false, std::memory_order_relaxed);
+    mfgunlock::framecount::g_ui_native_hudless_fallback.store(
+        true, std::memory_order_relaxed);
+  }
+}
+
+mfgunlock::uicandidate::Evidence BuildUiCandidateEvidence(
+    const UiRuntimeCandidate& candidate, uint64_t now_ms) {
+  mfgunlock::uicandidate::Evidence evidence{};
+  const uint32_t output_width = g_primary_output_width.load(std::memory_order_relaxed);
+  const uint32_t output_height = g_primary_output_height.load(std::memory_order_relaxed);
+  evidence.output_match = output_width != 0 && output_height != 0 &&
+      candidate.width == output_width && candidate.height == output_height;
+  evidence.swapchain = candidate.swapchain;
+  evidence.already_tagged = candidate.already_tagged;
+  evidence.rgba8_with_alpha = candidate.format == candidate.view_format &&
+      (candidate.format == static_cast<uint32_t>(reshade::api::format::r8g8b8a8_unorm) ||
+       candidate.format == static_cast<uint32_t>(reshade::api::format::r8g8b8a8_unorm_srgb));
+  evidence.fresh_transparent_clear = candidate.last_clear_transparent &&
+      candidate.clear_serial != 0 &&
+      candidate.clear_serial != candidate.evaluated_clear_serial;
+  evidence.rtv_binds_after_clear = candidate.rtv_binds_since_clear;
+  evidence.state_known = candidate.state_known;
+  evidence.recent = candidate.last_clear_ms != 0 && now_ms >= candidate.last_clear_ms &&
+      now_ms - candidate.last_clear_ms <= kUiCandidateMaxAgeMs;
+  evidence.late_writes = candidate.last_late_writes;
+  return evidence;
+}
+
+void ObserveNativeStreamlineTags(const sl::ResourceTag* tags, uint32_t count) {
+  if (!UiCandidateObservationEnabled() || tags == nullptr || count == 0) return;
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  for (uint32_t index = 0; index < count; ++index) {
+    if (tags[index].resource == nullptr) continue;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(tags[index].resource);
+    uint64_t matched = 0;
+    uint32_t matches = 0;
+    const size_t scan_bytes = (std::min)(sizeof(sl::Resource), size_t{64});
+    for (size_t offset = 0; offset + sizeof(uint64_t) <= scan_bytes;
+         offset += sizeof(uint64_t)) {
+      uint64_t value = 0;
+      std::memcpy(&value, bytes + offset, sizeof(value));
+      if (value == 0 || value == matched) continue;
+      for (const auto& candidate : g_ui_candidates) {
+        if (!candidate.used || candidate.resource.handle != value) continue;
+        matched = value;
+        ++matches;
+        break;
+      }
+    }
+    if (matches != 1) continue;
+    for (auto& candidate : g_ui_candidates) {
+      if (candidate.used && candidate.resource.handle == matched) {
+        candidate.already_tagged = true;
+        break;
+      }
+    }
+  }
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+}
+
+bool ObserveUiCandidate(mfgunlock::framecount::UiCandidateSnapshot* snapshot) {
+  if (snapshot == nullptr || !UiCandidateObservationEnabled() ||
+      !g_ui_candidate_d3d12.load(std::memory_order_relaxed)) {
+    return false;
+  }
+
+  UiRuntimeCandidate* matches[kMaxUiRuntimeCandidates]{};
+  size_t match_count = 0;
+  const uint64_t now_ms = GetTickCount64();
+  AcquireSRWLockExclusive(&g_ui_candidate_lock);
+  for (auto& candidate : g_ui_candidates) {
+    if (!candidate.used) continue;
+    const auto evidence = BuildUiCandidateEvidence(candidate, now_ms);
+    if (mfgunlock::uicandidate::Assess(evidence) == mfgunlock::uicandidate::kAccept)
+      matches[match_count++] = &candidate;
+  }
+  for (auto& candidate : g_ui_candidates) {
+    if (candidate.used && candidate.clear_serial != candidate.evaluated_clear_serial)
+      candidate.evaluated_clear_serial = candidate.clear_serial;
+  }
+
+  g_ui_candidate_ambiguous = match_count > 1;
+  if (match_count != 1) {
+    ResetUiSelectionLocked();
+    ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+    return false;
+  }
+
+  UiRuntimeCandidate& candidate = *matches[0];
+  const bool same_resource = g_ui_selected_resource == candidate.resource.handle;
+  if (same_resource) {
+    if (g_ui_selected_clear_serial != candidate.clear_serial)
+      ++g_ui_selected_stable_frames;
+  } else {
+    const uint64_t family_age_ms = g_ui_candidate_family_valid &&
+        now_ms >= g_ui_candidate_family_last_seen_ms
+        ? now_ms - g_ui_candidate_family_last_seen_ms
+        : mfgunlock::uicandidate::kHandoverMaxGapMs + 1;
+    const bool warm_handover = mfgunlock::uicandidate::CanWarmHandover(
+        g_ui_candidate_family_valid, MatchesUiFamilyLocked(candidate), family_age_ms);
+    g_ui_selected_stable_frames = warm_handover
+        ? mfgunlock::uicandidate::HandoverSeedStableFrames()
+        : 1;
+    if (warm_handover) ++g_ui_candidate_family_handoffs;
+  }
+  g_ui_selected_resource = candidate.resource.handle;
+  g_ui_selected_clear_serial = candidate.clear_serial;
+  candidate.hudless_clear_serial = candidate.clear_serial;
+  candidate.current_late_writes = 0;
+  if (mfgunlock::uicandidate::IsStable(g_ui_selected_stable_frames)) {
+    if (!MatchesUiFamilyLocked(candidate))
+      EstablishUiFamilyLocked(candidate, now_ms);
+    else
+      g_ui_candidate_family_last_seen_ms = now_ms;
+  }
+
+  snapshot->native_resource = candidate.resource.handle;
+  snapshot->width = candidate.width;
+  snapshot->height = candidate.height;
+  snapshot->format = candidate.format;
+  snapshot->state = candidate.state;
+  snapshot->state_known = candidate.state_known;
+  snapshot->stable_frames = g_ui_selected_stable_frames;
+  snapshot->rtv_binds_after_clear = candidate.rtv_binds_since_clear;
+  snapshot->reject_reasons = mfgunlock::uicandidate::kAccept;
+  snapshot->late_writes = candidate.last_late_writes;
+  snapshot->clear_serial = candidate.clear_serial;
+  snapshot->recent = true;
+  ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+  return true;
+}
+
+bool AcquireUiCandidate(const mfgunlock::framecount::UiCandidateSnapshot* snapshot) {
+  if (snapshot == nullptr || snapshot->native_resource == 0) return false;
+  IUnknown* reference = nullptr;
+  AcquireSRWLockShared(&g_ui_candidate_lock);
+  for (const auto& candidate : g_ui_candidates) {
+    if (!candidate.used || candidate.resource.handle != snapshot->native_resource ||
+        candidate.clear_serial != snapshot->clear_serial ||
+        candidate.state != snapshot->state || candidate.format != snapshot->format) {
+      continue;
+    }
+    auto evidence = BuildUiCandidateEvidence(candidate, GetTickCount64());
+    evidence.fresh_transparent_clear = candidate.last_clear_transparent &&
+        candidate.clear_serial == snapshot->clear_serial;
+    evidence.late_writes = candidate.current_late_writes;
+    if (mfgunlock::uicandidate::Assess(evidence) != mfgunlock::uicandidate::kAccept)
+      continue;
+    reference = reinterpret_cast<IUnknown*>(
+        static_cast<uintptr_t>(candidate.resource.handle));
+    reference->AddRef();
+    break;
+  }
+  ReleaseSRWLockShared(&g_ui_candidate_lock);
+  return reference != nullptr;
+}
+
+void ReleaseUiCandidate(const mfgunlock::framecount::UiCandidateSnapshot* snapshot,
+                        bool injected, sl::Result result) {
+  if (snapshot == nullptr || snapshot->native_resource == 0) return;
+  if (injected && result == sl::Result::eOk) {
+    AcquireSRWLockExclusive(&g_ui_candidate_lock);
+    for (auto& candidate : g_ui_candidates) {
+      if (!candidate.used || candidate.resource.handle != snapshot->native_resource ||
+          candidate.clear_serial != snapshot->clear_serial) {
+        continue;
+      }
+      candidate.injected_clear_serial = snapshot->clear_serial;
+      candidate.current_late_writes = 0;
+      break;
+    }
+    ReleaseSRWLockExclusive(&g_ui_candidate_lock);
+  }
+  reinterpret_cast<IUnknown*>(static_cast<uintptr_t>(snapshot->native_resource))->Release();
+}
+
+UiCandidateDebugSnapshot ReadUiCandidateDebugSnapshot() {
+  UiCandidateDebugSnapshot snapshot{};
+  if (!TryAcquireSRWLockShared(&g_ui_candidate_lock)) return snapshot;
+  snapshot.ambiguous = g_ui_candidate_ambiguous;
+  snapshot.overflow = g_ui_candidate_overflow;
+  snapshot.family_valid = g_ui_candidate_family_valid;
+  snapshot.family_width = g_ui_candidate_family_width;
+  snapshot.family_height = g_ui_candidate_family_height;
+  snapshot.family_format = g_ui_candidate_family_format;
+  snapshot.family_handoffs = g_ui_candidate_family_handoffs;
+  const uint64_t family_now_ms = GetTickCount64();
+  snapshot.family_age_ms = g_ui_candidate_family_valid &&
+      family_now_ms >= g_ui_candidate_family_last_seen_ms
+      ? family_now_ms - g_ui_candidate_family_last_seen_ms
+      : 0;
+  snapshot.resource = g_ui_selected_resource;
+  snapshot.clear_serial = g_ui_selected_clear_serial;
+  snapshot.stable_frames = g_ui_selected_stable_frames;
+  snapshot.stable = mfgunlock::uicandidate::IsStable(snapshot.stable_frames);
+  for (const auto& candidate : g_ui_candidates) {
+    if (!candidate.used || candidate.resource.handle != g_ui_selected_resource) continue;
+    snapshot.present = true;
+    snapshot.width = candidate.width;
+    snapshot.height = candidate.height;
+    snapshot.format = candidate.format;
+    snapshot.state = candidate.state;
+    snapshot.state_known = candidate.state_known;
+    snapshot.swapchain = candidate.swapchain;
+    snapshot.already_tagged = candidate.already_tagged;
+    snapshot.transparent_clear = candidate.last_clear_transparent;
+    snapshot.rtv_binds_after_clear = candidate.rtv_binds_since_clear;
+    snapshot.late_writes = candidate.current_late_writes != 0
+        ? candidate.current_late_writes : candidate.last_late_writes;
+    const uint64_t now_ms = GetTickCount64();
+    snapshot.age_ms = now_ms >= candidate.last_clear_ms
+        ? now_ms - candidate.last_clear_ms : 0;
+    auto evidence = BuildUiCandidateEvidence(candidate, now_ms);
+    evidence.fresh_transparent_clear = candidate.last_clear_transparent &&
+        candidate.clear_serial == g_ui_selected_clear_serial;
+    evidence.late_writes = snapshot.late_writes;
+    snapshot.reject_reasons = mfgunlock::uicandidate::Assess(evidence);
+    snapshot.safe = snapshot.stable && snapshot.reject_reasons == mfgunlock::uicandidate::kAccept;
+    break;
+  }
+  ReleaseSRWLockShared(&g_ui_candidate_lock);
+  return snapshot;
+}
+
+const char* UiCandidateFormatName(uint32_t format) {
+  if (format == static_cast<uint32_t>(reshade::api::format::r8g8b8a8_unorm))
+    return "RGBA8 UNORM";
+  if (format == static_cast<uint32_t>(reshade::api::format::r8g8b8a8_unorm_srgb))
+    return "RGBA8 sRGB";
+  return "unknown";
+}
+
 // Graphics initialization is also a finite fallback for already loaded modules.
 void OnInitDevice(reshade::api::device* device) {
-  if (device != nullptr && device->get_api() == reshade::api::device_api::d3d12)
-    mfgunlock::framecount::NotifyDynamicD3D12(true);
+  const bool d3d12 = device != nullptr &&
+      device->get_api() == reshade::api::device_api::d3d12;
+  g_ui_candidate_d3d12.store(d3d12, std::memory_order_relaxed);
+  if (d3d12) mfgunlock::framecount::NotifyDynamicD3D12(true);
   RefreshRuntime();
 }
 
 void OnInitCommandQueue(reshade::api::command_queue* /*queue*/) {
   RefreshRuntime();
+}
+
+bool IsHdrColorSpace(reshade::api::color_space color_space) {
+  return color_space == reshade::api::color_space::scrgb ||
+         color_space == reshade::api::color_space::hdr10_pq ||
+         color_space == reshade::api::color_space::hdr10_hlg;
+}
+
+void ObserveUiOutput(reshade::api::swapchain* swapchain) {
+  if (swapchain == nullptr ||
+      swapchain != g_primary_swapchain.load(std::memory_order_acquire)) {
+    return;
+  }
+  const auto color_space = swapchain->get_color_space();
+  if (color_space == reshade::api::color_space::unknown) return;
+  mfgunlock::framecount::NotifyHdrState(IsHdrColorSpace(color_space));
+}
+
+void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  if (swapchain == nullptr) return;
+  auto* device = swapchain->get_device();
+  if (device == nullptr || swapchain->get_back_buffer_count() == 0) return;
+
+  MarkSwapchainBuffers(swapchain, true);
+  const auto back_buffer = swapchain->get_back_buffer(0);
+  const auto desc = device->get_resource_desc(back_buffer);
+  const uint64_t area = static_cast<uint64_t>(desc.texture.width) * desc.texture.height;
+  const uint64_t selected_area = g_primary_swapchain_area.load(std::memory_order_relaxed);
+  reshade::api::swapchain* selected = g_primary_swapchain.load(std::memory_order_acquire);
+  if (selected != swapchain && selected != nullptr && area <= selected_area) return;
+
+  const bool changed = selected != swapchain;
+  g_primary_swapchain_area.store(area, std::memory_order_relaxed);
+  g_primary_output_width.store(desc.texture.width, std::memory_order_relaxed);
+  g_primary_output_height.store(desc.texture.height, std::memory_order_relaxed);
+  g_primary_swapchain.store(swapchain, std::memory_order_release);
+  if (changed) ResetUiCandidateSelection();
+
+  const auto color_space = swapchain->get_color_space();
+  if (color_space == reshade::api::color_space::unknown) {
+    mfgunlock::framecount::NotifyOutputUnknown();
+    return;
+  }
+  mfgunlock::framecount::NotifyHdrState(IsHdrColorSpace(color_space));
+}
+
+void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  if (swapchain == nullptr) return;
+  MarkSwapchainBuffers(swapchain, false);
+  reshade::api::swapchain* expected = swapchain;
+  if (!g_primary_swapchain.compare_exchange_strong(
+          expected, nullptr, std::memory_order_acq_rel)) {
+    return;
+  }
+  g_primary_swapchain_area.store(0, std::memory_order_relaxed);
+  g_primary_output_width.store(0, std::memory_order_relaxed);
+  g_primary_output_height.store(0, std::memory_order_relaxed);
+  ResetUiCandidateSelection();
+  mfgunlock::framecount::NotifyOutputUnknown();
+}
+
+void OnPresentUiOutput(reshade::api::command_queue* /*queue*/,
+                       reshade::api::swapchain* swapchain,
+                       const reshade::api::rect* /*source_rect*/,
+                       const reshade::api::rect* /*dest_rect*/,
+                       uint32_t /*dirty_rect_count*/,
+                       const reshade::api::rect* /*dirty_rects*/) {
+  if (swapchain == nullptr) return;
+  if (g_primary_swapchain.load(std::memory_order_acquire) == nullptr)
+    OnInitSwapchain(swapchain, false);
+  if (g_primary_swapchain.load(std::memory_order_acquire) != swapchain) return;
+
+  auto* device = swapchain->get_device();
+  if (device != nullptr && swapchain->get_back_buffer_count() != 0) {
+    const auto desc = device->get_resource_desc(swapchain->get_back_buffer(0));
+    const uint32_t old_width = g_primary_output_width.exchange(
+        desc.texture.width, std::memory_order_relaxed);
+    const uint32_t old_height = g_primary_output_height.exchange(
+        desc.texture.height, std::memory_order_relaxed);
+    if ((old_width != 0 && old_width != desc.texture.width) ||
+        (old_height != 0 && old_height != desc.texture.height)) {
+      ResetUiCandidateSelection();
+    }
+  }
+  ObserveUiOutput(swapchain);
 }
 
 // ---------------------------------------------------------------- config
@@ -893,6 +1554,50 @@ void EnsureEarlyLoadConfig() {
 
 // ---------------------------------------------------------------- overlay
 
+void SetWarpMode(int value) {
+  const int mode = static_cast<int>(mfgunlock::validatedwarp::ConfiguredMode(
+      g_show_debug_options.load(std::memory_order_relaxed), value));
+  g_validated_warp_mode.store(mode, std::memory_order_relaxed);
+  reshade::set_config_value(nullptr, kConfigSection, "WarpDiagnosticMode", mode);
+}
+
+void DrawWarpStatus(bool requested, bool debug_options) {
+  if (!TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
+    ImGui::TextDisabled("Warp provider update in progress.");
+    return;
+  }
+  struct Unlock {
+    ~Unlock() { ReleaseSRWLockShared(&g_provider_maintenance_lock); }
+  } unlock;
+  const auto mode = mfgunlock::validatedwarp::ConfiguredMode(
+      debug_options, g_validated_warp_mode.load(std::memory_order_relaxed));
+  if (!g_validated_warp_modules.empty()) {
+    const bool matches = std::all_of(g_validated_warp_modules.begin(), g_validated_warp_modules.end(),
+                                    [mode](const auto& patch) { return patch.mode == mode; });
+    if (!requested) {
+      ImGui::TextWrapped("Warp remains applied. Restart the game to disable it.");
+    } else if (!matches) {
+      ImGui::TextWrapped("Warp mode change pending. Restart the game to apply the selected mode.");
+    } else if (mode == mfgunlock::validatedwarp::Mode::kValidatedWarp) {
+      ImGui::TextUnformatted("Validated Warp Blend: applied.");
+    } else {
+      ImGui::Text("Diagnostic Warp path applied: %s.", mfgunlock::validatedwarp::ModeName(mode));
+    }
+    if (debug_options) {
+      for (const auto& patch : g_validated_warp_modules)
+        ImGui::TextWrapped("Applied: %s; %s.", mfgunlock::validatedwarp::ModeName(patch.mode),
+                           patch.detail.c_str());
+    }
+  } else if (requested) {
+    if (!g_validated_warp_detail.empty()) {
+      ImGui::TextWrapped("Warp was not applied. See the ReShade log for the reason.");
+      if (debug_options) ImGui::TextWrapped("%s", g_validated_warp_detail.c_str());
+    } else {
+      ImGui::TextDisabled("Warp: waiting for provider load. Restart after changing settings.");
+    }
+  }
+}
+
 void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   if (g_early_load_restart_required.load(std::memory_order_acquire)) {
     ImGui::Text("Restart the game once to enable early loading.");
@@ -903,55 +1608,81 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   if (ImGui::Checkbox("Enable multi-frame override", &enabled)) {
     g_enabled.store(enabled, std::memory_order_relaxed);
     reshade::set_config_value(nullptr, kConfigSection, "Enabled", enabled ? 1 : 0);
+    if (enabled) InstallPresetForLoadedProviders();
+  }
+  bool debug_options = g_show_debug_options.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Show advanced/debug options", &debug_options)) {
+    g_show_debug_options.store(debug_options, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "ShowDebugOptions", debug_options ? 1 : 0);
+    if (!debug_options) {
+      SetWarpMode(static_cast<int>(mfgunlock::validatedwarp::Mode::kValidatedWarp));
+      mfgunlock::framecount::g_ui_candidate_injection_enabled.store(
+          false, std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyUiCandidateInjectionChanged();
+      reshade::set_config_value(nullptr, kConfigSection, "UICandidateInjection", 0);
+    }
   }
 
   static const char* kRuntimeModes[] = {
       "Game default", "Prefer local runtime", "Force NVIDIA OTA runtime"};
   int runtime_mode = static_cast<int>(
       mfgunlock::framecount::g_runtime_selection_mode.load(std::memory_order_relaxed));
-  if (ImGui::Combo("Streamline runtime", &runtime_mode, kRuntimeModes, ARRAYSIZE(kRuntimeModes))) {
+  bool runtime_changed = false;
+  if (debug_options) {
+    runtime_changed = ImGui::Combo("Streamline runtime", &runtime_mode, kRuntimeModes, ARRAYSIZE(kRuntimeModes));
+  } else {
+    bool local = runtime_mode == 1;
+    if (ImGui::Checkbox("Prefer local runtime", &local)) {
+      runtime_mode = local ? 1 : 0;
+      runtime_changed = true;
+    }
+    if (runtime_mode == 2) ImGui::TextDisabled("NVIDIA OTA runtime forced (advanced setting).");
+  }
+  if (runtime_changed) {
     mfgunlock::framecount::g_runtime_selection_mode.store(
         static_cast<unsigned int>(runtime_mode), std::memory_order_relaxed);
     reshade::set_config_value(nullptr, kConfigSection, "RuntimeSelectionMode", runtime_mode);
   }
   ImGui::TextDisabled("Restart required after changing the Streamline runtime policy.");
 
-  int count = static_cast<int>(g_max_count.load(std::memory_order_relaxed));
-  if (ImGui::SliderInt("Reported MultiFrameCountMax", &count,
-                       static_cast<int>(kMinCount), static_cast<int>(kMaxCount))) {
-    if (count < static_cast<int>(kMinCount)) count = static_cast<int>(kMinCount);
-    if (count > static_cast<int>(kMaxCount)) count = static_cast<int>(kMaxCount);
-    g_max_count.store(static_cast<unsigned int>(count), std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "MaxCount", count);
-  }
-  ImGui::TextDisabled(
-      "Takes effect when DLSS-G next queries the runtime -- toggle frame\n"
-      "generation off and on in the game if the option does not appear.");
+  if (debug_options) {
+    int count = static_cast<int>(g_max_count.load(std::memory_order_relaxed));
+    if (ImGui::SliderInt("Reported MultiFrameCountMax", &count,
+                         static_cast<int>(kMinCount), static_cast<int>(kMaxCount))) {
+      if (count < static_cast<int>(kMinCount)) count = static_cast<int>(kMinCount);
+      if (count > static_cast<int>(kMaxCount)) count = static_cast<int>(kMaxCount);
+      g_max_count.store(static_cast<unsigned int>(count), std::memory_order_relaxed);
+      reshade::set_config_value(nullptr, kConfigSection, "MaxCount", count);
+    }
+    ImGui::TextDisabled(
+        "Takes effect when DLSS-G next queries the runtime -- toggle frame\n"
+        "generation off and on in the game if the option does not appear.");
 
-  bool flip_off = g_force_flip_meter_off.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Force legacy software flip pacing (compatibility)", &flip_off)) {
-    g_force_flip_meter_off.store(flip_off, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", flip_off ? 1 : 0);
-  }
-  ImGui::TextDisabled(
-      "Leave off with current Streamline builds. Enable only if 3x/4x freezes;\n"
-      "applied once per session, so restart the game after changing it.");
+    bool flip_off = g_force_flip_meter_off.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Force legacy software flip pacing (compatibility)", &flip_off)) {
+      g_force_flip_meter_off.store(flip_off, std::memory_order_relaxed);
+      reshade::set_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", flip_off ? 1 : 0);
+    }
+    ImGui::TextDisabled(
+        "Leave off with current Streamline builds. Enable only if 3x/4x freezes;\n"
+        "applied once per session, so restart the game after changing it.");
 
-  ImGui::Separator();
-  if (g_flip_meter_patched.load(std::memory_order_acquire)) {
-    ImGui::TextUnformatted("Software pacing: active");
-  } else if (g_flip_meter_failed.load(std::memory_order_acquire)) {
-    ImGui::TextDisabled("Software pacing: unavailable; see the ReShade log.");
-  } else {
-    ImGui::TextDisabled("Software pacing: inactive.");
-  }
-  if (g_ceiling_patched.load(std::memory_order_acquire))
-    ImGui::Text("Streamline maximum: %ux.", g_ceiling_effective + 1);
-  if (mfgunlock::framecount::g_capacity_advertised.load(std::memory_order_relaxed)) {
-    ImGui::Text("Native menu maximum: runtime %ux, advertised %ux.",
-                mfgunlock::framecount::g_runtime_max_generated.load(std::memory_order_relaxed) + 1,
-                mfgunlock::framecount::g_advertised_max_generated.load(
-                    std::memory_order_relaxed) + 1);
+    ImGui::Separator();
+    if (g_flip_meter_patched.load(std::memory_order_acquire)) {
+      ImGui::TextUnformatted("Software pacing: active");
+    } else if (g_flip_meter_failed.load(std::memory_order_acquire)) {
+      ImGui::TextDisabled("Software pacing: unavailable; see the ReShade log.");
+    } else {
+      ImGui::TextDisabled("Software pacing: inactive.");
+    }
+    if (g_ceiling_patched.load(std::memory_order_acquire))
+      ImGui::Text("Streamline maximum: %ux.", g_ceiling_effective + 1);
+    if (mfgunlock::framecount::g_capacity_advertised.load(std::memory_order_relaxed)) {
+      ImGui::Text("Native menu maximum: runtime %ux, advertised %ux.",
+                  mfgunlock::framecount::g_runtime_max_generated.load(std::memory_order_relaxed) + 1,
+                  mfgunlock::framecount::g_advertised_max_generated.load(
+                      std::memory_order_relaxed) + 1);
+    }
   }
   if (mfgunlock::framecount::g_state_seen.load(std::memory_order_relaxed)) {
     const unsigned int status =
@@ -978,11 +1709,11 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
                 mfgunlock::framecount::g_last_forced.load(std::memory_order_relaxed));
   } else if (mfgunlock::framecount::g_declined_no_pacing.load(std::memory_order_relaxed)) {
     ImGui::TextWrapped("Declined to force: flip metering was still on when DLSS-G started.");
-  } else if (mfgunlock::framecount::g_feature_function_hooked.load(std::memory_order_acquire)) {
+  } else if (debug_options && mfgunlock::framecount::g_feature_function_hooked.load(std::memory_order_acquire)) {
     ImGui::TextDisabled("slGetFeatureFunction hook installed; DLSS-G not exercised yet.");
-  } else if (mfgunlock::framecount::g_init_hooked.load(std::memory_order_acquire)) {
+  } else if (debug_options && mfgunlock::framecount::g_init_hooked.load(std::memory_order_acquire)) {
     ImGui::TextDisabled("Streamline startup hook installed; no slGetFeatureFunction export.");
-  } else if (GetModuleHandleW(L"sl.interposer.dll")) {
+  } else if (debug_options && GetModuleHandleW(L"sl.interposer.dll")) {
     ImGui::TextDisabled("Streamline multiplier control: unavailable.");
   }
 
@@ -1029,36 +1760,242 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   }
 
   ImGui::Separator();
+  static const char* kFgPresets[] = {"Application / driver default", "Preset A", "Preset B"};
+  int preset = static_cast<int>(mfgunlock::fgpreset::g_requested.load(std::memory_order_relaxed));
+  if (ImGui::Combo("Frame Generation model", &preset, kFgPresets, ARRAYSIZE(kFgPresets))) {
+    mfgunlock::fgpreset::g_requested.store(mfgunlock::fgpreset::Parse(preset), std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "FrameGenerationPreset", preset);
+    InstallPresetForLoadedProviders();
+  }
+  ImGui::TextDisabled("Model changes may require restarting the game; FG off/on may reuse cached settings.");
+  if (preset != 0) {
+    if (!enabled) {
+      ImGui::TextDisabled("Preset override is disabled with MFG Unlock.");
+    } else if (!mfgunlock::fgpreset::HasHook()) {
+      ImGui::TextDisabled("Preset override unavailable: requires the supported DLSS-G 310.9.1 build.");
+    } else {
+      ImGui::Text("Requested preset: %s. Applies on the next model-setup read.",
+                  mfgunlock::fgpreset::Name(mfgunlock::fgpreset::Parse(preset)));
+    }
+  }
+  const int supplied = mfgunlock::fgpreset::g_last_supplied.load(std::memory_order_relaxed);
+  if (supplied >= 0) {
+    ImGui::Text("Last model-setup override supplied: %s.",
+                mfgunlock::fgpreset::Name(mfgunlock::fgpreset::Parse(supplied)));
+    if (supplied != preset || !enabled)
+      ImGui::TextDisabled("The previous model may remain cached. Restart to apply the new selection.");
+  }
+  const int applied = mfgunlock::fgpreset::g_last_applied.load(std::memory_order_relaxed);
+  if (applied >= 0) {
+    ImGui::Text("Provider-applied preset: %s (runtime-observed).",
+                mfgunlock::fgpreset::Name(mfgunlock::fgpreset::Parse(applied)));
+    if (applied != preset)
+      ImGui::TextDisabled("Provider state differs from the current selector; restart the game.");
+  } else if (supplied >= 0 && mfgunlock::fgpreset::HasObserver()) {
+    ImGui::TextDisabled("Provider-applied preset: waiting for NVIDIA override-state reporting.");
+  }
+
+  ImGui::Separator();
+  bool ui_composition = mfgunlock::framecount::g_ui_composition_enabled.load(
+      std::memory_order_relaxed);
+  if (ImGui::Checkbox("Automatic UI Composition", &ui_composition)) {
+    mfgunlock::framecount::g_ui_composition_enabled.store(
+        ui_composition, std::memory_order_relaxed);
+    mfgunlock::framecount::NotifyUiCompositionChanged();
+    reshade::set_config_value(nullptr, kConfigSection, "UIComposition",
+                              ui_composition ? 1 : 0);
+    if (!ui_composition) {
+      mfgunlock::framecount::g_ui_candidate_injection_enabled.store(
+          false, std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyUiCandidateInjectionChanged();
+      reshade::set_config_value(nullptr, kConfigSection, "UICandidateInjection", 0);
+    }
+  }
+  ImGui::TextDisabled(
+      "Keeps HUD/UI separate from generated scene frames when Streamline supplies a valid pair.\n"
+      "Independent of the Frame Generation model; toggle frame generation off/on after changing it.");
+  const auto ui_debug = mfgunlock::framecount::ReadUiDebugSnapshot();
+  if (!ui_composition) {
+    ImGui::TextDisabled("UI Composition: disabled; native final-color path.");
+  } else if (!mfgunlock::framecount::g_hdr_state_seen.load(std::memory_order_acquire)) {
+    ImGui::TextDisabled("UI Composition: waiting for output color-space detection.");
+  } else if (mfgunlock::framecount::g_hdr_active.load(std::memory_order_relaxed)) {
+    ImGui::TextDisabled("UI Composition: HDR output detected; guarded final-color fallback.");
+  } else if (mfgunlock::framecount::g_ui_composition_fell_back.load(
+                 std::memory_order_relaxed)) {
+    ImGui::Text("UI Composition: runtime rejected the request (sl::Result 0x%x); native path restored.",
+                mfgunlock::framecount::g_ui_composition_result.load(
+                    std::memory_order_relaxed));
+  } else if (mfgunlock::framecount::g_ui_composition_applied.load(
+                 std::memory_order_relaxed)) {
+    if (mfgunlock::framecount::g_ui_pair_eligible.load(std::memory_order_relaxed)) {
+      ImGui::TextUnformatted("UI Composition: active; validated HUD-less + UI inputs observed.");
+    } else if (mfgunlock::framecount::g_ui_native_hudless_fallback.load(
+                   std::memory_order_relaxed)) {
+      ImGui::TextDisabled(
+          "UI Composition: HUD-less present, UI partner missing; preserving native HUD-less path.");
+    } else if (ui_debug.suppression_active) {
+      ImGui::TextDisabled("UI Composition: path active; unsafe optional UI inputs are being guarded.");
+    } else {
+      ImGui::TextDisabled("UI Composition: path active; waiting for a complete HUD-less + UI pair.");
+    }
+  } else {
+    ImGui::TextDisabled("UI Composition: ready; toggle frame generation off/on to submit it.");
+  }
+  if (debug_options) {
+    ImGui::TextDisabled(
+        "UI inputs: HUD-less=%s (%llu), UI Color+Alpha=%s (%llu), UI Alpha=%s (%llu).",
+        ui_debug.hudless_seen ? "yes" : "no",
+        mfgunlock::framecount::g_ui_hudless_tags_seen.load(std::memory_order_relaxed),
+        ui_debug.ui_color_alpha_seen ? "yes" : "no",
+        mfgunlock::framecount::g_ui_color_alpha_tags_seen.load(std::memory_order_relaxed),
+        ui_debug.ui_alpha_seen ? "yes" : "no",
+        mfgunlock::framecount::g_ui_alpha_tags_seen.load(std::memory_order_relaxed));
+    ImGui::TextDisabled(
+        "UI state: viewports=%u, options=%s, pair(now)=%s, pair(history)=%s, invalid=%s.",
+        ui_debug.viewport_count, ui_debug.options_seen ? "yes" : "no",
+        mfgunlock::framecount::g_ui_pair_eligible.load(std::memory_order_relaxed)
+            ? "yes" : "no",
+        ui_debug.pair_eligible ? "yes" : "no", ui_debug.invalid ? "yes" : "no");
+    ImGui::TextDisabled(
+        "UI guard: suppression=%s, native fallback=%s.",
+        ui_debug.suppression_active ? "yes" : "no",
+        mfgunlock::framecount::g_ui_native_hudless_fallback.load(std::memory_order_relaxed)
+            ? "yes" : "no");
+    ImGui::TextDisabled(
+        "UI request: accepted=%s, runtime fallback=%s, output=%s/%s.",
+        mfgunlock::framecount::g_ui_composition_applied.load(std::memory_order_relaxed)
+            ? "yes" : "no",
+        mfgunlock::framecount::g_ui_composition_fell_back.load(std::memory_order_relaxed)
+            ? "yes" : "no",
+        mfgunlock::framecount::g_hdr_state_seen.load(std::memory_order_acquire)
+            ? "known" : "unknown",
+        mfgunlock::framecount::g_hdr_active.load(std::memory_order_relaxed) ? "HDR" : "SDR");
+    ImGui::TextDisabled(
+        "UI options: source v%u, result=0x%x, suppressed tags=%llu; issue mask=0x%x; resets=%llu/%llu.",
+        mfgunlock::framecount::g_ui_composition_source_version.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_composition_result.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_optional_tags_suppressed.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_issue_mask.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_resets_injected.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_resets_requested.load(std::memory_order_relaxed));
+
+    ImGui::Separator();
+    bool inject_ui_candidate =
+        mfgunlock::framecount::g_ui_candidate_injection_enabled.load(
+            std::memory_order_relaxed);
+    ImGui::BeginDisabled(!ui_composition);
+    if (ImGui::Checkbox("Inject detected UI Color+Alpha (experimental)",
+                        &inject_ui_candidate)) {
+      mfgunlock::framecount::g_ui_candidate_injection_enabled.store(
+          inject_ui_candidate, std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyUiCandidateInjectionChanged();
+      reshade::set_config_value(nullptr, kConfigSection, "UICandidateInjection",
+                                inject_ui_candidate ? 1 : 0);
+    }
+    ImGui::EndDisabled();
+    ImGui::TextDisabled(
+        "Opt-in diagnostic path. Metadata can identify a strong UI target but cannot prove\n"
+        "premultiplied UI pixels. The tag uses OnlyValidNow and fails back to native HUD-less.");
+
+    const auto candidate = ReadUiCandidateDebugSnapshot();
+    ImGui::TextDisabled(
+        "Detected UI candidate: present=%s, stable=%s, safe=%s, ambiguous=%s, overflow=%s.",
+        candidate.present ? "yes" : "no", candidate.stable ? "yes" : "no",
+        candidate.safe ? "yes" : "no", candidate.ambiguous ? "yes" : "no",
+        candidate.overflow ? "yes" : "no");
+    ImGui::TextDisabled(
+        "Candidate family: valid=%s, %ux%u, format=%u, handovers=%llu, age=%llums.",
+        candidate.family_valid ? "yes" : "no", candidate.family_width,
+        candidate.family_height, candidate.family_format,
+        static_cast<unsigned long long>(candidate.family_handoffs),
+        static_cast<unsigned long long>(candidate.family_age_ms));
+    if (candidate.present) {
+      ImGui::TextDisabled(
+          "Candidate: resource=0x%llx, %ux%u, format=%u (%s), alpha=8 bits.",
+          static_cast<unsigned long long>(candidate.resource), candidate.width,
+          candidate.height, candidate.format, UiCandidateFormatName(candidate.format));
+      ImGui::TextDisabled(
+          "Candidate evidence: transparent clear=%s, RTV binds after clear=%u, stable frames=%u, age=%llums.",
+          candidate.transparent_clear ? "yes" : "no", candidate.rtv_binds_after_clear,
+          candidate.stable_frames, static_cast<unsigned long long>(candidate.age_ms));
+      ImGui::TextDisabled(
+          "Candidate state: D3D12 known=%s state=0x%x, swapchain=%s, native-tagged=%s, "
+          "late writes=%u, reject mask=0x%x.",
+          candidate.state_known ? "yes" : "no", candidate.state,
+          candidate.swapchain ? "yes" : "no", candidate.already_tagged ? "yes" : "no",
+          candidate.late_writes, candidate.reject_reasons);
+    }
+    ImGui::TextDisabled(
+        "UI candidate injection: enabled=%s, active=%s, format=%u, options synced=%s, hard declined=%s.",
+        inject_ui_candidate ? "yes" : "no",
+        mfgunlock::framecount::g_ui_candidate_active.load(std::memory_order_relaxed)
+            ? "yes" : "no",
+        mfgunlock::framecount::g_ui_candidate_format.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_candidate_options_synced.load(std::memory_order_acquire)
+            ? "yes" : "no",
+        mfgunlock::framecount::g_ui_candidate_runtime_declined.load(std::memory_order_acquire)
+            ? "yes" : "no");
+    ImGui::TextDisabled(
+        "UI retry: cooldown=%u frames, consecutive failures=%u, last failed resource=0x%llx, recoveries=%llu.",
+        mfgunlock::framecount::g_ui_candidate_retry_frames.load(std::memory_order_acquire),
+        mfgunlock::framecount::g_ui_candidate_consecutive_failures.load(std::memory_order_acquire),
+        static_cast<unsigned long long>(
+            mfgunlock::framecount::g_ui_candidate_last_failed_resource.load(
+                std::memory_order_acquire)),
+        mfgunlock::framecount::g_ui_candidate_recoveries.load(std::memory_order_relaxed));
+    ImGui::TextDisabled(
+        "UI tag injection: injected=%llu, failures=%llu, native fallbacks=%llu, "
+        "missing command buffer=%llu, full batches=%llu, last result=0x%x; "
+        "lifecycle=OnlyValidNow.",
+        mfgunlock::framecount::g_ui_candidate_tags_injected.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_candidate_injection_failures.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_candidate_native_fallbacks.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_candidate_missing_command_buffer.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_candidate_full_batches.load(std::memory_order_relaxed),
+        mfgunlock::framecount::g_ui_candidate_last_result.load(std::memory_order_relaxed));
+  }
+
+  ImGui::Separator();
   bool warp = g_validated_warp_blend.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Validated Warp Blend (Ampere, 310.9.1)", &warp)) {
     g_validated_warp_blend.store(warp, std::memory_order_relaxed);
     reshade::set_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", warp ? 1 : 0);
   }
-  ImGui::TextDisabled("Quality patch; exact provider/kernel identity only. Restart required.");
-  if (!g_validated_warp_modules.empty()) {
-    ImGui::TextWrapped("Validated Warp Blend: active; %s.", g_validated_warp_detail.c_str());
-  } else if (warp && !g_validated_warp_detail.empty()) {
-    ImGui::TextWrapped("Validated Warp Blend: not applied; %s.", g_validated_warp_detail.c_str());
-  } else if (warp) {
-    ImGui::TextDisabled("Validated Warp Blend: pending restart/provider load.");
+  ImGui::TextDisabled("Changes apply after restarting the game.");
+  if (warp && debug_options) {
+    static const char* kWarpModes[] = {
+        "Redirect control",
+        "Blackwell baseline sm_86",
+        "Validated Warp sm_86",
+    };
+    int warp_mode = g_validated_warp_mode.load(std::memory_order_relaxed);
+    if (ImGui::Combo("Warp diagnostic mode", &warp_mode, kWarpModes, ARRAYSIZE(kWarpModes)))
+      SetWarpMode(warp_mode);
+    ImGui::TextDisabled("0: relocation control; 1: baseline rebuild; 2: normal Warp quality path.");
   }
+  DrawWarpStatus(warp, debug_options);
 
-  ImGui::Separator();
-  bool temporal = g_temporal_fix.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Temporal fix (stops all frames landing at the midpoint)", &temporal)) {
-    g_temporal_fix.store(temporal, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "TemporalFix", temporal ? 1 : 0);
+  if (debug_options) {
+    ImGui::Separator();
+    bool temporal = g_temporal_fix.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Temporal fix (stops all frames landing at the midpoint)", &temporal)) {
+      g_temporal_fix.store(temporal, std::memory_order_relaxed);
+      reshade::set_config_value(nullptr, kConfigSection, "TemporalFix", temporal ? 1 : 0);
+    }
+    ImGui::TextDisabled("Applied once at load; restart the game to change it.");
+    if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
+      if (g_midpoint_patched.load(std::memory_order_acquire)) {
+        ImGui::TextWrapped("Temporal fix: %zu provider(s); last result: %s.",
+                           g_midpoint_modules.size(), g_midpoint_detail.c_str());
+      } else {
+        ImGui::TextDisabled("Temporal fix: pending.");
+      }
+      ReleaseSRWLockShared(&g_provider_maintenance_lock);
+    }
+  } else if (!g_temporal_fix.load(std::memory_order_relaxed)) {
+    ImGui::TextDisabled("Temporal correction disabled (advanced setting).");
   }
-  ImGui::TextDisabled("Applied once at load; restart the game to change it.");
-
-  ImGui::Separator();
-  if (g_midpoint_patched.load(std::memory_order_acquire)) {
-    ImGui::TextWrapped("Temporal fix: %zu provider(s); last result: %s.",
-                       g_midpoint_modules.size(), g_midpoint_detail.c_str());
-  } else {
-    ImGui::TextDisabled("Temporal fix: pending.");
-  }
-
 }
 
 void LoadConfig() {
@@ -1091,6 +2028,36 @@ void LoadConfig() {
   if (reshade::get_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", value)) {
     g_validated_warp_blend.store(value != 0, std::memory_order_relaxed);
   }
+  int debug_options = 0;
+  reshade::get_config_value(nullptr, kConfigSection, "ShowDebugOptions", debug_options);
+  g_show_debug_options.store(debug_options != 0, std::memory_order_relaxed);
+  int ui_candidate_injection = 0;
+  if (debug_options != 0) {
+    reshade::get_config_value(nullptr, kConfigSection, "UICandidateInjection",
+                              ui_candidate_injection);
+  }
+  mfgunlock::framecount::g_ui_candidate_injection_enabled.store(
+      ui_candidate_injection != 0, std::memory_order_relaxed);
+  if (debug_options == 0 && reshade::get_config_value(
+          nullptr, kConfigSection, "UICandidateInjection", ui_candidate_injection) &&
+      ui_candidate_injection != 0) {
+    reshade::set_config_value(nullptr, kConfigSection, "UICandidateInjection", 0);
+  }
+  int warp_mode = static_cast<int>(mfgunlock::validatedwarp::Mode::kValidatedWarp);
+  const bool has_mode = reshade::get_config_value(nullptr, kConfigSection, "WarpDiagnosticMode", warp_mode);
+  const int configured_mode = static_cast<int>(mfgunlock::validatedwarp::ConfiguredMode(debug_options != 0, warp_mode));
+  g_validated_warp_mode.store(configured_mode, std::memory_order_relaxed);
+  // Migrate diagnostic INIs before any provider preparation, even if the panel
+  // is never opened. Hiding compatibility settings does not reset those keys.
+  if (has_mode && warp_mode != configured_mode)
+    reshade::set_config_value(nullptr, kConfigSection, "WarpDiagnosticMode", configured_mode);
+
+  int preset = 0;
+  const bool has_preset = reshade::get_config_value(nullptr, kConfigSection, "FrameGenerationPreset", preset);
+  const auto configured_preset = mfgunlock::fgpreset::Parse(preset);
+  mfgunlock::fgpreset::g_requested.store(configured_preset, std::memory_order_relaxed);
+  if (has_preset && preset != static_cast<int>(configured_preset))
+    reshade::set_config_value(nullptr, kConfigSection, "FrameGenerationPreset", static_cast<int>(configured_preset));
   if (reshade::get_config_value(nullptr, kConfigSection, "DynamicMFG", value)) {
     mfgunlock::framecount::g_dynamic_mfg_enabled.store(value != 0,
                                                        std::memory_order_relaxed);
@@ -1100,6 +2067,10 @@ void LoadConfig() {
     if (value > 480) value = 480;
     mfgunlock::framecount::g_dynamic_target_fps.store(
         static_cast<unsigned int>(value), std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "UIComposition", value)) {
+    mfgunlock::framecount::g_ui_composition_enabled.store(
+        value != 0, std::memory_order_relaxed);
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "RaiseFrameCeiling", value)) {
     g_raise_ceiling.store(value != 0, std::memory_order_relaxed);
@@ -1139,6 +2110,10 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       if (!reshade::register_addon(h_module)) return FALSE;
       LoadConfig();
       EnsureEarlyLoadConfig();
+      mfgunlock::framecount::g_observe_streamline_ui_tags = ObserveNativeStreamlineTags;
+      mfgunlock::framecount::g_observe_ui_candidate = ObserveUiCandidate;
+      mfgunlock::framecount::g_acquire_ui_candidate = AcquireUiCandidate;
+      mfgunlock::framecount::g_release_ui_candidate = ReleaseUiCandidate;
       mfgunlock::streamline::Initialize(g_self_module);
       mfgunlock::ngx::g_prepare_loaded_providers = RunProviderMaintenance;
       mfgunlock::streamline::g_on_interposer_loaded = mfgunlock::framecount::TryInstall;
@@ -1186,8 +2161,28 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       reshade::register_overlay("MFG Unlock", OnRegisterOverlay);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+      reshade::register_event<reshade::addon_event::destroy_resource>(
+          OnDestroyUiCandidateResource);
+      reshade::register_event<reshade::addon_event::barrier>(OnUiCandidateBarrier);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+          OnBindUiCandidateRenderTargets);
+      reshade::register_event<reshade::addon_event::clear_render_target_view>(
+          OnClearUiCandidateRenderTarget);
+      reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+      reshade::register_event<reshade::addon_event::present>(OnPresentUiOutput);
       break;
     case DLL_PROCESS_DETACH:
+      reshade::unregister_event<reshade::addon_event::present>(OnPresentUiOutput);
+      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+      reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::unregister_event<reshade::addon_event::clear_render_target_view>(
+          OnClearUiCandidateRenderTarget);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+          OnBindUiCandidateRenderTargets);
+      reshade::unregister_event<reshade::addon_event::barrier>(OnUiCandidateBarrier);
+      reshade::unregister_event<reshade::addon_event::destroy_resource>(
+          OnDestroyUiCandidateResource);
       reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_overlay("MFG Unlock", OnRegisterOverlay);
@@ -1205,6 +2200,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       mfgunlock::ngx::g_prepare_loaded_providers = nullptr;
       mfgunlock::streamline::Shutdown();
       mfgunlock::framecount::Uninstall();
+      mfgunlock::framecount::g_observe_streamline_ui_tags = nullptr;
+      mfgunlock::framecount::g_observe_ui_candidate = nullptr;
+      mfgunlock::framecount::g_acquire_ui_candidate = nullptr;
+      mfgunlock::framecount::g_release_ui_candidate = nullptr;
+      ClearUiRuntimeCandidates();
+      g_ui_candidate_d3d12.store(false, std::memory_order_relaxed);
+      mfgunlock::fgpreset::Shutdown();
       RestoreValidatedWarp();
       RestoreMidpoint();
       RestoreDlssgArchGate();

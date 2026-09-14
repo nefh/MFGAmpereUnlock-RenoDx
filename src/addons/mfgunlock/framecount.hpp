@@ -14,9 +14,14 @@
 #include <vector>
 #include <windows.h>
 
+#include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstring>
+#include <limits>
 #include <sstream>
+#include <type_traits>
+#include <utility>
 
 #include <sl.h>
 #include <sl_dlss_g.h>
@@ -25,6 +30,8 @@
 
 #include "./architecture.hpp"
 #include "./ngx_hook.hpp"
+#include "./quality_guard.hpp"
+#include "./ui_candidate.hpp"
 
 namespace mfgunlock::framecount {
 
@@ -63,6 +70,68 @@ inline std::atomic_bool g_dynamic_runtime_declined{false};
 inline std::atomic<unsigned int> g_dynamic_result{0};
 inline bool (*g_dynamic_stack_ready)() = nullptr;
 
+// UI recomposition is independent of the selected Frame Generation preset.
+// Automatic mode requests Streamline's UI-capable path only after ReShade has
+// positively identified an SDR output; optional HUD/UI resources still pass
+// through a fail-closed metadata guard before Streamline can consume them.
+inline std::atomic_bool g_ui_composition_enabled{true};
+inline std::atomic_bool g_hdr_state_seen{false};
+inline std::atomic_bool g_hdr_active{false};
+inline std::atomic_bool g_ui_composition_applied{false};
+inline std::atomic_bool g_ui_composition_fell_back{false};
+inline std::atomic<unsigned int> g_ui_composition_result{0};
+inline std::atomic<unsigned int> g_ui_composition_source_version{0};
+inline std::atomic_bool g_ui_pair_eligible{false};
+inline std::atomic_bool g_hud_inputs_suppressed{false};
+inline std::atomic_bool g_ui_native_hudless_fallback{false};
+inline std::atomic<uint32_t> g_ui_issue_mask{0};
+inline std::atomic<unsigned long long> g_ui_resets_requested{0};
+inline std::atomic<unsigned long long> g_ui_resets_injected{0};
+inline std::atomic<unsigned long long> g_ui_hudless_tags_seen{0};
+inline std::atomic<unsigned long long> g_ui_color_alpha_tags_seen{0};
+inline std::atomic<unsigned long long> g_ui_alpha_tags_seen{0};
+inline std::atomic<unsigned long long> g_ui_optional_tags_suppressed{0};
+inline std::atomic_bool g_ui_tag_batch_too_large{false};
+inline std::atomic_bool g_ui_viewport_capacity_exhausted{false};
+
+// UI resource discovery is always observational. Injection is an explicit
+// advanced opt-in because metadata cannot prove premultiplied UI pixels.
+inline std::atomic_bool g_ui_candidate_injection_enabled{false};
+inline std::atomic_bool g_ui_candidate_active{false};
+inline std::atomic<uint32_t> g_ui_candidate_format{0};
+inline std::atomic_bool g_ui_candidate_options_synced{false};
+inline std::atomic_bool g_ui_candidate_runtime_declined{false};
+inline std::atomic<uint32_t> g_ui_candidate_retry_frames{0};
+inline std::atomic<uint32_t> g_ui_candidate_consecutive_failures{0};
+inline std::atomic<uint64_t> g_ui_candidate_last_failed_resource{0};
+inline std::atomic<unsigned long long> g_ui_candidate_tags_injected{0};
+inline std::atomic<unsigned long long> g_ui_candidate_injection_failures{0};
+inline std::atomic<unsigned long long> g_ui_candidate_recoveries{0};
+inline std::atomic<unsigned long long> g_ui_candidate_native_fallbacks{0};
+inline std::atomic<unsigned long long> g_ui_candidate_missing_command_buffer{0};
+inline std::atomic<unsigned long long> g_ui_candidate_full_batches{0};
+inline std::atomic<unsigned int> g_ui_candidate_last_result{0};
+
+struct UiCandidateSnapshot {
+  uint64_t native_resource = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t state = 0;
+  uint32_t stable_frames = 0;
+  uint32_t rtv_binds_after_clear = 0;
+  uint32_t reject_reasons = uicandidate::kStale;
+  uint32_t late_writes = 0;
+  uint64_t clear_serial = 0;
+  bool state_known = false;
+  bool recent = false;
+};
+
+inline void (*g_observe_streamline_ui_tags)(const sl::ResourceTag*, uint32_t) = nullptr;
+inline bool (*g_observe_ui_candidate)(UiCandidateSnapshot*) = nullptr;
+inline bool (*g_acquire_ui_candidate)(const UiCandidateSnapshot*) = nullptr;
+inline void (*g_release_ui_candidate)(const UiCandidateSnapshot*, bool, sl::Result) = nullptr;
+
 // The game owns Streamline runtime selection by default. Explicit overrides
 // only change NVIDIA's documented OTA flags for the slInit call.
 enum class RuntimeSelectionMode : unsigned int {
@@ -92,6 +161,10 @@ using GetStateFn =
     sl::Result (*)(const sl::ViewportHandle&, sl::DLSSGState&, const sl::DLSSGOptions*);
 using GetFeatureFunctionFn = sl::Result (*)(sl::Feature, const char*, void*&);
 using InitFn = sl::Result (*)(const sl::Preferences&, uint64_t);
+using SetTagFn = sl::Result (*)(const sl::ViewportHandle&, const sl::ResourceTag*, uint32_t,
+                               sl::CommandBuffer*);
+using SetTagForFrameFn = PFun_slSetTagForFrame*;
+using SetConstantsFn = PFun_slSetConstants*;
 
 inline SetOptionsFn g_real_set_options = nullptr;
 inline GetStateFn g_real_get_state = nullptr;
@@ -100,6 +173,11 @@ inline hook::AddressHook g_get_state_entry;
 inline std::atomic_bool g_entry_shutting_down{false};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
+inline SetTagFn g_real_set_tag = nullptr;
+inline SetTagForFrameFn g_real_set_tag_for_frame = nullptr;
+inline SetConstantsFn g_real_set_constants = nullptr;
+inline std::vector<hook::HookItem> g_ui_hooks;
+inline std::atomic_bool g_ui_hooks_installed{false};
 
 inline bool DynamicStackReady() {
   return g_dynamic_d3d12.load(std::memory_order_relaxed) &&
@@ -126,6 +204,304 @@ inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result
             : "mfgunlock: slDLSSGGetState reports NVIDIA Dynamic MFG unsupported; fixed MFG remains active.");
   }
   return true;
+}
+
+constexpr uint32_t kUnusedViewport = (std::numeric_limits<uint32_t>::max)();
+
+struct UiViewportState {
+  SRWLOCK lock = SRWLOCK_INIT;
+  std::atomic<uint32_t> key{kUnusedViewport};
+  std::atomic_bool options_seen{false};
+  std::atomic<uint32_t> mode{0};
+  std::atomic<uint32_t> generated_frames{0};
+  std::atomic<uint32_t> flags{0};
+  std::atomic<uint32_t> color_width{0};
+  std::atomic<uint32_t> color_height{0};
+  std::atomic<uint32_t> color_format{0};
+  std::atomic<uint32_t> mvec_width{0};
+  std::atomic<uint32_t> mvec_height{0};
+  std::atomic<uint32_t> backbuffer_width{0};
+  std::atomic<uint32_t> backbuffer_height{0};
+  std::atomic<uint32_t> backbuffer_format{0};
+  std::atomic_bool hud_separation_seen{false};
+  std::atomic_bool hud_separation_suppressed{false};
+  std::atomic_bool hudless_color_seen{false};
+  std::atomic_bool ui_color_or_alpha_seen{false};
+  std::atomic_bool ui_color_alpha_seen{false};
+  std::atomic_bool ui_alpha_seen{false};
+  std::atomic_bool ui_recomposition_invalid{false};
+  std::atomic_bool ui_recomposition_eligible{false};
+  std::atomic<uint64_t> reset_requested{0};
+  std::atomic<uint64_t> reset_applied{0};
+};
+
+inline std::array<UiViewportState, 8> g_ui_viewports{};
+
+inline UiViewportState* GetUiState(const sl::ViewportHandle& viewport) {
+  const uint32_t key = static_cast<uint32_t>(viewport);
+  for (auto& state : g_ui_viewports) {
+    if (state.key.load(std::memory_order_acquire) == key) return &state;
+  }
+  for (auto& state : g_ui_viewports) {
+    uint32_t unused = kUnusedViewport;
+    if (state.key.compare_exchange_strong(unused, key, std::memory_order_acq_rel))
+      return &state;
+    if (unused == key) return &state;
+  }
+  if (!g_ui_viewport_capacity_exhausted.exchange(true, std::memory_order_relaxed)) {
+    reshade::log::message(
+        reshade::log::level::warning,
+        "mfgunlock: UI Composition observed more than eight Streamline viewports; "
+        "additional viewports keep the native final-color path.");
+  }
+  return nullptr;
+}
+
+inline void RequestUiReset(UiViewportState* state) {
+  if (state == nullptr) return;
+  state->reset_requested.fetch_add(1, std::memory_order_release);
+  g_ui_resets_requested.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void RequestAllUiResets() {
+  for (auto& state : g_ui_viewports) {
+    if (state.key.load(std::memory_order_acquire) != kUnusedViewport)
+      RequestUiReset(&state);
+  }
+}
+
+inline void ForgetUiOutputs() {
+  for (auto& state : g_ui_viewports) {
+    AcquireSRWLockExclusive(&state.lock);
+    state.backbuffer_width.store(0, std::memory_order_relaxed);
+    state.backbuffer_height.store(0, std::memory_order_relaxed);
+    state.backbuffer_format.store(0, std::memory_order_relaxed);
+    state.hud_separation_seen.store(false, std::memory_order_relaxed);
+    state.hud_separation_suppressed.store(false, std::memory_order_relaxed);
+    state.hudless_color_seen.store(false, std::memory_order_relaxed);
+    state.ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
+    state.ui_color_alpha_seen.store(false, std::memory_order_relaxed);
+    state.ui_alpha_seen.store(false, std::memory_order_relaxed);
+    state.ui_recomposition_invalid.store(false, std::memory_order_relaxed);
+    state.ui_recomposition_eligible.store(false, std::memory_order_relaxed);
+    ReleaseSRWLockExclusive(&state.lock);
+  }
+  g_ui_pair_eligible.store(false, std::memory_order_relaxed);
+  g_ui_native_hudless_fallback.store(false, std::memory_order_relaxed);
+}
+
+inline void ObserveUiOptionsTransition(const sl::ViewportHandle& viewport,
+                                       const sl::DLSSGOptions& options) {
+  UiViewportState* state = GetUiState(viewport);
+  if (state == nullptr) return;
+
+  AcquireSRWLockExclusive(&state->lock);
+  const uint32_t mode = static_cast<uint32_t>(options.mode);
+  const uint32_t flags = static_cast<uint32_t>(options.flags);
+  const bool changed = state->options_seen.load(std::memory_order_acquire) &&
+      (state->mode.load(std::memory_order_relaxed) != mode ||
+       state->generated_frames.load(std::memory_order_relaxed) != options.numFramesToGenerate ||
+       state->flags.load(std::memory_order_relaxed) != flags ||
+       state->color_width.load(std::memory_order_relaxed) != options.colorWidth ||
+       state->color_height.load(std::memory_order_relaxed) != options.colorHeight ||
+       state->color_format.load(std::memory_order_relaxed) != options.colorBufferFormat ||
+       state->mvec_width.load(std::memory_order_relaxed) != options.mvecDepthWidth ||
+       state->mvec_height.load(std::memory_order_relaxed) != options.mvecDepthHeight);
+  state->mode.store(mode, std::memory_order_relaxed);
+  state->generated_frames.store(options.numFramesToGenerate, std::memory_order_relaxed);
+  state->flags.store(flags, std::memory_order_relaxed);
+  state->color_width.store(options.colorWidth, std::memory_order_relaxed);
+  state->color_height.store(options.colorHeight, std::memory_order_relaxed);
+  state->color_format.store(options.colorBufferFormat, std::memory_order_relaxed);
+  state->mvec_width.store(options.mvecDepthWidth, std::memory_order_relaxed);
+  state->mvec_height.store(options.mvecDepthHeight, std::memory_order_relaxed);
+  state->options_seen.store(true, std::memory_order_release);
+  ReleaseSRWLockExclusive(&state->lock);
+
+  if (changed && g_ui_composition_enabled.load(std::memory_order_relaxed))
+    RequestUiReset(state);
+}
+
+inline qualityguard::OutputDescription ExpectedUiOutput(const UiViewportState* state) {
+  if (state == nullptr) return {};
+  qualityguard::OutputDescription result{
+      state->backbuffer_width.load(std::memory_order_relaxed),
+      state->backbuffer_height.load(std::memory_order_relaxed),
+      state->backbuffer_format.load(std::memory_order_relaxed)};
+  if (!result.HasDimensions()) {
+    result.width = state->color_width.load(std::memory_order_relaxed);
+    result.height = state->color_height.load(std::memory_order_relaxed);
+  }
+  if (!result.HasFormat())
+    result.format = state->color_format.load(std::memory_order_relaxed);
+  return result;
+}
+
+inline void UpdateUiCandidateFormat(uint32_t format) {
+  if (format == 0) return;
+  const uint32_t previous = g_ui_candidate_format.exchange(
+      format, std::memory_order_acq_rel);
+  if (previous != format) {
+    g_ui_candidate_options_synced.store(false, std::memory_order_release);
+  }
+}
+
+inline bool CandidateInjectionRequested() {
+  return g_ui_candidate_injection_enabled.load(std::memory_order_relaxed) &&
+         !g_ui_candidate_runtime_declined.load(std::memory_order_acquire);
+}
+
+inline bool ConsumeCandidateRetryFrame() {
+  uint32_t remaining = g_ui_candidate_retry_frames.load(std::memory_order_acquire);
+  while (remaining != 0) {
+    if (g_ui_candidate_retry_frames.compare_exchange_weak(
+            remaining, remaining - 1, std::memory_order_acq_rel,
+            std::memory_order_acquire)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+inline bool BuildUiCompositionOptions(const sl::DLSSGOptions& source,
+                                      sl::DLSSGOptions& destination) {
+  const size_t version = source.structVersion;
+  if (source.structType != sl::DLSSGOptions::s_structType ||
+      version < sl::kStructVersion1 || version > sl::kStructVersion5) {
+    return false;
+  }
+
+  destination = sl::DLSSGOptions{};
+  destination.next = source.next;
+  destination.structVersion = version < sl::kStructVersion4
+                                  ? sl::kStructVersion4
+                                  : version;
+  destination.mode = source.mode;
+  destination.numFramesToGenerate = source.numFramesToGenerate;
+  destination.flags = source.flags;
+  destination.dynamicResWidth = source.dynamicResWidth;
+  destination.dynamicResHeight = source.dynamicResHeight;
+  destination.numBackBuffers = source.numBackBuffers;
+  destination.mvecDepthWidth = source.mvecDepthWidth;
+  destination.mvecDepthHeight = source.mvecDepthHeight;
+  destination.colorWidth = source.colorWidth;
+  destination.colorHeight = source.colorHeight;
+  destination.colorBufferFormat = source.colorBufferFormat;
+  destination.mvecBufferFormat = source.mvecBufferFormat;
+  destination.depthBufferFormat = source.depthBufferFormat;
+  destination.hudLessBufferFormat = source.hudLessBufferFormat;
+  destination.uiBufferFormat = source.uiBufferFormat;
+  const uint32_t candidate_format =
+      g_ui_candidate_format.load(std::memory_order_acquire);
+  if (CandidateInjectionRequested() && candidate_format != 0)
+    destination.uiBufferFormat = candidate_format;
+  destination.onErrorCallback = source.onErrorCallback;
+  if (version >= sl::kStructVersion2) destination.bReserved15 = source.bReserved15;
+  if (version >= sl::kStructVersion3)
+    destination.queueParallelismMode = source.queueParallelismMode;
+  destination.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
+  if (version >= sl::kStructVersion5)
+    destination.dynamicTargetFrameRate = source.dynamicTargetFrameRate;
+  return true;
+}
+
+inline uint32_t SuppressHudSeparationResources(sl::ResourceTag* tags, uint32_t count) {
+  if (tags == nullptr) return 0;
+  uint32_t suppressed = 0;
+  for (uint32_t index = 0; index < count; ++index) {
+    if (!qualityguard::IsHudSeparationType(tags[index].type)) continue;
+    tags[index].resource = nullptr;
+    ++suppressed;
+  }
+  return suppressed;
+}
+
+inline uint32_t SuppressUiResources(sl::ResourceTag* tags, uint32_t count) {
+  if (tags == nullptr) return 0;
+  uint32_t suppressed = 0;
+  for (uint32_t index = 0; index < count; ++index) {
+    if (!qualityguard::IsUiColorOrAlphaType(tags[index].type)) continue;
+    tags[index].resource = nullptr;
+    ++suppressed;
+  }
+  return suppressed;
+}
+
+inline bool ShouldRequestUiComposition(const sl::DLSSGOptions& options) {
+  return g_ui_composition_enabled.load(std::memory_order_relaxed) &&
+         options.mode != sl::DLSSGMode::eOff &&
+         qualityguard::ShouldRequestAutomaticUiPath(
+             g_hdr_state_seen.load(std::memory_order_acquire),
+             g_hdr_active.load(std::memory_order_relaxed));
+}
+
+inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
+                                    const sl::DLSSGOptions& options) {
+  if (g_real_set_options == nullptr) return sl::Result::eErrorNotInitialized;
+
+  const bool recompose = ShouldRequestUiComposition(options);
+  if (!recompose) {
+    ObserveUiOptionsTransition(viewport, options);
+    const sl::Result result = g_real_set_options(viewport, options);
+    if (options.mode == sl::DLSSGMode::eOff ||
+        !g_ui_composition_enabled.load(std::memory_order_relaxed) ||
+        g_hdr_active.load(std::memory_order_relaxed)) {
+      g_ui_composition_applied.store(false, std::memory_order_relaxed);
+      g_ui_candidate_options_synced.store(false, std::memory_order_release);
+    }
+    return result;
+  }
+
+  sl::DLSSGOptions forwarded{};
+  if (!BuildUiCompositionOptions(options, forwarded)) {
+    g_ui_composition_applied.store(false, std::memory_order_relaxed);
+    g_ui_candidate_options_synced.store(false, std::memory_order_release);
+    g_ui_composition_result.store(
+        static_cast<unsigned int>(sl::Result::eErrorUnsupportedInterface),
+        std::memory_order_relaxed);
+    if (!g_ui_composition_fell_back.exchange(true, std::memory_order_relaxed)) {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "mfgunlock: UI Composition was not submitted because the game supplied an "
+          "unknown DLSSGOptions ABI; native options were preserved.");
+    }
+    ObserveUiOptionsTransition(viewport, options);
+    return g_real_set_options(viewport, options);
+  }
+
+  g_ui_composition_source_version.store(
+      static_cast<unsigned int>(options.structVersion), std::memory_order_relaxed);
+  const sl::Result result = g_real_set_options(viewport, forwarded);
+  g_ui_composition_result.store(static_cast<unsigned int>(result),
+                                std::memory_order_relaxed);
+  if (result == sl::Result::eOk) {
+    ObserveUiOptionsTransition(viewport, forwarded);
+    const uint32_t candidate_format =
+        g_ui_candidate_format.load(std::memory_order_acquire);
+    const bool candidate_synced = CandidateInjectionRequested() &&
+        candidate_format != 0 && forwarded.uiBufferFormat == candidate_format;
+    g_ui_candidate_options_synced.store(candidate_synced, std::memory_order_release);
+    g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
+    if (!g_ui_composition_applied.exchange(true, std::memory_order_relaxed)) {
+      reshade::log::message(
+          reshade::log::level::info,
+          "mfgunlock: Streamline accepted the guarded UI Composition path; optional HUD/UI "
+          "resources remain gated by metadata validation.");
+    }
+    return result;
+  }
+
+  g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  g_ui_candidate_options_synced.store(false, std::memory_order_release);
+  if (!g_ui_composition_fell_back.exchange(true, std::memory_order_relaxed)) {
+    std::stringstream message;
+    message << "mfgunlock: UI Composition was rejected with sl::Result "
+            << static_cast<unsigned int>(result)
+            << "; restoring the game's native final-color path.";
+    reshade::log::message(reshade::log::level::warning, message.str().c_str());
+  }
+  ObserveUiOptionsTransition(viewport, options);
+  return g_real_set_options(viewport, options);
 }
 
 inline bool BuildDynamicOptions(const sl::DLSSGOptions& source,
@@ -218,7 +594,7 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
   if (options.mode == sl::DLSSGMode::eOff) {
     g_dynamic_applied.store(false, std::memory_order_relaxed);
     g_dynamic_runtime_declined.store(false, std::memory_order_relaxed);
-    return g_real_set_options(viewport, options);
+    return ForwardSetOptions(viewport, options);
   }
 
   const bool dynamic_requested =
@@ -232,11 +608,11 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     if (backend_ready) {
       sl::DLSSGOptions dynamic_options{};
       if (BuildDynamicOptions(options, dynamic_options)) {
-        sl::Result result = g_real_set_options(viewport, dynamic_options);
+        sl::Result result = ForwardSetOptions(viewport, dynamic_options);
         if (result != sl::Result::eOk) {
           // Feature-manager startup can be transient. Retry the same validated
           // request once, then preserve the game's fixed request as fallback.
-          result = g_real_set_options(viewport, dynamic_options);
+          result = ForwardSetOptions(viewport, dynamic_options);
         }
         g_dynamic_result.store(static_cast<unsigned int>(result),
                                std::memory_order_relaxed);
@@ -299,13 +675,13 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
       auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
       const uint32_t requested = options.numFramesToGenerate;
       mutable_options.numFramesToGenerate = 1;
-      const sl::Result result = g_real_set_options(viewport, options);
+      const sl::Result result = ForwardSetOptions(viewport, options);
       mutable_options.numFramesToGenerate = requested;
       return result;
     }
   }
   if (multiplier < 2 || options.mode == sl::DLSSGMode::eOff)
-    return g_real_set_options(viewport, options);
+    return ForwardSetOptions(viewport, options);
 
   const uint32_t desired = multiplier - 1;  // generated frames, not total
   const uint32_t requested = options.numFramesToGenerate;
@@ -315,10 +691,10 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
           reshade::log::level::warning,
           "mfgunlock: provider not ready for MFG; multiplier unchanged.");
     }
-    return g_real_set_options(viewport, options);
+    return ForwardSetOptions(viewport, options);
   }
   g_last_requested.store(requested, std::memory_order_relaxed);
-  if (requested == desired) return g_real_set_options(viewport, options);
+  if (requested == desired) return ForwardSetOptions(viewport, options);
 
   // Fixed multi-frame compatibility can use the legacy software-pacing path.
   // Dynamic MFG returns above and leaves pacing to the current NVIDIA runtime.
@@ -334,14 +710,14 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
             "asking for more than one generated frame without software pacing freezes "
             "presentation. Leaving the game's own request alone.");
       }
-      return g_real_set_options(viewport, options);
+      return ForwardSetOptions(viewport, options);
     }
   }
 
   // The caller owns this structure, so restore it before returning.
   auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
   mutable_options.numFramesToGenerate = desired;
-  sl::Result result = g_real_set_options(viewport, options);
+  sl::Result result = ForwardSetOptions(viewport, options);
   mutable_options.numFramesToGenerate = requested;
 
   // Fall back to the original request if the override is rejected.
@@ -349,7 +725,7 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     // The feature manager can reject the first call while still initializing.
     // Retry the same request once before treating the count as unsupported.
     mutable_options.numFramesToGenerate = desired;
-    const sl::Result retry = g_real_set_options(viewport, options);
+    const sl::Result retry = ForwardSetOptions(viewport, options);
     mutable_options.numFramesToGenerate = requested;
 
     if (retry == sl::Result::eOk) {
@@ -372,7 +748,7 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
         << requested << ". The count itself is being refused, not a transient state.";
       reshade::log::message(reshade::log::level::warning, s.str().c_str());
     }
-    return g_real_set_options(viewport, options);
+    return ForwardSetOptions(viewport, options);
   }
 
   if (!g_intercepted.exchange(true, std::memory_order_relaxed)) {
@@ -382,6 +758,396 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
   g_last_forced.store(desired, std::memory_order_relaxed);
+  return result;
+}
+
+inline void MarkInjectedUiPair(UiViewportState* state) {
+  if (state == nullptr) return;
+  AcquireSRWLockExclusive(&state->lock);
+  const bool was_eligible =
+      state->ui_recomposition_eligible.exchange(true, std::memory_order_acq_rel);
+  state->hudless_color_seen.store(true, std::memory_order_release);
+  state->ui_color_or_alpha_seen.store(true, std::memory_order_release);
+  state->ui_color_alpha_seen.store(true, std::memory_order_release);
+  state->ui_recomposition_invalid.store(false, std::memory_order_release);
+  state->hud_separation_suppressed.store(false, std::memory_order_release);
+  if (!was_eligible) RequestUiReset(state);
+  ReleaseSRWLockExclusive(&state->lock);
+
+  g_ui_pair_eligible.store(true, std::memory_order_relaxed);
+  g_ui_native_hudless_fallback.store(false, std::memory_order_relaxed);
+}
+
+template <typename Forward>
+inline sl::Result TryInjectUiCandidate(UiViewportState* state,
+                                      const UiCandidateSnapshot& candidate,
+                                      const sl::ResourceTag* tags, uint32_t count,
+                                      sl::CommandBuffer* command_buffer,
+                                      Forward&& forward) {
+  g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  const bool injection_requested = CandidateInjectionRequested();
+  const bool options_synced =
+      g_ui_candidate_options_synced.load(std::memory_order_acquire);
+  const bool can_inject = uicandidate::CanInject(
+      candidate.reject_reasons, candidate.stable_frames, command_buffer != nullptr,
+      options_synced, injection_requested);
+  if (can_inject && count >= 64) {
+    g_ui_candidate_full_batches.fetch_add(1, std::memory_order_relaxed);
+    return forward(tags, count);
+  }
+  if (!can_inject) {
+    if (injection_requested && options_synced &&
+        candidate.reject_reasons == uicandidate::kAccept &&
+        uicandidate::IsStable(candidate.stable_frames) && command_buffer == nullptr) {
+      g_ui_candidate_missing_command_buffer.fetch_add(1, std::memory_order_relaxed);
+    }
+    return forward(tags, count);
+  }
+  if (ConsumeCandidateRetryFrame()) return forward(tags, count);
+  if (g_acquire_ui_candidate == nullptr || g_release_ui_candidate == nullptr ||
+      !g_acquire_ui_candidate(&candidate)) {
+    return forward(tags, count);
+  }
+
+  sl::Resource ui_resource(
+      sl::ResourceType::eTex2d,
+      reinterpret_cast<void*>(static_cast<uintptr_t>(candidate.native_resource)),
+      candidate.state);
+  ui_resource.width = candidate.width;
+  ui_resource.height = candidate.height;
+  ui_resource.nativeFormat = candidate.format;
+  sl::Extent ui_extent{};
+  ui_extent.width = candidate.width;
+  ui_extent.height = candidate.height;
+  sl::ResourceTag ui_tag(&ui_resource, sl::kBufferTypeUIColorAndAlpha,
+                         sl::ResourceLifecycle::eOnlyValidNow, &ui_extent);
+
+  static_assert(std::is_trivially_copyable_v<sl::ResourceTag>);
+  alignas(sl::ResourceTag)
+      std::array<std::byte, sizeof(sl::ResourceTag) * 65> storage{};
+  std::memcpy(storage.data(), tags, sizeof(sl::ResourceTag) * count);
+  std::memcpy(storage.data() + sizeof(sl::ResourceTag) * count,
+              &ui_tag, sizeof(ui_tag));
+  const auto* forwarded = reinterpret_cast<const sl::ResourceTag*>(storage.data());
+  const sl::Result result = forward(forwarded, count + 1);
+  g_ui_candidate_last_result.store(static_cast<unsigned int>(result),
+                                   std::memory_order_relaxed);
+  g_release_ui_candidate(&candidate, true, result);
+
+  if (result == sl::Result::eOk) {
+    const uint32_t previous_failures =
+        g_ui_candidate_consecutive_failures.exchange(0, std::memory_order_acq_rel);
+    g_ui_candidate_last_failed_resource.store(0, std::memory_order_release);
+    g_ui_candidate_retry_frames.store(0, std::memory_order_release);
+    if (previous_failures != 0)
+      g_ui_candidate_recoveries.fetch_add(1, std::memory_order_relaxed);
+    g_ui_candidate_tags_injected.fetch_add(1, std::memory_order_relaxed);
+    g_ui_candidate_active.store(true, std::memory_order_relaxed);
+    MarkInjectedUiPair(state);
+    return result;
+  }
+
+  g_ui_candidate_injection_failures.fetch_add(1, std::memory_order_relaxed);
+  g_ui_candidate_native_fallbacks.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t previous_resource =
+      g_ui_candidate_last_failed_resource.exchange(candidate.native_resource,
+                                                   std::memory_order_acq_rel);
+  const uint32_t previous_streak =
+      g_ui_candidate_consecutive_failures.load(std::memory_order_acquire);
+  const uint32_t failure_streak = uicandidate::NextFailureStreak(
+      previous_resource == candidate.native_resource, previous_streak);
+  g_ui_candidate_consecutive_failures.store(failure_streak,
+                                            std::memory_order_release);
+  g_ui_candidate_retry_frames.store(uicandidate::kRetryCooldownFrames,
+                                    std::memory_order_release);
+
+  if (uicandidate::ShouldHardDecline(failure_streak)) {
+    g_ui_candidate_runtime_declined.store(true, std::memory_order_release);
+    g_ui_candidate_options_synced.store(false, std::memory_order_release);
+    std::stringstream message;
+    message << "mfgunlock: detected UI Color+Alpha tag failed " << failure_streak
+            << " consecutive times on resource 0x" << std::hex
+            << candidate.native_resource << std::dec << " (sl::Result "
+            << static_cast<unsigned int>(result)
+            << "); disabling experimental UI injection until the option is toggled.";
+    reshade::log::message(reshade::log::level::warning, message.str().c_str());
+  } else if (failure_streak == 1) {
+    std::stringstream message;
+    message << "mfgunlock: detected UI Color+Alpha tag was transiently rejected with "
+            << "sl::Result " << static_cast<unsigned int>(result)
+            << "; preserving native HUD-less and retrying after candidate revalidation.";
+    reshade::log::message(reshade::log::level::warning, message.str().c_str());
+  }
+  return forward(tags, count);
+}
+
+template <typename Forward>
+inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
+                               const sl::ResourceTag* tags, uint32_t count,
+                               sl::CommandBuffer* command_buffer,
+                               Forward&& forward) {
+  if (!g_enabled.load(std::memory_order_relaxed) ||
+      !g_ui_composition_enabled.load(std::memory_order_relaxed) ||
+      tags == nullptr || count == 0) {
+    return forward(tags, count);
+  }
+
+  if (count > 64) {
+    if (!g_ui_tag_batch_too_large.exchange(true, std::memory_order_relaxed)) {
+      reshade::log::message(
+          reshade::log::level::warning,
+          "mfgunlock: UI Composition received more than 64 Streamline tags in one call; "
+          "the oversized batch is forwarded unchanged.");
+    }
+    return forward(tags, count);
+  }
+
+  for (uint32_t index = 0; index < count; ++index) {
+    if (tags[index].resource == nullptr) continue;
+    if (tags[index].type == sl::kBufferTypeHUDLessColor) {
+      g_ui_hudless_tags_seen.fetch_add(1, std::memory_order_relaxed);
+    } else if (tags[index].type == sl::kBufferTypeUIColorAndAlpha) {
+      g_ui_color_alpha_tags_seen.fetch_add(1, std::memory_order_relaxed);
+    } else if (tags[index].type == sl::kBufferTypeUIAlpha) {
+      g_ui_alpha_tags_seen.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
+  if (g_observe_streamline_ui_tags != nullptr)
+    g_observe_streamline_ui_tags(tags, count);
+
+  UiViewportState* state = GetUiState(viewport);
+  const bool hdr = g_hdr_active.load(std::memory_order_relaxed);
+  qualityguard::OutputDescription expected{};
+  if (state != nullptr) {
+    AcquireSRWLockShared(&state->lock);
+    expected = ExpectedUiOutput(state);
+    ReleaseSRWLockShared(&state->lock);
+  }
+
+  const auto assessment = qualityguard::AssessTags(tags, count, hdr, expected);
+  bool eligible = false;
+  auto suppression = assessment.suppress_hud_separation
+                         ? qualityguard::SuppressionPolicy::kAllHudSeparation
+                         : qualityguard::SuppressionPolicy::kNone;
+
+  if (state != nullptr) {
+    AcquireSRWLockExclusive(&state->lock);
+    bool output_changed = false;
+    if (assessment.observed_backbuffer.HasDimensions()) {
+      const uint32_t old_width = state->backbuffer_width.load(std::memory_order_relaxed);
+      const uint32_t old_height = state->backbuffer_height.load(std::memory_order_relaxed);
+      output_changed = (old_width != 0 && old_height != 0) &&
+                       (old_width != assessment.observed_backbuffer.width ||
+                        old_height != assessment.observed_backbuffer.height);
+      state->backbuffer_width.store(assessment.observed_backbuffer.width,
+                                    std::memory_order_relaxed);
+      state->backbuffer_height.store(assessment.observed_backbuffer.height,
+                                     std::memory_order_relaxed);
+    }
+    if (assessment.observed_backbuffer.HasFormat()) {
+      const uint32_t old_format = state->backbuffer_format.load(std::memory_order_relaxed);
+      output_changed = output_changed ||
+                       (old_format != 0 && old_format != assessment.observed_backbuffer.format);
+      state->backbuffer_format.store(assessment.observed_backbuffer.format,
+                                     std::memory_order_relaxed);
+    }
+
+    if (output_changed) {
+      state->hudless_color_seen.store(false, std::memory_order_relaxed);
+      state->ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
+      state->ui_color_alpha_seen.store(false, std::memory_order_relaxed);
+      state->ui_alpha_seen.store(false, std::memory_order_relaxed);
+      state->ui_recomposition_invalid.store(false, std::memory_order_relaxed);
+      state->ui_recomposition_eligible.store(false, std::memory_order_relaxed);
+      RequestUiReset(state);
+    }
+
+    if (assessment.has_hud_separation) {
+      const bool was_eligible =
+          state->ui_recomposition_eligible.load(std::memory_order_relaxed);
+      if (assessment.clears_hudless_color)
+        state->hudless_color_seen.store(false, std::memory_order_release);
+      if (assessment.clears_ui_color_alpha)
+        state->ui_color_alpha_seen.store(false, std::memory_order_release);
+      if (assessment.clears_ui_alpha)
+        state->ui_alpha_seen.store(false, std::memory_order_release);
+      if (assessment.clears_ui_color_or_alpha) {
+        const bool ui_seen =
+            state->ui_color_alpha_seen.load(std::memory_order_acquire) ||
+            state->ui_alpha_seen.load(std::memory_order_acquire);
+        state->ui_color_or_alpha_seen.store(ui_seen, std::memory_order_release);
+      }
+      if (assessment.clears_hudless_color || assessment.clears_ui_color_or_alpha)
+        state->ui_recomposition_invalid.store(false, std::memory_order_release);
+      if (assessment.has_hudless_color)
+        state->hudless_color_seen.store(true, std::memory_order_release);
+      if (assessment.has_ui_color_alpha)
+        state->ui_color_alpha_seen.store(true, std::memory_order_release);
+      if (assessment.has_ui_alpha)
+        state->ui_alpha_seen.store(true, std::memory_order_release);
+      if (assessment.has_ui_color_or_alpha)
+        state->ui_color_or_alpha_seen.store(true, std::memory_order_release);
+
+      const bool complete_batch =
+          assessment.has_hudless_color && assessment.has_ui_color_or_alpha;
+      if (complete_batch && !qualityguard::HasStructuralIssues(assessment)) {
+        state->ui_recomposition_invalid.store(false, std::memory_order_release);
+      } else if (qualityguard::HasStructuralIssues(assessment)) {
+        state->ui_recomposition_invalid.store(true, std::memory_order_release);
+      }
+
+      auto accumulated = assessment;
+      accumulated.has_hudless_color =
+          state->hudless_color_seen.load(std::memory_order_acquire);
+      accumulated.has_ui_color_or_alpha =
+          state->ui_color_or_alpha_seen.load(std::memory_order_acquire);
+      if (state->ui_recomposition_invalid.load(std::memory_order_acquire))
+        accumulated.issues |= qualityguard::kInvalidOptionalResource;
+
+      eligible = qualityguard::CanAutomaticallyUseUiRecomposition(accumulated, hdr);
+      suppression = qualityguard::ResolveSuppression(
+          assessment, accumulated, hdr, was_eligible);
+      const bool suppress = suppression != qualityguard::SuppressionPolicy::kNone;
+      const bool native_hudless_fallback =
+          !hdr && accumulated.has_hudless_color &&
+          !accumulated.has_ui_color_or_alpha &&
+          !qualityguard::HasStructuralIssues(accumulated);
+      g_ui_native_hudless_fallback.store(native_hudless_fallback,
+                                         std::memory_order_relaxed);
+
+      const bool was_seen =
+          state->hud_separation_seen.exchange(true, std::memory_order_acq_rel);
+      const bool was_suppressed = state->hud_separation_suppressed.exchange(
+          suppress, std::memory_order_acq_rel);
+      const bool previous_eligible = state->ui_recomposition_eligible.exchange(
+          eligible, std::memory_order_acq_rel);
+      if ((!was_seen && suppress) ||
+          (was_seen && (was_suppressed != suppress || previous_eligible != eligible))) {
+        RequestUiReset(state);
+      }
+    }
+    ReleaseSRWLockExclusive(&state->lock);
+  } else if (assessment.has_hud_separation) {
+    suppression = qualityguard::SuppressionPolicy::kAllHudSeparation;
+    g_ui_native_hudless_fallback.store(false, std::memory_order_relaxed);
+  }
+
+  if (assessment.has_hud_separation)
+    g_ui_pair_eligible.store(eligible, std::memory_order_relaxed);
+
+  const bool native_hudless_only = state != nullptr && !hdr &&
+      assessment.has_hudless_color && !assessment.has_ui_color_or_alpha &&
+      !qualityguard::HasStructuralIssues(assessment) &&
+      suppression == qualityguard::SuppressionPolicy::kNone;
+  if (native_hudless_only &&
+      g_ui_candidate_injection_enabled.load(std::memory_order_relaxed)) {
+    g_ui_candidate_active.store(false, std::memory_order_relaxed);
+    g_ui_pair_eligible.store(false, std::memory_order_relaxed);
+    g_ui_native_hudless_fallback.store(true, std::memory_order_relaxed);
+  }
+  if (native_hudless_only && g_observe_ui_candidate != nullptr) {
+    UiCandidateSnapshot candidate{};
+    if (g_observe_ui_candidate(&candidate)) {
+      UpdateUiCandidateFormat(candidate.format);
+      return TryInjectUiCandidate(
+          state, candidate, tags, count, command_buffer, std::forward<Forward>(forward));
+    }
+  }
+
+  if (suppression == qualityguard::SuppressionPolicy::kNone) return forward(tags, count);
+
+  static_assert(std::is_trivially_copyable_v<sl::ResourceTag>);
+  alignas(sl::ResourceTag)
+      std::array<std::byte, sizeof(sl::ResourceTag) * 64> storage{};
+  std::memcpy(storage.data(), tags, sizeof(sl::ResourceTag) * count);
+  auto* forwarded = reinterpret_cast<sl::ResourceTag*>(storage.data());
+  const uint32_t suppressed =
+      suppression == qualityguard::SuppressionPolicy::kAllHudSeparation
+          ? SuppressHudSeparationResources(forwarded, count)
+          : SuppressUiResources(forwarded, count);
+  if (suppressed == 0) return forward(tags, count);
+
+  g_ui_optional_tags_suppressed.fetch_add(suppressed, std::memory_order_relaxed);
+  const uint32_t previous_issues =
+      g_ui_issue_mask.fetch_or(assessment.issues, std::memory_order_relaxed);
+  if (!g_hud_inputs_suppressed.exchange(true, std::memory_order_relaxed)) {
+    reshade::log::message(
+        reshade::log::level::info,
+        "mfgunlock: UI Composition guard is active; unsafe or transition-only UI tags are "
+        "withheld while a valid native HUD-less input is preserved when no UI partner exists.");
+  }
+  if ((assessment.issues & ~previous_issues) != 0) {
+    std::stringstream message;
+    message << "mfgunlock: UI Composition guard observed optional-input issue mask 0x"
+            << std::hex << assessment.issues << std::dec
+            << "; using the safest available HUD-less/final-color fallback for this submission.";
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+  return forward(forwarded, count);
+}
+
+inline sl::Result HookedSetTag(const sl::ViewportHandle& viewport,
+                               const sl::ResourceTag* tags, uint32_t count,
+                               sl::CommandBuffer* command_buffer) {
+  if (g_real_set_tag == nullptr) return sl::Result::eErrorNotInitialized;
+  return FilterUiTags(
+      viewport, tags, count, command_buffer,
+      [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count) {
+        return g_real_set_tag(viewport, forwarded, forwarded_count, command_buffer);
+      });
+}
+
+inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame,
+                                       const sl::ViewportHandle& viewport,
+                                       const sl::ResourceTag* tags, uint32_t count,
+                                       sl::CommandBuffer* command_buffer) {
+  if (g_real_set_tag_for_frame == nullptr) return sl::Result::eErrorNotInitialized;
+  return FilterUiTags(
+      viewport, tags, count, command_buffer,
+      [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count) {
+        return g_real_set_tag_for_frame(
+            frame, viewport, forwarded, forwarded_count, command_buffer);
+      });
+}
+
+inline sl::Result HookedSetConstants(const sl::Constants& values,
+                                     const sl::FrameToken& frame,
+                                     const sl::ViewportHandle& viewport) {
+  if (g_real_set_constants == nullptr) return sl::Result::eErrorNotInitialized;
+  if (!g_enabled.load(std::memory_order_relaxed) ||
+      !g_ui_composition_enabled.load(std::memory_order_relaxed)) {
+    return g_real_set_constants(values, frame, viewport);
+  }
+
+  UiViewportState* state = GetUiState(viewport);
+  if (state == nullptr || !state->options_seen.load(std::memory_order_acquire) ||
+      state->mode.load(std::memory_order_relaxed) ==
+          static_cast<uint32_t>(sl::DLSSGMode::eOff)) {
+    return g_real_set_constants(values, frame, viewport);
+  }
+
+  const uint64_t requested = state->reset_requested.load(std::memory_order_acquire);
+  if (requested == state->reset_applied.load(std::memory_order_relaxed))
+    return g_real_set_constants(values, frame, viewport);
+
+  if (values.reset == sl::Boolean::eTrue) {
+    const sl::Result result = g_real_set_constants(values, frame, viewport);
+    if (result == sl::Result::eOk)
+      state->reset_applied.store(requested, std::memory_order_release);
+    return result;
+  }
+
+  alignas(sl::Constants) std::array<std::byte, sizeof(sl::Constants)> storage{};
+  if (!qualityguard::CopyConstantsWithReset(values, storage.data(), storage.size()))
+    return g_real_set_constants(values, frame, viewport);
+
+  const sl::Result result = g_real_set_constants(
+      *reinterpret_cast<const sl::Constants*>(storage.data()), frame, viewport);
+  if (result == sl::Result::eOk) {
+    state->reset_applied.store(requested, std::memory_order_release);
+    g_ui_resets_injected.fetch_add(1, std::memory_order_relaxed);
+  }
   return result;
 }
 
@@ -475,6 +1241,32 @@ inline sl::Result HookedGetFeatureFunction(sl::Feature feature, const char* func
   return result;
 }
 
+inline void TryInstallUiHooks(HMODULE interposer) {
+  if (g_ui_hooks_installed.load(std::memory_order_acquire) || interposer == nullptr) return;
+
+  std::vector<hook::HookItem> hooks;
+  if (GetProcAddress(interposer, "slSetTag") != nullptr) {
+    hooks.push_back({"slSetTag", reinterpret_cast<void**>(&g_real_set_tag),
+                     reinterpret_cast<void*>(&HookedSetTag)});
+  }
+  if (GetProcAddress(interposer, "slSetTagForFrame") != nullptr) {
+    hooks.push_back({"slSetTagForFrame", reinterpret_cast<void**>(&g_real_set_tag_for_frame),
+                     reinterpret_cast<void*>(&HookedSetTagForFrame)});
+  }
+  if (GetProcAddress(interposer, "slSetConstants") != nullptr) {
+    hooks.push_back({"slSetConstants", reinterpret_cast<void**>(&g_real_set_constants),
+                     reinterpret_cast<void*>(&HookedSetConstants)});
+  }
+  if (hooks.empty()) return;
+  if (!hook::Install(interposer, hooks, "Streamline UI Composition guard")) return;
+
+  g_ui_hooks = std::move(hooks);
+  g_ui_hooks_installed.store(true, std::memory_order_release);
+  reshade::log::message(
+      reshade::log::level::info,
+      "mfgunlock: Streamline UI Composition guard hooks installed.");
+}
+
 inline const std::vector<hook::HookItem> kFeatureFunctionHook = {
     {"slGetFeatureFunction", reinterpret_cast<void**>(&g_real_get_feature_function),
      reinterpret_cast<void*>(&HookedGetFeatureFunction)},
@@ -488,6 +1280,93 @@ inline const std::vector<hook::HookItem> kInitHook = {
 }  // namespace internal
 
 inline bool DynamicStackReady() { return internal::DynamicStackReady(); }
+
+struct UiDebugSnapshot {
+  uint32_t viewport_count = 0;
+  bool options_seen = false;
+  bool hudless_seen = false;
+  bool ui_color_or_alpha_seen = false;
+  bool ui_color_alpha_seen = false;
+  bool ui_alpha_seen = false;
+  bool pair_eligible = false;
+  bool invalid = false;
+  bool suppression_active = false;
+};
+
+inline UiDebugSnapshot ReadUiDebugSnapshot() {
+  UiDebugSnapshot snapshot{};
+  for (const auto& state : internal::g_ui_viewports) {
+    if (state.key.load(std::memory_order_acquire) == internal::kUnusedViewport) continue;
+    ++snapshot.viewport_count;
+    snapshot.options_seen |= state.options_seen.load(std::memory_order_acquire);
+    snapshot.hudless_seen |= state.hudless_color_seen.load(std::memory_order_acquire);
+    snapshot.ui_color_or_alpha_seen |=
+        state.ui_color_or_alpha_seen.load(std::memory_order_acquire);
+    snapshot.ui_color_alpha_seen |=
+        state.ui_color_alpha_seen.load(std::memory_order_acquire);
+    snapshot.ui_alpha_seen |= state.ui_alpha_seen.load(std::memory_order_acquire);
+    snapshot.pair_eligible |=
+        state.ui_recomposition_eligible.load(std::memory_order_acquire);
+    snapshot.invalid |= state.ui_recomposition_invalid.load(std::memory_order_acquire);
+    snapshot.suppression_active |=
+        state.hud_separation_suppressed.load(std::memory_order_acquire);
+  }
+  return snapshot;
+}
+
+inline void NotifyHdrState(bool hdr) {
+  const bool previous = g_hdr_active.exchange(hdr, std::memory_order_relaxed);
+  const bool seen = g_hdr_state_seen.exchange(true, std::memory_order_acq_rel);
+  if (!seen || previous != hdr) {
+    internal::ForgetUiOutputs();
+    internal::RequestAllUiResets();
+    g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  }
+}
+
+inline void NotifyOutputUnknown() {
+  g_hdr_state_seen.store(false, std::memory_order_release);
+  g_hdr_active.store(false, std::memory_order_relaxed);
+  g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  internal::ForgetUiOutputs();
+  internal::RequestAllUiResets();
+}
+
+inline void NotifyUiCompositionChanged() {
+  g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
+  g_ui_composition_result.store(0, std::memory_order_relaxed);
+  g_hud_inputs_suppressed.store(false, std::memory_order_relaxed);
+  g_ui_native_hudless_fallback.store(false, std::memory_order_relaxed);
+  g_ui_issue_mask.store(0, std::memory_order_relaxed);
+  g_ui_pair_eligible.store(false, std::memory_order_relaxed);
+  g_ui_hudless_tags_seen.store(0, std::memory_order_relaxed);
+  g_ui_color_alpha_tags_seen.store(0, std::memory_order_relaxed);
+  g_ui_alpha_tags_seen.store(0, std::memory_order_relaxed);
+  g_ui_optional_tags_suppressed.store(0, std::memory_order_relaxed);
+  g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  g_ui_candidate_options_synced.store(false, std::memory_order_release);
+  internal::ForgetUiOutputs();
+  internal::RequestAllUiResets();
+}
+
+inline void NotifyUiCandidateInjectionChanged() {
+  g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  g_ui_candidate_options_synced.store(false, std::memory_order_release);
+  g_ui_candidate_runtime_declined.store(false, std::memory_order_release);
+  g_ui_candidate_retry_frames.store(0, std::memory_order_release);
+  g_ui_candidate_consecutive_failures.store(0, std::memory_order_release);
+  g_ui_candidate_last_failed_resource.store(0, std::memory_order_release);
+  g_ui_candidate_last_result.store(0, std::memory_order_relaxed);
+  g_ui_candidate_injection_failures.store(0, std::memory_order_relaxed);
+  g_ui_candidate_recoveries.store(0, std::memory_order_relaxed);
+  g_ui_candidate_native_fallbacks.store(0, std::memory_order_relaxed);
+  g_ui_candidate_missing_command_buffer.store(0, std::memory_order_relaxed);
+  g_ui_candidate_full_batches.store(0, std::memory_order_relaxed);
+  g_ui_candidate_tags_injected.store(0, std::memory_order_relaxed);
+  internal::RequestAllUiResets();
+}
 
 inline void NotifyDynamicD3D12(bool d3d12) {
   g_dynamic_d3d12.store(d3d12, std::memory_order_relaxed);
@@ -518,6 +1397,8 @@ inline void TryInstall() {
     g_feature_function_hooked.store(true, std::memory_order_release);
   }
 
+  internal::TryInstallUiHooks(interposer);
+
   const bool compatible_init = g_init_compatible ? g_init_compatible(interposer)
       : GetProcAddress(interposer, "slGetFeatureFunction") != nullptr;
   const bool observe_init = g_on_init && compatible_init;
@@ -534,6 +1415,12 @@ inline void TryInstall() {
 
 inline void Uninstall() {
   internal::g_entry_shutting_down.store(true, std::memory_order_release);
+  if (internal::g_ui_hooks_installed.load(std::memory_order_acquire) &&
+      !internal::g_ui_hooks.empty()) {
+    hook::Uninstall(internal::g_ui_hooks);
+    internal::g_ui_hooks.clear();
+    internal::g_ui_hooks_installed.store(false, std::memory_order_release);
+  }
   if (g_init_hooked.load(std::memory_order_acquire)) hook::Uninstall(internal::kInitHook);
   if (g_feature_function_hooked.load(std::memory_order_acquire))
     hook::Uninstall(internal::kFeatureFunctionHook);
@@ -544,6 +1431,9 @@ inline void Uninstall() {
   hook::UninstallAddress(internal::g_set_options_entry);
   internal::g_real_get_state = nullptr;
   internal::g_real_set_options = nullptr;
+  internal::g_real_set_tag = nullptr;
+  internal::g_real_set_tag_for_frame = nullptr;
+  internal::g_real_set_constants = nullptr;
 }
 
 }  // namespace mfgunlock::framecount

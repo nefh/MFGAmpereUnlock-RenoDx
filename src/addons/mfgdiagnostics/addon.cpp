@@ -4,6 +4,7 @@
 #include <tlhelp32.h>
 #include <d3d12.h>
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <shared_mutex>
 #include <string>
@@ -44,8 +45,65 @@ struct TrackedResourceInfo {
   uint16_t samples = 0;
   uint32_t flags = 0;
 };
+struct TrackedResourceViewInfo {
+  uint64_t resource = 0;
+  uint32_t usage = 0;
+  uint32_t format = 0;
+};
+
+constexpr uint64_t kMaxCaptureDurationMs = 120000;
+constexpr size_t kMaxUiCandidates = 128;
+
+enum class UiCandidateUse : uint32_t {
+  kRenderTargetBind,
+  kClear,
+  kShaderResourcePush,
+};
+
+struct UiCandidateStats {
+  bool used = false;
+  bool seen_as_swapchain = false;
+  uint64_t resource = 0;
+  uint64_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t flags = 0;
+  uint32_t view_format = 0;
+  uint32_t view_usage = 0;
+  uint32_t rtv_bind_count = 0;
+  uint32_t clear_count = 0;
+  uint32_t transparent_clear_count = 0;
+  uint32_t srv_push_count = 0;
+  uint32_t post_hudless_rtv_bind_count = 0;
+  uint32_t post_hudless_clear_count = 0;
+  uint32_t post_hudless_transparent_clear_count = 0;
+  uint32_t post_hudless_srv_push_count = 0;
+  uint32_t hudless_tag_matches = 0;
+  uint64_t first_qpc = 0;
+  uint64_t last_qpc = 0;
+  uint64_t last_post_hudless_qpc = 0;
+  uint64_t first_after_hudless_ticks = 0;
+  uint64_t last_before_present_ticks = 0;
+  std::array<float, 4> last_clear{};
+};
+
 std::shared_mutex g_resources_mutex;
 std::unordered_map<uint64_t, TrackedResourceInfo> g_resources;
+std::unordered_map<uint64_t, TrackedResourceViewInfo> g_resource_views;
+std::mutex g_ui_candidates_mutex;
+std::array<UiCandidateStats, kMaxUiCandidates> g_ui_candidates{};
+std::atomic_bool g_ui_candidate_overflow{false};
+std::atomic_bool g_hudless_window_open{false};
+std::atomic<uint64_t> g_last_hudless_qpc{0};
+std::atomic<uint64_t> g_last_hudless_resource{0};
+std::atomic<uint32_t> g_hudless_tag_count{0};
+std::atomic<uint32_t> g_ui_color_alpha_tag_count{0};
+std::atomic<uint32_t> g_ui_alpha_tag_count{0};
+std::atomic<uint64_t> g_capture_started_ms{0};
+std::atomic<uint64_t> g_capture_stopped_ms{0};
+std::atomic_bool g_capture_auto_stopped{false};
+std::atomic<uint32_t> g_output_width{0};
+std::atomic<uint32_t> g_output_height{0};
 std::mutex g_device_mutex;
 IUnknown* g_native_d3d12_device = nullptr;
 
@@ -91,6 +149,181 @@ void Submit(Event event, uint64_t ticket, uint64_t begin, uint32_t viewport,
   event.frame = frame;
   event.result = static_cast<uint32_t>(result);
   g_capture.Submit(event);
+}
+
+struct ResolvedView {
+  uint64_t resource = 0;
+  uint32_t view_format = 0;
+  uint32_t view_usage = 0;
+  TrackedResourceInfo resource_info{};
+};
+
+bool ResolveView(reshade::api::resource_view view, ResolvedView& resolved) {
+  if (view.handle == 0) return false;
+  std::shared_lock lock(g_resources_mutex);
+  const auto view_it = g_resource_views.find(view.handle);
+  if (view_it == g_resource_views.end() || view_it->second.resource == 0) return false;
+  const auto resource_it = g_resources.find(view_it->second.resource);
+  if (resource_it == g_resources.end()) return false;
+  resolved.resource = view_it->second.resource;
+  resolved.view_format = view_it->second.format;
+  resolved.view_usage = view_it->second.usage;
+  resolved.resource_info = resource_it->second;
+  return true;
+}
+
+bool IsFullOutputResource(const TrackedResourceInfo& info) {
+  const uint32_t width = g_output_width.load(std::memory_order_relaxed);
+  const uint32_t height = g_output_height.load(std::memory_order_relaxed);
+  return width != 0 && height != 0 && info.width == width && info.height == height;
+}
+
+void ResetUiCandidateCapture() {
+  std::lock_guard lock(g_ui_candidates_mutex);
+  g_ui_candidates = {};
+  g_ui_candidate_overflow.store(false, std::memory_order_relaxed);
+  g_hudless_window_open.store(false, std::memory_order_relaxed);
+  g_last_hudless_qpc.store(0, std::memory_order_relaxed);
+  g_last_hudless_resource.store(0, std::memory_order_relaxed);
+  g_hudless_tag_count.store(0, std::memory_order_relaxed);
+  g_ui_color_alpha_tag_count.store(0, std::memory_order_relaxed);
+  g_ui_alpha_tag_count.store(0, std::memory_order_relaxed);
+}
+
+UiCandidateStats* FindUiCandidate(uint64_t resource) {
+  UiCandidateStats* empty = nullptr;
+  for (auto& candidate : g_ui_candidates) {
+    if (candidate.used && candidate.resource == resource) return &candidate;
+    if (!candidate.used && empty == nullptr) empty = &candidate;
+  }
+  return empty;
+}
+
+// Tag-call CPU ordering is not a GPU execution proof, so keep all full-output
+// RTV candidates and record post-HUD-less activity as an additional signal.
+void RecordUiCandidate(reshade::api::resource_view view, UiCandidateUse use,
+                       const float* clear_color = nullptr) {
+  const uint64_t ticket = Ticket();
+  if (ticket == 0) return;
+  ResolvedView resolved{};
+  if (!ResolveView(view, resolved) || !IsFullOutputResource(resolved.resource_info)) return;
+
+  const uint64_t now = Ticks();
+  const bool post_hudless = g_hudless_window_open.load(std::memory_order_acquire);
+  const uint64_t hudless = g_last_hudless_qpc.load(std::memory_order_relaxed);
+  std::lock_guard lock(g_ui_candidates_mutex);
+  if (g_capture.active.load(std::memory_order_acquire) != ticket) return;
+  UiCandidateStats* candidate = FindUiCandidate(resolved.resource);
+  if (candidate == nullptr) {
+    g_ui_candidate_overflow.store(true, std::memory_order_relaxed);
+    return;
+  }
+  if (!candidate->used) {
+    if (use == UiCandidateUse::kShaderResourcePush) return;
+    candidate->used = true;
+    candidate->resource = resolved.resource;
+    candidate->width = resolved.resource_info.width;
+    candidate->height = resolved.resource_info.height;
+    candidate->format = resolved.resource_info.format;
+    candidate->flags = resolved.resource_info.flags;
+    candidate->view_format = resolved.view_format;
+    candidate->view_usage = resolved.view_usage;
+    candidate->first_qpc = now;
+    if (resolved.resource == g_last_hudless_resource.load(std::memory_order_relaxed))
+      candidate->hudless_tag_matches = 1;
+  }
+  candidate->last_qpc = now;
+  if (post_hudless) {
+    candidate->last_post_hudless_qpc = now;
+    if (candidate->first_after_hudless_ticks == 0 && hudless != 0 && now >= hudless)
+      candidate->first_after_hudless_ticks = now - hudless;
+  }
+
+  switch (use) {
+    case UiCandidateUse::kRenderTargetBind:
+      ++candidate->rtv_bind_count;
+      if (post_hudless) ++candidate->post_hudless_rtv_bind_count;
+      break;
+    case UiCandidateUse::kClear:
+      ++candidate->clear_count;
+      if (post_hudless) ++candidate->post_hudless_clear_count;
+      if (clear_color != nullptr) {
+        for (size_t i = 0; i < candidate->last_clear.size(); ++i)
+          candidate->last_clear[i] = clear_color[i];
+        if (clear_color[0] == 0.0f && clear_color[1] == 0.0f &&
+            clear_color[2] == 0.0f && clear_color[3] == 0.0f) {
+          ++candidate->transparent_clear_count;
+          if (post_hudless) ++candidate->post_hudless_transparent_clear_count;
+        }
+      }
+      break;
+    case UiCandidateUse::kShaderResourcePush:
+      ++candidate->srv_push_count;
+      if (post_hudless) ++candidate->post_hudless_srv_push_count;
+      break;
+  }
+}
+
+// Legacy slSetTag has no frame token. The HUD-less-to-Present interval is a
+// bounded ordering heuristic only; exported raw tag events remain authoritative.
+void ObserveUiTagWindow(const sl::ResourceTag* tags, const Event* samples,
+                        uint32_t count, uint64_t ticket) {
+  if (tags == nullptr || ticket == 0 ||
+      g_capture.active.load(std::memory_order_acquire) != ticket) return;
+  for (uint32_t index = 0; index < count; ++index) {
+    const auto& tag = tags[index];
+    if (tag.resource == nullptr) continue;
+    if (tag.type == sl::kBufferTypeHUDLessColor) {
+      g_hudless_tag_count.fetch_add(1, std::memory_order_relaxed);
+      g_last_hudless_qpc.store(Ticks(), std::memory_order_relaxed);
+      g_hudless_window_open.store(true, std::memory_order_release);
+      if (samples != nullptr && samples[index].recognized &&
+          samples[index].values[4] != 0 && samples[index].values[4] != kUnknown) {
+        const uint64_t hudless_resource = samples[index].values[4];
+        g_last_hudless_resource.store(hudless_resource, std::memory_order_relaxed);
+        std::lock_guard lock(g_ui_candidates_mutex);
+        for (auto& candidate : g_ui_candidates) {
+          if (candidate.used && candidate.resource == hudless_resource) {
+            ++candidate.hudless_tag_matches;
+            break;
+          }
+        }
+      }
+    } else if (tag.type == sl::kBufferTypeUIColorAndAlpha) {
+      g_ui_color_alpha_tag_count.fetch_add(1, std::memory_order_relaxed);
+    } else if (tag.type == sl::kBufferTypeUIAlpha) {
+      g_ui_alpha_tag_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+}
+
+void FinalizeUiCandidateWindow(reshade::api::swapchain* swapchain, uint64_t present_qpc) {
+  if (!g_hudless_window_open.exchange(false, std::memory_order_acq_rel)) return;
+  const uint64_t hudless = g_last_hudless_qpc.load(std::memory_order_relaxed);
+  std::lock_guard lock(g_ui_candidates_mutex);
+  const uint32_t backbuffer_count = swapchain->get_back_buffer_count();
+  for (auto& candidate : g_ui_candidates) {
+    if (!candidate.used) continue;
+    if (candidate.last_post_hudless_qpc >= hudless && hudless != 0) {
+      candidate.last_before_present_ticks =
+          present_qpc >= candidate.last_post_hudless_qpc
+              ? present_qpc - candidate.last_post_hudless_qpc
+              : 0;
+    }
+    for (uint32_t index = 0; index < backbuffer_count; ++index) {
+      if (swapchain->get_back_buffer(index).handle == candidate.resource) {
+        candidate.seen_as_swapchain = true;
+        break;
+      }
+    }
+  }
+}
+
+size_t UiCandidateCount() {
+  std::lock_guard lock(g_ui_candidates_mutex);
+  size_t count = 0;
+  for (const auto& candidate : g_ui_candidates) count += candidate.used ? 1u : 0u;
+  return count;
 }
 
 sl::Result HookOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options) {
@@ -241,6 +474,7 @@ sl::Result ObserveTags(const sl::ViewportHandle& viewport, uint32_t frame,
     if (samples[i].recognized && tags[i].resource != nullptr)
       ResolveTrackedResource(*tags[i].resource, samples[i]);
   }
+  ObserveUiTagWindow(tags, samples.data(), size, ticket);
   const auto result = call();
   if (tags == nullptr || count > 64) {
     Event batch(Kind::tag_batch);
@@ -430,6 +664,15 @@ Json ObserveNvapi() {
   return result;
 }
 
+uint64_t UiCandidateScore(const UiCandidateStats& candidate) {
+  return static_cast<uint64_t>(candidate.post_hudless_srv_push_count) * 1000000 +
+         static_cast<uint64_t>(candidate.post_hudless_transparent_clear_count) * 100000 +
+         static_cast<uint64_t>(candidate.post_hudless_rtv_bind_count) * 1000 +
+         static_cast<uint64_t>(candidate.srv_push_count) * 100 +
+         static_cast<uint64_t>(candidate.transparent_clear_count) * 10 +
+         candidate.rtv_bind_count;
+}
+
 // Formatting, module inventory and file I/O run only on the explicitly requested
 // export worker after recording has stopped. Never enumerate modules in Present.
 DWORD WINAPI ExportWorker(LPVOID pinned_module) {
@@ -439,6 +682,8 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
       {"qpc_frequency", g_frequency}, {"dropped_events", g_capture.dropped.load()},
       {"capacity_exhausted", g_capture.full.load()},
       {"truncated_tag_batches", g_truncated_tag_batches.load()},
+      {"capture_started_ms", g_capture_started_ms.load(std::memory_order_relaxed)},
+      {"capture_stopped_ms", g_capture_stopped_ms.load(std::memory_order_relaxed)},
       {"interposer_export_mask", g_optional_exports.load()},
       {"options_downstream_owner", FunctionOwner(reinterpret_cast<const void*>(g_set_options.load()))},
       {"state_downstream_owner", FunctionOwner(reinterpret_cast<const void*>(g_get_state.load()))},
@@ -459,7 +704,10 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
                 "Legacy tags have no explicit frame ID. Format does not establish color encoding. "
                 "Other addon wrappers may be downstream. The optional one-shot Dynamic MFG probe "
                 "issues one extra slDLSSGGetState query on the game's GetState thread; no Streamline "
-                "setters, NVAPI setters or latency markers are issued. NVAPI is sampled only at export."}};
+                "setters, NVAPI setters or latency markers are issued. UI candidates are heuristic: "
+                "they are full-output render targets observed during capture, with post-HUD-less timing "
+                "and push-descriptor SRV evidence when available; descriptor-table SRV use is not "
+                "exhaustive. NVAPI is sampled only at export."}};
     root["events"] = Json::array();
     std::unordered_map<uint64_t, uint64_t> ids;
     auto identity = [&](uint64_t value) -> Json {
@@ -487,6 +735,51 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
           row["values"][0] = identity(event.values[0]);
         }
         root["events"].push_back(std::move(row));
+      }
+    }
+    root["ui_tag_summary"] = {
+        {"hudless", g_hudless_tag_count.load(std::memory_order_relaxed)},
+        {"ui_color_and_alpha", g_ui_color_alpha_tag_count.load(std::memory_order_relaxed)},
+        {"ui_alpha", g_ui_alpha_tag_count.load(std::memory_order_relaxed)},
+        {"candidate_overflow", g_ui_candidate_overflow.load(std::memory_order_relaxed)}};
+    root["ui_candidates"] = Json::array();
+    {
+      std::lock_guard lock(g_ui_candidates_mutex);
+      std::vector<UiCandidateStats> candidates;
+      candidates.reserve(kMaxUiCandidates);
+      for (const auto& candidate : g_ui_candidates) {
+        if (candidate.used) candidates.push_back(candidate);
+      }
+      std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+        if (left.seen_as_swapchain != right.seen_as_swapchain)
+          return !left.seen_as_swapchain;
+        if ((left.hudless_tag_matches != 0) != (right.hudless_tag_matches != 0))
+          return left.hudless_tag_matches == 0;
+        return UiCandidateScore(left) > UiCandidateScore(right);
+      });
+      for (const auto& candidate : candidates) {
+        const uint64_t score = UiCandidateScore(candidate);
+        root["ui_candidates"].push_back({
+            {"resource", identity(candidate.resource)},
+            {"width", candidate.width}, {"height", candidate.height},
+            {"format", candidate.format}, {"view_format", candidate.view_format},
+            {"view_usage", candidate.view_usage}, {"flags", candidate.flags},
+            {"swapchain", candidate.seen_as_swapchain},
+            {"hudless_tag_matches", candidate.hudless_tag_matches},
+            {"ui_candidate", !candidate.seen_as_swapchain &&
+                             candidate.hudless_tag_matches == 0},
+            {"rtv_binds", candidate.rtv_bind_count}, {"clears", candidate.clear_count},
+            {"transparent_clears", candidate.transparent_clear_count},
+            {"srv_push_binds", candidate.srv_push_count},
+            {"post_hudless_rtv_binds", candidate.post_hudless_rtv_bind_count},
+            {"post_hudless_clears", candidate.post_hudless_clear_count},
+            {"post_hudless_transparent_clears",
+             candidate.post_hudless_transparent_clear_count},
+            {"post_hudless_srv_push_binds", candidate.post_hudless_srv_push_count},
+            {"first_qpc", candidate.first_qpc}, {"last_qpc", candidate.last_qpc},
+            {"first_after_hudless_ticks", candidate.first_after_hudless_ticks},
+            {"last_before_present_ticks", candidate.last_before_present_ticks},
+            {"last_clear", candidate.last_clear}, {"rank_score", score}});
       }
     }
     root["loaded_candidates_at_export"] = Json::array();
@@ -581,24 +874,124 @@ void OnDestroyResource(reshade::api::device* device, reshade::api::resource reso
   g_resources.erase(resource.handle);
 }
 
+void OnInitResourceView(reshade::api::device* device, reshade::api::resource resource,
+                        reshade::api::resource_usage usage,
+                        const reshade::api::resource_view_desc& desc,
+                        reshade::api::resource_view view) {
+  if (device->get_api() != reshade::api::device_api::d3d12 || view.handle == 0) return;
+  std::unique_lock lock(g_resources_mutex);
+  g_resource_views[view.handle] = {
+      resource.handle,
+      static_cast<uint32_t>(usage),
+      static_cast<uint32_t>(desc.format),
+  };
+}
+
+void OnDestroyResourceView(reshade::api::device* device, reshade::api::resource_view view) {
+  if (device->get_api() != reshade::api::device_api::d3d12 || view.handle == 0) return;
+  std::unique_lock lock(g_resources_mutex);
+  g_resource_views.erase(view.handle);
+}
+
+void OnBindRenderTargetsAndDepthStencil(reshade::api::command_list*, uint32_t count,
+                                        const reshade::api::resource_view* rtvs,
+                                        reshade::api::resource_view) {
+  if (rtvs == nullptr) return;
+  for (uint32_t index = 0; index < count; ++index)
+    RecordUiCandidate(rtvs[index], UiCandidateUse::kRenderTargetBind);
+}
+
+bool OnClearRenderTargetView(reshade::api::command_list*, reshade::api::resource_view rtv,
+                             const float color[4], uint32_t,
+                             const reshade::api::rect*) {
+  RecordUiCandidate(rtv, UiCandidateUse::kClear, color);
+  return false;
+}
+
+void OnPushDescriptors(reshade::api::command_list*, reshade::api::shader_stage,
+                       reshade::api::pipeline_layout, uint32_t,
+                       const reshade::api::descriptor_table_update& update) {
+  if (update.count == 0 || update.descriptors == nullptr) return;
+  for (uint32_t index = 0; index < update.count; ++index) {
+    reshade::api::resource_view view{};
+    switch (update.type) {
+      case reshade::api::descriptor_type::sampler_with_resource_view:
+        view = static_cast<const reshade::api::sampler_with_resource_view*>(
+            update.descriptors)[index].view;
+        break;
+      case reshade::api::descriptor_type::texture_shader_resource_view:
+        view = static_cast<const reshade::api::resource_view*>(update.descriptors)[index];
+        break;
+      default:
+        continue;
+    }
+    RecordUiCandidate(view, UiCandidateUse::kShaderResourcePush);
+  }
+}
+
 void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain,
-                const reshade::api::rect*, const reshade::api::rect*, uint32_t,
-                const reshade::api::rect*) {
+               const reshade::api::rect*, const reshade::api::rect*, uint32_t,
+               const reshade::api::rect*) {
+  const uint64_t present_qpc = Ticks();
+  const uint32_t backbuffer_count = swapchain->get_back_buffer_count();
+  if (backbuffer_count != 0) {
+    const auto desc = swapchain->get_device()->get_resource_desc(swapchain->get_back_buffer(0));
+    g_output_width.store(static_cast<uint32_t>(desc.texture.width), std::memory_order_relaxed);
+    g_output_height.store(static_cast<uint32_t>(desc.texture.height),
+                          std::memory_order_relaxed);
+  }
+
   const uint64_t ticket = Ticket();
+  if (ticket != 0) FinalizeUiCandidateWindow(swapchain, present_qpc);
+  else g_hudless_window_open.store(false, std::memory_order_release);
   if (ticket == 0) return;
-  const uint64_t begin = Ticks();
+
   Event event(Kind::output);
   event.recognized = true;
   event.values[0] = reinterpret_cast<uintptr_t>(swapchain);
   event.values[1] = static_cast<uint32_t>(swapchain->get_color_space());
-  event.values[5] = swapchain->get_back_buffer_count();
-  if (event.values[5] != 0) {
+  event.values[5] = backbuffer_count;
+  if (backbuffer_count != 0) {
     const auto desc = swapchain->get_device()->get_resource_desc(swapchain->get_back_buffer(0));
     event.values[2] = static_cast<uint32_t>(desc.texture.format);
     event.values[3] = desc.texture.width;
     event.values[4] = desc.texture.height;
   }
-  Submit(event, ticket, begin, UINT32_MAX, UINT32_MAX, sl::Result::eOk);
+  Submit(event, ticket, present_qpc, UINT32_MAX, UINT32_MAX, sl::Result::eOk);
+}
+
+void BeginCapture() {
+  g_recorded_label = g_label;
+  g_truncated_tag_batches.store(0, std::memory_order_relaxed);
+  ResetUiCandidateCapture();
+  const uint64_t now = GetTickCount64();
+  g_capture_started_ms.store(now, std::memory_order_relaxed);
+  g_capture_stopped_ms.store(0, std::memory_order_relaxed);
+  g_capture_auto_stopped.store(false, std::memory_order_relaxed);
+  g_capture.Start(now, kMaxCaptureDurationMs);
+}
+
+void StopCapture() {
+  g_capture.Stop();
+  g_hudless_window_open.store(false, std::memory_order_release);
+  g_capture_auto_stopped.store(false, std::memory_order_relaxed);
+  g_capture_stopped_ms.store(GetTickCount64(), std::memory_order_relaxed);
+}
+
+void LaunchExport() {
+  HMODULE pinned = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                          reinterpret_cast<LPCWSTR>(&ExportWorker), &pinned)) {
+    return;
+  }
+  g_saving.store(true, std::memory_order_release);
+  HANDLE thread = CreateThread(nullptr, 0, ExportWorker, pinned, 0, nullptr);
+  if (thread != nullptr) {
+    CloseHandle(thread);
+  } else {
+    g_saving.store(false, std::memory_order_release);
+    FreeLibrary(pinned);
+  }
 }
 
 void OnOverlay(reshade::api::effect_runtime*) {
@@ -639,35 +1032,51 @@ void OnOverlay(reshade::api::effect_runtime*) {
     ImGui::TextDisabled("Armed: waiting for the game's next slDLSSGGetState call.");
 
   const bool saving = g_saving.load(std::memory_order_acquire);
-  ImGui::BeginDisabled(saving || !g_installed.load());
-  ImGui::Combo("Capture label (manual)", &g_label, kLabels, static_cast<int>(std::size(kLabels)));
-  if (ImGui::Button("Capture 10 seconds")) {
-    g_recorded_label = g_label;
-    g_truncated_tag_batches.store(0);
-    g_capture.Start(GetTickCount64(), 10000);
-  }
-  ImGui::SameLine();
-  if (ImGui::Button("Stop")) g_capture.Stop();
-  ImGui::EndDisabled();
   const bool active = Ticket() != 0;
-  ImGui::Text("Capture: %s; dropped: %u; buffer full: %s", active ? "recording" : "stopped",
-               g_capture.dropped.load(), g_capture.full.load() ? "yes" : "no");
-  ImGui::BeginDisabled(saving || active);
-  if (ImGui::Button("Export stopped capture")) {
-    HMODULE pinned = nullptr;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-        reinterpret_cast<LPCWSTR>(&ExportWorker), &pinned)) {
-      g_saving.store(true, std::memory_order_release);
-      HANDLE thread = CreateThread(nullptr, 0, ExportWorker, pinned, 0, nullptr);
-      if (thread != nullptr) CloseHandle(thread);
-      else { g_saving.store(false); FreeLibrary(pinned); }
-    }
+  const uint64_t now_ms = GetTickCount64();
+  const uint64_t started_ms = g_capture_started_ms.load(std::memory_order_relaxed);
+  if (!active && started_ms != 0 &&
+      g_capture_stopped_ms.load(std::memory_order_relaxed) == 0) {
+    g_capture_stopped_ms.store(now_ms, std::memory_order_relaxed);
+    g_capture_auto_stopped.store(true, std::memory_order_relaxed);
   }
+  ImGui::Combo("Capture label (manual)", &g_label, kLabels, static_cast<int>(std::size(kLabels)));
+  ImGui::BeginDisabled(saving || active || !g_installed.load());
+  if (ImGui::Button("Start capture")) BeginCapture();
+  ImGui::EndDisabled();
+  ImGui::SameLine();
+  ImGui::BeginDisabled(saving || !active);
+  if (ImGui::Button("Stop & export")) {
+    StopCapture();
+    LaunchExport();
+  }
+  ImGui::EndDisabled();
+
+  const uint64_t stopped_ms = g_capture_stopped_ms.load(std::memory_order_relaxed);
+  const uint64_t end_ms = active || stopped_ms == 0 ? now_ms : stopped_ms;
+  const double elapsed_s = started_ms == 0 || end_ms < started_ms
+      ? 0.0 : static_cast<double>(end_ms - started_ms) / 1000.0;
+  const char* capture_state = active ? "recording"
+      : g_capture_auto_stopped.load(std::memory_order_relaxed) ? "auto-stopped" : "stopped";
+  ImGui::Text("Capture: %s, %.1f s; dropped: %u; buffer full: %s",
+              capture_state, elapsed_s, g_capture.dropped.load(),
+              g_capture.full.load() ? "yes" : "no");
+  ImGui::Text("UI observer: HUD-less tags=%u, UI Color+Alpha=%u, UI Alpha=%u, candidates=%zu%s",
+              g_hudless_tag_count.load(std::memory_order_relaxed),
+              g_ui_color_alpha_tag_count.load(std::memory_order_relaxed),
+              g_ui_alpha_tag_count.load(std::memory_order_relaxed), UiCandidateCount(),
+              g_ui_candidate_overflow.load(std::memory_order_relaxed) ? " (overflow)" : "");
+  ImGui::TextDisabled(
+      "Manual stop; automatic stop occurs at 120 s or when the bounded event buffer fills.");
+
+  ImGui::BeginDisabled(saving || active || started_ms == 0);
+  if (ImGui::Button("Export stopped capture")) LaunchExport();
   ImGui::EndDisabled();
   std::unique_lock lock(g_output_mutex, std::try_to_lock);
   if (lock.owns_lock()) ImGui::TextWrapped("%s", g_output_message.c_str());
-  ImGui::TextWrapped("Close the overlay during capture. For options data, switch the native FG setting "
-                    "while recording. Restart to disable hooks; do not hot-unload either addon.");
+  ImGui::TextWrapped("Close the overlay during capture. For UI discovery, switch native FG off/on and "
+                    "leave the game running for a few seconds after HUD-less appears. Restart to disable "
+                    "hooks; do not hot-unload either addon.");
 }
 } // namespace
 
@@ -692,6 +1101,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
+      reshade::register_event<reshade::addon_event::init_resource_view>(OnInitResourceView);
+      reshade::register_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+          OnBindRenderTargetsAndDepthStencil);
+      reshade::register_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+      reshade::register_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
     }
     reshade::register_overlay("MFG Diagnostics", OnOverlay);
@@ -700,6 +1115,12 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     reshade::unregister_overlay("MFG Diagnostics", OnOverlay);
     if (g_enabled) {
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::push_descriptors>(OnPushDescriptors);
+      reshade::unregister_event<reshade::addon_event::clear_render_target_view>(OnClearRenderTargetView);
+      reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+          OnBindRenderTargetsAndDepthStencil);
+      reshade::unregister_event<reshade::addon_event::destroy_resource_view>(OnDestroyResourceView);
+      reshade::unregister_event<reshade::addon_event::init_resource_view>(OnInitResourceView);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);

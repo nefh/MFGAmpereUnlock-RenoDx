@@ -32,6 +32,19 @@ std::string Fixture() {
 }  // namespace
 
 int main() {
+  using mfgunlock::validatedwarp::ConfiguredMode;
+  using mfgunlock::validatedwarp::Mode;
+  for (int value : {-1, 0, 1, 2, 3, 255}) {
+    Check(ConfiguredMode(false, value) == Mode::kValidatedWarp, "hidden debug always uses production Warp");
+    const auto expected = value >= 0 && value <= 2 ? static_cast<Mode>(value) : Mode::kValidatedWarp;
+    Check(ConfiguredMode(true, value) == expected, "visible debug preserves valid modes only");
+  }
+  auto configured = ConfiguredMode(true, 0);
+  const auto applied = configured;
+  configured = ConfiguredMode(false, static_cast<int>(configured));
+  Check(configured == Mode::kValidatedWarp && applied == Mode::kRedirectControl,
+        "disabling debug resets configured mode without pretending to hot-swap applied Warp");
+
   std::string why;
   std::string ptx = Fixture();
   Check(warp::RewriteValidatedWarpBlend(ptx, why), "validated warp rewrite");

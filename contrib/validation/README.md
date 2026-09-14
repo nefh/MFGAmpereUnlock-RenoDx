@@ -28,3 +28,16 @@ build.validation/inspect_provider /path/to/nvngx_dlssg.dll Turing
 The temporal cases run against both the inspector helper and the runtime
 `midpoint.hpp`. The frame-count test exercises the real `framecount.hpp` using
 SDK doubles. Neither test installs machine-code hooks.
+
+The Warp test also covers release/debug mode normalization. `fg_preset_test`
+checks Default/A/B parsing, scoped model-setup overrides and native passthrough
+using hook doubles. On non-Windows builds it can additionally inspect a local
+copy of the supported provider and exercise the installation guards:
+
+```sh
+build.validation/fg_preset_test /path/to/nvngx_dlssg.dll
+```
+
+That optional check verifies the actual machine-code fingerprints and mocked
+lifecycle only. It neither loads NVIDIA code nor validates Detours, the Windows
+ABI, model B execution, or frame-generation quality. No NVIDIA DLL is included.

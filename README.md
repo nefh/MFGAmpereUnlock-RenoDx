@@ -6,7 +6,7 @@ Ampere, and Turing** GPUs through a ReShade/RenoDX addon.
 <p align="center">
   <a href="docs/media/ampere-screenshot.jpg">
     <img src="docs/media/ampere-screenshot.jpg"
-         alt="MFGAmpereUnlock running on an RTX 3090"
+         alt="MFGAmpereUnlock in Cyberpunk 2077"
          width="900">
   </a>
 </p>
@@ -42,20 +42,34 @@ binaries are redistributed.**
 
 ### Dynamic MFG and Validated Warp Blend
 
-Both features work on **Ampere (RTX 30)**. They are not supported on
-**Turing (RTX 20)** because Turing targets `sm_75`, while this path requires
-`sm_80` or newer.
+- Both features are for **Ampere (RTX 30)**; Turing keeps the fixed MFG path.
+- **Dynamic MFG** lets NVIDIA vary the multiplier toward the selected output FPS.
+  Use D3D12, Streamline **2.14.1**, DLSS-G **310.9.1** and driver **595.41+**.
+  Enable it in MFG Unlock and toggle Frame Generation off/on if needed.
+- **Validated Warp Blend** is an Ampere quality patch for DLSS-G **310.9.1**.
+  Enable it and restart the game.
+- Advanced/debug exposes Warp diagnostic modes; normal use stays on
+  **Validated Warp sm_86**.
 
-**Dynamic MFG** lets NVIDIA adjust the MFG multiplier dynamically to reach the
-selected output FPS. It makes sense to try in D3D12 games that work with current
-Streamline. Use Streamline **2.14.1**, DLSS-G **310.9.1**, and NVIDIA driver
-**595.41 or newer**. It works, for example, in **Cyberpunk 2077**.
+### Frame Generation Presets A/B
 
-Enable **NVIDIA Dynamic MFG** in MFG Unlock. If the game loads another Streamline
-version, select **Prefer local runtime**.
+- Choose **Application / driver default**, **Preset A**, or **Preset B**.
+- A/B overrides are process-local and do not change NVIDIA App or driver profiles.
+- The selector is limited to the supported **DLSS-G 310.9.1** provider build;
+  unsupported builds are left unchanged.
+- Preset selection is independent from multiplier, Dynamic MFG, Warp, Temporal
+  Fix and UI Composition. Restart the game if a preset change is not picked up.
 
-**Validated Warp Blend** is an Ampere quality patch for DLSS-G **310.9.1**.
-Enable it and restart the game.
+### UI Recomposition
+
+- **Automatic UI Composition** is enabled by default on SDR and keeps the native
+  HUD-less path when no usable UI buffer is available.
+- **Inject detected UI Color+Alpha (experimental)** is available under
+  advanced/debug for D3D12 games that do not provide a Streamline UI tag.
+- Dialog/menu UI-target changes are reacquired automatically and transient tag
+  failures are retried instead of disabling UIR for the session.
+- If UI composition looks wrong, disable the experimental injection; Automatic
+  UI Composition can stay enabled.
 
 ## Tested Games
 
@@ -70,7 +84,7 @@ Enable it and restart the game.
 | Resident Evil Requiem | | | Working | |
 | Assassin's Creed IV: Black Flag | | | Working | |
 | PRAGMATA | | | Working | |
-| Cyberpunk 2077 | Working | | Working | Dynamic MFG + Validated Warp Blend validated on Ampere with Streamline 2.14.1 / DLSS-G 310.9.1 |
+| Cyberpunk 2077 | Working | | Working | Dynamic MFG + Validated Warp Blend + Preset B; Streamline 2.14.1 / DLSS-G 310.9.1 |
 | Portal with RTX | Partial | | | Native DLSS-G/MFG loads on Ampere; RTX Remix frame pacing remains unresolved |
 | Alan Wake 2 | | | Working | |
 | Dragon's Dogma 2 | | | Working | |
@@ -150,13 +164,23 @@ Settings use `[RenoDX.MFGUnlock]` in `ReShade.ini`.
 | `Architecture` | `Auto` | `Auto`, `Ada`, `Ampere`, or `Turing` |
 | `MaxCount` | `4` | Reported `DLSSG.MultiFrameCountMax` |
 | `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` forces that exact multiplier |
-| `DynamicMFG` | `0` | Enables native Dynamic MFG on the validated Ampere setup; takes priority over `ForceMultiplier` |
+| `DynamicMFG` | `0` | Enables native Dynamic MFG on Ampere; takes priority over `ForceMultiplier` |
 | `DynamicTargetFPS` | `0` | Dynamic output target; `0` follows display refresh |
 | `ValidatedWarpBlend` | `0` | Ampere quality patch for DLSS-G 310.9.1; restart required |
+| `ShowDebugOptions` | `0` | Shows diagnostic and advanced compatibility controls |
+| `WarpDiagnosticMode` | `2` | `0` relocation control, `1` baseline rebuild, `2` normal Warp; modes 0/1 require `ShowDebugOptions=1` |
+| `FrameGenerationPreset` | `0` | `0` application/driver default, `1` A, `2` B; supported 310.9.1 build only |
+| `UIComposition` | `1` | Automatic guarded UI recomposition on SDR |
+| `UICandidateInjection` | `0` | Experimental D3D12 UI Color+Alpha injection; requires `ShowDebugOptions=1` |
 | `TemporalFix` | `1` | Corrects generated-frame temporal positions |
 | `ForceFlipMeteringOff` | `0` | Legacy software pacing fallback |
 | `RaiseFrameCeiling` | `0` | Raises an old Streamline plugin's compiled limit to 6x |
 | `RuntimeSelectionMode` | `0` | `0` keeps the game policy, `1` prefers local Streamline plugins, `2` forces NVIDIA OTA flags |
+
+Hidden diagnostic Warp modes in old configurations are migrated to mode `2`
+before provider preparation. Hiding advanced options does not reset existing
+compatibility values such as `TemporalFix`, `MaxCount`, `ForceFlipMeteringOff`,
+`RaiseFrameCeiling`, `Architecture` or `RuntimeSelectionMode`.
 
 ## Troubleshooting
 
@@ -178,6 +202,12 @@ Settings use `[RenoDX.MFGUnlock]` in `ReShade.ini`.
 - After enabling Dynamic MFG, toggle Frame Generation off/on in the game.
 - Validated Warp Blend requires a restart. Legacy Streamline 1.x games should
   keep their existing fixed MFG path.
+
+### UI Recomposition problems
+
+- Dialog/menu changes should be reacquired automatically after a short handover.
+- If UIR does not return or UI artifacts appear, disable **Inject detected UI
+  Color+Alpha (experimental)**. Automatic UI Composition can remain enabled.
 
 ### 3x/4x freezes or pacing becomes unusable
 
@@ -208,18 +238,21 @@ selected architecture:
    Frame Generation as available for the selected GPU.
 6. At higher MFG multipliers, the temporal fix preserves a distinct intended
    temporal position for each generated frame.
-7. On the validated Ampere D3D12 stack, Dynamic MFG requests NVIDIA's native
-   `DLSSGMode::eDynamic`; NVIDIA selects the active multiplier and owns pacing.
-8. On the exact validated 310.9.1 provider, Validated Warp Blend ports the
-   MFGAdaUnlock quality path to Ampere by validating later-stage reprojection
-   candidates before blending accepted warped color.
+7. On Ampere D3D12 with the supported Streamline/DLSS-G stack, Dynamic MFG
+   requests NVIDIA's native `DLSSGMode::eDynamic`; NVIDIA selects the multiplier
+   and owns pacing.
+8. For DLSS-G 310.9.1, Validated Warp Blend ports the MFGAdaUnlock quality path
+   to Ampere and checks later-stage reprojection candidates before blending.
+9. Automatic UI Composition keeps native HUD-less fallback when a usable UI
+   partner is unavailable; advanced injection can supply a detected D3D12 UI
+   Color+Alpha target and recover across short UI-target handovers.
 
 Unknown provider layouts are left untouched.
 
 ## Building
 
 The addon is built as part of a [RenoDX](https://github.com/clshortfuse/renodx)
-tree. The validated Windows build pins NVIDIA/NVAPI commit `87dca62`.
+tree. The Windows build pins NVIDIA/NVAPI commit `87dca62`.
 
 ```powershell
 git clone --recursive https://github.com/clshortfuse/renodx
@@ -258,7 +291,8 @@ Prebuilt binaries are attached to [Releases](../../releases).
   [MFGAdaUnlock-RenoDx](https://github.com/mavismmg/MFGAdaUnlock-RenoDx) fork,
   extending the Ada implementation with broader game and DLSS-G provider
   compatibility, lifecycle and pacing fixes, Vulkan support, runtime diagnostics,
-  Dynamic MFG, and the Validated Warp Blend path later ported here to Ampere.
+  Dynamic MFG, UI recomposition and the Validated Warp Blend path. Selected paths
+  were later adapted here for Ampere.
 - Tony Joaca, author of DLSSG-Transfusion, publicly identified
   `Kernel_BlendCandidatesFused` as the useful intervention point behind the
   `qualityValidWarp` option. That public research informed MFGAdaUnlock's

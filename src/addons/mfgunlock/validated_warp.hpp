@@ -19,11 +19,39 @@
 #include <cstring>
 #include <limits>
 #include <sstream>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "./fatbin.hpp"
+
 namespace mfgunlock::validatedwarp {
+
+enum class Mode : int {
+  kRedirectControl = 0,
+  kBlackwellBaseline = 1,
+  kValidatedWarp = 2,
+};
+
+constexpr Mode ConfiguredMode(bool debug_options, int value) {
+  return debug_options && value >= static_cast<int>(Mode::kRedirectControl) &&
+                 value <= static_cast<int>(Mode::kValidatedWarp)
+             ? static_cast<Mode>(value) : Mode::kValidatedWarp;
+}
+
+inline const char* ModeName(Mode mode) {
+  switch (mode) {
+    case Mode::kRedirectControl:
+      return "redirect control";
+    case Mode::kBlackwellBaseline:
+      return "Blackwell baseline sm_86";
+    case Mode::kValidatedWarp:
+      return "Validated Warp sm_86";
+    default:
+      return "unknown";
+  }
+}
 
 struct DescriptorPatch {
   uint64_t* slot = nullptr;
@@ -47,6 +75,7 @@ constexpr uint32_t kFatbinMagic = 0xBA55ED50u;
 constexpr size_t kOuterHeader = 16;
 constexpr uint32_t kPtxKind = 1;
 constexpr uint32_t kAmpereArch = 86;
+constexpr uint32_t kAdaArch = 89;
 constexpr uint32_t kBlackwellArch = 120;
 constexpr uint64_t kUncompressedFlags = 0x41;
 constexpr size_t kMaxFatbinSize = 4u * 1024u * 1024u;
@@ -68,12 +97,13 @@ struct PtxProfile {
   size_t declared_raw_size;
   size_t normalized_size;
   uint64_t raw_fnv1a64;
+  size_t descriptor_references;
   const char* entry_name;
   const char* parameter_signature;
 };
 
 constexpr PtxProfile kPtxProfile = {
-    kBlackwellArch, 39639u, 39638u, 0x7a6f5f41105c6d85ull,
+    kBlackwellArch, 39639u, 39638u, 0x7a6f5f41105c6d85ull, 8u,
     "Kernel_BlendCandidatesFused",
     ".param .align 8 .b8 Kernel_BlendCandidatesFused_param_0[240]"};
 
@@ -329,16 +359,36 @@ inline bool FindPtxEntry(const uint8_t* fatbin, size_t fatbin_size,
   return false;
 }
 
-inline bool BuildRedirectedFatbin(const uint8_t* fatbin, size_t fatbin_size,
-                                  const PtxProfile& profile,
-                                  std::vector<uint8_t>& rebuilt,
-                                  std::string& why) {
+inline bool ValidatePristineLayout(const uint8_t* fatbin, size_t fatbin_size,
+                                   size_t target_entry, std::string& why) {
+  std::vector<fatbin::Entry> entries;
+  size_t end = 0;
+  if (!fatbin::Parse(std::span<const unsigned char>(fatbin, fatbin_size), entries, end) ||
+      end != fatbin_size || entries.size() != 3 ||
+      entries[0].offset != target_entry || entries[0].kind != kPtxKind ||
+      entries[0].architecture != kBlackwellArch ||
+      entries[1].kind != kPtxKind || entries[1].architecture != kAdaArch ||
+      entries[2].kind != 2 || entries[2].architecture != kAdaArch) {
+    why = "provider fatbin was already retargeted or selectable image layout changed";
+    return false;
+  }
+  return true;
+}
+
+inline bool BuildRetargetedFatbin(const uint8_t* fatbin, size_t fatbin_size,
+                                   const PtxProfile& profile, bool apply_warp,
+                                   std::vector<uint8_t>& rebuilt,
+                                   std::string& why) {
   size_t entry = 0;
   std::vector<uint8_t> source;
   if (!FindPtxEntry(fatbin, fatbin_size, profile, entry, source, why)) return false;
+  // Build from the pristine 310.9.1 image set before provider retargeting, so
+  // the replacement has one selectable sm_86 program instead of inheriting a
+  // second retargeted sm_86 PTX image.
+  if (!ValidatePristineLayout(fatbin, fatbin_size, entry, why)) return false;
   std::string ptx(reinterpret_cast<const char*>(source.data()), source.size());
   if (!ReplaceOnce(ptx, ".target sm_120", ".target sm_86", why)) return false;
-  if (!RewriteValidatedWarpBlend(ptx, why)) return false;
+  if (apply_warp && !RewriteValidatedWarpBlend(ptx, why)) return false;
 
   const uint32_t header = ReadU32(fatbin + entry + 4);
   const uint64_t original_payload64 = ReadU64(fatbin + entry + 8);
@@ -381,6 +431,61 @@ struct LocatedFatbin {
   const uint8_t* address = nullptr;
   size_t size = 0;
 };
+
+inline bool BuildRedirectControlFatbin(const LocatedFatbin& located,
+                                       std::vector<uint8_t>& rebuilt,
+                                       std::string& why) {
+  if (located.address == nullptr || located.size < kOuterHeader ||
+      ReadU32(located.address) != kFatbinMagic ||
+      ReadU16(located.address + 6) != kOuterHeader) {
+    why = "prepared control fatbin header is invalid";
+    return false;
+  }
+  const uint64_t declared = ReadU64(located.address + 8);
+  if (declared == 0 || declared > located.size - kOuterHeader) {
+    why = "prepared control fatbin size is invalid";
+    return false;
+  }
+  const size_t size = static_cast<size_t>(declared) + kOuterHeader;
+  std::vector<fatbin::Entry> entries;
+  size_t end = 0;
+  if (!fatbin::Parse(std::span<const unsigned char>(located.address, size), entries, end) ||
+      end != size || entries.size() != 2 ||
+      entries[0].kind != kPtxKind || entries[0].architecture != kBlackwellArch ||
+      entries[1].kind != kPtxKind || entries[1].architecture != kAmpereArch) {
+    why = "prepared control fatbin does not match the normal Ampere layout";
+    return false;
+  }
+  // Match the provider's physical backing span as well as its visible header.
+  // The normal Ampere path hides the trailing sm_89 cubin by shortening the
+  // outer header; keeping those bytes makes pointer relocation the only change.
+  rebuilt.assign(located.address, located.address + located.size);
+  return true;
+}
+
+inline std::string DescribeFatbin(const std::vector<uint8_t>& bytes) {
+  if (bytes.size() < kOuterHeader || ReadU32(bytes.data()) != kFatbinMagic)
+    return "entries=invalid";
+  const uint64_t declared = ReadU64(bytes.data() + 8);
+  if (declared > bytes.size() - kOuterHeader) return "entries=invalid";
+  const size_t visible = static_cast<size_t>(declared) + kOuterHeader;
+  std::vector<fatbin::Entry> entries;
+  size_t end = 0;
+  if (!fatbin::Parse(std::span<const unsigned char>(bytes.data(), visible), entries, end) ||
+      end != visible) {
+    return "entries=invalid";
+  }
+  std::ostringstream stream;
+  stream << "visible=" << visible << '/' << bytes.size() << "; entries=[";
+  for (size_t index = 0; index < entries.size(); ++index) {
+    if (index != 0) stream << ',';
+    stream << (entries[index].kind == kPtxKind ? "ptx" : "cubin")
+           << "/sm_" << entries[index].architecture
+           << '/' << entries[index].payload_bytes;
+  }
+  stream << ']';
+  return stream.str();
+}
 
 inline bool LocateUniqueFatbin(HMODULE module, const PtxProfile& profile,
                                LocatedFatbin& located, std::string& why) {
@@ -432,28 +537,23 @@ inline bool LocateUniqueFatbin(HMODULE module, const PtxProfile& profile,
   return true;
 }
 
-inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile,
-                           Redirect& redirect, std::string& detail) {
+using PrepareProviderCallback = bool (*)(HMODULE);
+
+inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile, Mode mode,
+                           PrepareProviderCallback prepare_provider, Redirect& redirect,
+                           std::string& detail) {
   LocatedFatbin located;
   if (!LocateUniqueFatbin(module, profile, located, detail)) return false;
-  std::vector<uint8_t> rebuilt;
-  if (!BuildRedirectedFatbin(located.address, located.size, profile,
-                             rebuilt, detail)) {
-    return false;
-  }
-  void* allocation = VirtualAlloc(nullptr, rebuilt.size(),
-                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-  if (allocation == nullptr) {
-    detail = "replacement fatbin allocation failed";
-    return false;
-  }
-  std::memcpy(allocation, rebuilt.data(), rebuilt.size());
 
   auto* base = reinterpret_cast<uint8_t*>(module);
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
   const size_t image_size = nt->OptionalHeader.SizeOfImage;
   const uint64_t expected = reinterpret_cast<uint64_t>(located.address);
+  const uint64_t source_hash = Fnv1a64(located.address, located.size);
+  const size_t source_rva = static_cast<size_t>(located.address - base);
+
+  std::vector<uint64_t*> slots;
   const auto* section = IMAGE_FIRST_SECTION(nt);
   for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
     if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
@@ -468,35 +568,109 @@ inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile,
          offset += alignof(uint64_t)) {
       uint64_t value = 0;
       std::memcpy(&value, bytes + offset, sizeof(value));
-      if (value != expected) continue;
-      auto* slot = reinterpret_cast<uint64_t*>(bytes + offset);
-      DWORD old_protection = 0;
-      if (!VirtualProtect(slot, sizeof(uint64_t), PAGE_READWRITE, &old_protection)) continue;
-      redirect.descriptors.push_back({slot, *slot});
-      *slot = reinterpret_cast<uint64_t>(allocation);
-      DWORD ignored = 0;
-      VirtualProtect(slot, sizeof(uint64_t), old_protection, &ignored);
+      if (value == expected) slots.push_back(reinterpret_cast<uint64_t*>(bytes + offset));
     }
   }
-  if (redirect.descriptors.empty() || redirect.descriptors.size() > 32) {
-    for (const auto& patch : redirect.descriptors) {
+  if (slots.size() != profile.descriptor_references) {
+    std::ostringstream stream;
+    stream << "found " << slots.size() << " descriptor reference(s), expected "
+           << profile.descriptor_references;
+    detail = stream.str();
+    return false;
+  }
+
+  std::vector<uint8_t> rebuilt;
+  if (mode == Mode::kBlackwellBaseline || mode == Mode::kValidatedWarp) {
+    const bool apply_warp = mode == Mode::kValidatedWarp;
+    if (!BuildRetargetedFatbin(located.address, located.size, profile, apply_warp,
+                               rebuilt, detail)) {
+      return false;
+    }
+  } else if (mode != Mode::kRedirectControl) {
+    detail = "unknown warp diagnostic mode";
+    return false;
+  }
+
+  // Provider preparation must complete before replacement pointers are
+  // published. Redirect-control intentionally copies the resulting normal
+  // Ampere fatbin byte-for-byte, isolating the redirect/allocation mechanism.
+  if (prepare_provider != nullptr && !prepare_provider(module)) {
+    detail = "provider preparation failed before warp redirect";
+    return false;
+  }
+  if (mode == Mode::kRedirectControl &&
+      !BuildRedirectControlFatbin(located, rebuilt, detail)) {
+    return false;
+  }
+
+  void* allocation = VirtualAlloc(nullptr, rebuilt.size(),
+                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (allocation == nullptr) {
+    detail = "replacement fatbin allocation failed";
+    return false;
+  }
+  std::memcpy(allocation, rebuilt.data(), rebuilt.size());
+
+  const uint64_t replacement = reinterpret_cast<uint64_t>(allocation);
+  bool committed = true;
+  for (uint64_t* slot : slots) {
+    if (*slot != expected) {
+      committed = false;
+      break;
+    }
+    DWORD old_protection = 0;
+    if (!VirtualProtect(slot, sizeof(uint64_t), PAGE_READWRITE, &old_protection)) {
+      committed = false;
+      break;
+    }
+    redirect.descriptors.push_back({slot, *slot});
+    *slot = replacement;
+    DWORD ignored = 0;
+    if (!VirtualProtect(slot, sizeof(uint64_t), old_protection, &ignored) ||
+        *slot != replacement) {
+      committed = false;
+      break;
+    }
+  }
+  if (!committed || redirect.descriptors.size() != slots.size()) {
+    bool rolled_back = true;
+    for (auto patch = redirect.descriptors.rbegin();
+         patch != redirect.descriptors.rend(); ++patch) {
       DWORD old_protection = 0;
-      if (VirtualProtect(patch.slot, sizeof(uint64_t), PAGE_READWRITE, &old_protection)) {
-        *patch.slot = patch.original;
-        DWORD ignored = 0;
-        VirtualProtect(patch.slot, sizeof(uint64_t), old_protection, &ignored);
+      if (!VirtualProtect(patch->slot, sizeof(uint64_t), PAGE_READWRITE, &old_protection)) {
+        rolled_back = false;
+        continue;
+      }
+      *patch->slot = patch->original;
+      DWORD ignored = 0;
+      if (!VirtualProtect(patch->slot, sizeof(uint64_t), old_protection, &ignored) ||
+          *patch->slot != patch->original) {
+        rolled_back = false;
       }
     }
     redirect.descriptors.clear();
-    VirtualFree(allocation, 0, MEM_RELEASE);
-    detail = "descriptor reference count is outside the safe 1..32 range";
+    if (rolled_back) VirtualFree(allocation, 0, MEM_RELEASE);
+    detail = rolled_back
+        ? "descriptor redirect transaction failed"
+        : "descriptor redirect transaction failed; replacement retained after incomplete rollback";
     return false;
   }
+
   redirect.allocation = allocation;
   std::ostringstream stream;
-  stream << "redirected " << redirect.descriptors.size()
-         << " exact descriptor reference(s) from a " << located.size
-         << "-byte provider fatbin to a " << rebuilt.size() << "-byte PTX rebuild";
+  stream << "mode=" << ModeName(mode)
+         << "; source-rva=0x" << std::hex << source_rva
+         << "; source-hash=0x" << source_hash
+         << "; replacement-hash=0x" << Fnv1a64(rebuilt.data(), rebuilt.size())
+         << std::dec << "; redirected " << redirect.descriptors.size()
+         << " descriptor(s), " << located.size << " -> " << rebuilt.size()
+         << " bytes; " << DescribeFatbin(rebuilt) << "; descriptor-rva=[";
+  for (size_t index = 0; index < slots.size(); ++index) {
+    if (index != 0) stream << ',';
+    stream << "0x" << std::hex
+           << static_cast<size_t>(reinterpret_cast<uint8_t*>(slots[index]) - base);
+  }
+  stream << ']';
   detail = stream.str();
   return true;
 }
@@ -544,13 +718,17 @@ inline bool IsSupportedProvider(HMODULE module, std::string& version,
 inline void Restore(std::vector<Redirect>& redirects) {
   for (auto redirect = redirects.rbegin(); redirect != redirects.rend(); ++redirect) {
     bool restored_all = true;
-    for (const auto& patch : redirect->descriptors) {
+    for (auto patch = redirect->descriptors.rbegin();
+         patch != redirect->descriptors.rend(); ++patch) {
       DWORD old_protection = 0;
-      if (VirtualProtect(patch.slot, sizeof(uint64_t), PAGE_READWRITE, &old_protection)) {
-        *patch.slot = patch.original;
-        DWORD ignored = 0;
-        VirtualProtect(patch.slot, sizeof(uint64_t), old_protection, &ignored);
-      } else {
+      if (!VirtualProtect(patch->slot, sizeof(uint64_t), PAGE_READWRITE, &old_protection)) {
+        restored_all = false;
+        continue;
+      }
+      *patch->slot = patch->original;
+      DWORD ignored = 0;
+      if (!VirtualProtect(patch->slot, sizeof(uint64_t), old_protection, &ignored) ||
+          *patch->slot != patch->original) {
         restored_all = false;
       }
     }
@@ -566,7 +744,8 @@ inline void Restore(std::vector<Redirect>& redirects) {
 }
 
 inline bool Apply(HMODULE module, std::vector<Redirect>& redirects, Result& result,
-                  std::string& provider_version) {
+                  std::string& provider_version, Mode mode = Mode::kValidatedWarp,
+                  internal::PrepareProviderCallback prepare_provider = nullptr) {
   redirects.clear();
   result = {};
 
@@ -582,8 +761,8 @@ inline bool Apply(HMODULE module, std::vector<Redirect>& redirects, Result& resu
   }
 
   Redirect redirect;
-  if (!internal::RedirectFatbin(module, internal::kPtxProfile, redirect,
-                                result.detail)) {
+  if (!internal::RedirectFatbin(module, internal::kPtxProfile, mode, prepare_provider,
+                                redirect, result.detail)) {
     return false;
   }
   result.applied = true;
