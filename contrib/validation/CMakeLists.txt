@@ -68,6 +68,10 @@ add_executable(validated_warp_test "${TEST_ROOT}/validated_warp_test.cpp")
 target_include_directories(validated_warp_test PRIVATE "${TEST_ROOT}/provider_mocks")
 add_test(NAME validated_warp_test COMMAND validated_warp_test)
 
+add_executable(blackwell_temporal_test "${TEST_ROOT}/blackwell_temporal_test.cpp")
+target_include_directories(blackwell_temporal_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME blackwell_temporal_test COMMAND blackwell_temporal_test)
+
 # Run the same composition cases against the actual runtime transform, not only
 # the inspector's portable copy.
 add_executable(temporal_runtime_test "${TEST_ROOT}/temporal_composition_test.cpp")

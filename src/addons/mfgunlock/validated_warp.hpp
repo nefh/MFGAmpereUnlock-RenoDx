@@ -94,7 +94,7 @@ constexpr ProviderProfile kProviderProfiles[] = {
 
 struct PtxProfile {
   uint32_t arch;
-  size_t declared_raw_size;
+  size_t declared_raw_size;  // zero when normalized identity is the authoritative guard
   size_t normalized_size;
   uint64_t raw_fnv1a64;
   size_t descriptor_references;
@@ -325,8 +325,8 @@ inline bool FindPtxEntry(const uint8_t* fatbin, size_t fatbin_size,
         ReadU32(fatbin + cursor + 28) == profile.arch) {
       const uint32_t compressed = ReadU32(fatbin + cursor + 16);
       const uint64_t raw = ReadU64(fatbin + cursor + 56);
-      if (raw != profile.declared_raw_size || compressed == 0 ||
-          compressed > payload || raw > (8u << 20)) {
+      if ((profile.declared_raw_size != 0 && raw != profile.declared_raw_size) ||
+          compressed == 0 || compressed > payload || raw > (8u << 20)) {
         why = "PTX size/compression does not match the supported profile";
         return false;
       }
@@ -375,8 +375,10 @@ inline bool ValidatePristineLayout(const uint8_t* fatbin, size_t fatbin_size,
   return true;
 }
 
+using RewritePtxCallback = bool (*)(std::string&, std::string&);
+
 inline bool BuildRetargetedFatbin(const uint8_t* fatbin, size_t fatbin_size,
-                                   const PtxProfile& profile, bool apply_warp,
+                                   const PtxProfile& profile, RewritePtxCallback rewrite,
                                    std::vector<uint8_t>& rebuilt,
                                    std::string& why) {
   size_t entry = 0;
@@ -388,7 +390,7 @@ inline bool BuildRetargetedFatbin(const uint8_t* fatbin, size_t fatbin_size,
   if (!ValidatePristineLayout(fatbin, fatbin_size, entry, why)) return false;
   std::string ptx(reinterpret_cast<const char*>(source.data()), source.size());
   if (!ReplaceOnce(ptx, ".target sm_120", ".target sm_86", why)) return false;
-  if (apply_warp && !RewriteValidatedWarpBlend(ptx, why)) return false;
+  if (rewrite != nullptr && !rewrite(ptx, why)) return false;
 
   const uint32_t header = ReadU32(fatbin + entry + 4);
   const uint64_t original_payload64 = ReadU64(fatbin + entry + 8);
@@ -539,21 +541,30 @@ inline bool LocateUniqueFatbin(HMODULE module, const PtxProfile& profile,
 
 using PrepareProviderCallback = bool (*)(HMODULE);
 
-inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile, Mode mode,
-                           PrepareProviderCallback prepare_provider, Redirect& redirect,
-                           std::string& detail) {
+struct PreparedRedirect {
+  HMODULE module = nullptr;
   LocatedFatbin located;
-  if (!LocateUniqueFatbin(module, profile, located, detail)) return false;
+  std::vector<uint64_t*> slots;
+  std::vector<uint8_t> rebuilt;
+  uint64_t expected = 0;
+  uint64_t source_hash = 0;
+  size_t source_rva = 0;
+};
+
+inline bool PrepareRedirectSource(HMODULE module, const PtxProfile& profile,
+                                  PreparedRedirect& prepared, std::string& detail) {
+  prepared = {};
+  prepared.module = module;
+  if (!LocateUniqueFatbin(module, profile, prepared.located, detail)) return false;
 
   auto* base = reinterpret_cast<uint8_t*>(module);
   const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
   const size_t image_size = nt->OptionalHeader.SizeOfImage;
-  const uint64_t expected = reinterpret_cast<uint64_t>(located.address);
-  const uint64_t source_hash = Fnv1a64(located.address, located.size);
-  const size_t source_rva = static_cast<size_t>(located.address - base);
+  prepared.expected = reinterpret_cast<uint64_t>(prepared.located.address);
+  prepared.source_hash = Fnv1a64(prepared.located.address, prepared.located.size);
+  prepared.source_rva = static_cast<size_t>(prepared.located.address - base);
 
-  std::vector<uint64_t*> slots;
   const auto* section = IMAGE_FIRST_SECTION(nt);
   for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
     if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
@@ -568,53 +579,55 @@ inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile, Mode mode,
          offset += alignof(uint64_t)) {
       uint64_t value = 0;
       std::memcpy(&value, bytes + offset, sizeof(value));
-      if (value == expected) slots.push_back(reinterpret_cast<uint64_t*>(bytes + offset));
+      if (value == prepared.expected)
+        prepared.slots.push_back(reinterpret_cast<uint64_t*>(bytes + offset));
     }
   }
-  if (slots.size() != profile.descriptor_references) {
+  if (prepared.slots.size() != profile.descriptor_references) {
     std::ostringstream stream;
-    stream << "found " << slots.size() << " descriptor reference(s), expected "
+    stream << "found " << prepared.slots.size() << " descriptor reference(s), expected "
            << profile.descriptor_references;
     detail = stream.str();
+    prepared = {};
+    return false;
+  }
+  return true;
+}
+
+inline bool PrepareRetargetedRedirect(HMODULE module, const PtxProfile& profile,
+                                      RewritePtxCallback rewrite,
+                                      PreparedRedirect& prepared,
+                                      std::string& detail) {
+  if (!PrepareRedirectSource(module, profile, prepared, detail)) return false;
+  if (!BuildRetargetedFatbin(prepared.located.address, prepared.located.size,
+                             profile, rewrite, prepared.rebuilt, detail)) {
+    prepared = {};
+    return false;
+  }
+  return true;
+}
+
+inline bool CommitPreparedRedirect(PreparedRedirect& prepared,
+                                   const std::string& label, Redirect& redirect,
+                                   std::string& detail) {
+  if (prepared.module == nullptr || prepared.located.address == nullptr ||
+      prepared.rebuilt.empty() || prepared.slots.empty()) {
+    detail = "prepared redirect is incomplete";
     return false;
   }
 
-  std::vector<uint8_t> rebuilt;
-  if (mode == Mode::kBlackwellBaseline || mode == Mode::kValidatedWarp) {
-    const bool apply_warp = mode == Mode::kValidatedWarp;
-    if (!BuildRetargetedFatbin(located.address, located.size, profile, apply_warp,
-                               rebuilt, detail)) {
-      return false;
-    }
-  } else if (mode != Mode::kRedirectControl) {
-    detail = "unknown warp diagnostic mode";
-    return false;
-  }
-
-  // Provider preparation must complete before replacement pointers are
-  // published. Redirect-control intentionally copies the resulting normal
-  // Ampere fatbin byte-for-byte, isolating the redirect/allocation mechanism.
-  if (prepare_provider != nullptr && !prepare_provider(module)) {
-    detail = "provider preparation failed before warp redirect";
-    return false;
-  }
-  if (mode == Mode::kRedirectControl &&
-      !BuildRedirectControlFatbin(located, rebuilt, detail)) {
-    return false;
-  }
-
-  void* allocation = VirtualAlloc(nullptr, rebuilt.size(),
+  void* allocation = VirtualAlloc(nullptr, prepared.rebuilt.size(),
                                   MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (allocation == nullptr) {
     detail = "replacement fatbin allocation failed";
     return false;
   }
-  std::memcpy(allocation, rebuilt.data(), rebuilt.size());
+  std::memcpy(allocation, prepared.rebuilt.data(), prepared.rebuilt.size());
 
   const uint64_t replacement = reinterpret_cast<uint64_t>(allocation);
   bool committed = true;
-  for (uint64_t* slot : slots) {
-    if (*slot != expected) {
+  for (uint64_t* slot : prepared.slots) {
+    if (*slot != prepared.expected) {
       committed = false;
       break;
     }
@@ -632,7 +645,7 @@ inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile, Mode mode,
       break;
     }
   }
-  if (!committed || redirect.descriptors.size() != slots.size()) {
+  if (!committed || redirect.descriptors.size() != prepared.slots.size()) {
     bool rolled_back = true;
     for (auto patch = redirect.descriptors.rbegin();
          patch != redirect.descriptors.rend(); ++patch) {
@@ -657,22 +670,57 @@ inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile, Mode mode,
   }
 
   redirect.allocation = allocation;
+  auto* base = reinterpret_cast<uint8_t*>(prepared.module);
   std::ostringstream stream;
-  stream << "mode=" << ModeName(mode)
-         << "; source-rva=0x" << std::hex << source_rva
-         << "; source-hash=0x" << source_hash
-         << "; replacement-hash=0x" << Fnv1a64(rebuilt.data(), rebuilt.size())
+  stream << label
+         << "; source-rva=0x" << std::hex << prepared.source_rva
+         << "; source-hash=0x" << prepared.source_hash
+         << "; replacement-hash=0x" << Fnv1a64(prepared.rebuilt.data(), prepared.rebuilt.size())
          << std::dec << "; redirected " << redirect.descriptors.size()
-         << " descriptor(s), " << located.size << " -> " << rebuilt.size()
-         << " bytes; " << DescribeFatbin(rebuilt) << "; descriptor-rva=[";
-  for (size_t index = 0; index < slots.size(); ++index) {
+         << " descriptor(s), " << prepared.located.size << " -> " << prepared.rebuilt.size()
+         << " bytes; " << DescribeFatbin(prepared.rebuilt) << "; descriptor-rva=[";
+  for (size_t index = 0; index < prepared.slots.size(); ++index) {
     if (index != 0) stream << ',';
     stream << "0x" << std::hex
-           << static_cast<size_t>(reinterpret_cast<uint8_t*>(slots[index]) - base);
+           << static_cast<size_t>(reinterpret_cast<uint8_t*>(prepared.slots[index]) - base);
   }
   stream << ']';
   detail = stream.str();
   return true;
+}
+
+inline bool RedirectFatbin(HMODULE module, const PtxProfile& profile, Mode mode,
+                           PrepareProviderCallback prepare_provider, Redirect& redirect,
+                           std::string& detail) {
+  PreparedRedirect prepared;
+  if (!PrepareRedirectSource(module, profile, prepared, detail)) return false;
+
+  if (mode == Mode::kBlackwellBaseline || mode == Mode::kValidatedWarp) {
+    const RewritePtxCallback rewrite =
+        mode == Mode::kValidatedWarp ? RewriteValidatedWarpBlend : nullptr;
+    if (!BuildRetargetedFatbin(prepared.located.address, prepared.located.size,
+                               profile, rewrite, prepared.rebuilt, detail)) {
+      return false;
+    }
+  } else if (mode != Mode::kRedirectControl) {
+    detail = "unknown warp diagnostic mode";
+    return false;
+  }
+
+  // Provider preparation must complete before replacement pointers are
+  // published. Redirect-control intentionally copies the resulting normal
+  // Ampere fatbin byte-for-byte, isolating the redirect/allocation mechanism.
+  if (prepare_provider != nullptr && !prepare_provider(module)) {
+    detail = "provider preparation failed before warp redirect";
+    return false;
+  }
+  if (mode == Mode::kRedirectControl &&
+      !BuildRedirectControlFatbin(prepared.located, prepared.rebuilt, detail)) {
+    return false;
+  }
+
+  return CommitPreparedRedirect(
+      prepared, std::string("mode=") + ModeName(mode), redirect, detail);
 }
 
 }  // namespace internal

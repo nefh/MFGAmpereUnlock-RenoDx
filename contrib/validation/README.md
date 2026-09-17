@@ -41,3 +41,8 @@ build.validation/fg_preset_test /path/to/nvngx_dlssg.dll
 That optional check verifies the actual machine-code fingerprints and mocked
 lifecycle only. It neither loads NVIDIA code nor validates Detours, the Windows
 ABI, model B execution, or frame-generation quality. No NVIDIA DLL is included.
+
+### `blackwell_temporal_test`
+
+Checks the exact DLSS-G 310.9.1 Blackwell temporal PTX identities used by the
+Ampere full-temporal path and the fail-closed Intermediate Scatter rewrite.

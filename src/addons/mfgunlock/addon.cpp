@@ -26,6 +26,7 @@
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 
+#include "./blackwell_temporal.hpp"
 #include "./early_load.hpp"
 #include "./fg_preset.hpp"
 #include "./framecount.hpp"
@@ -47,6 +48,7 @@ using mfgunlock::g_enabled;
 std::atomic<unsigned int> g_max_count{4};
 std::atomic_bool g_force_flip_meter_off{false};
 std::atomic_bool g_temporal_fix{true};
+std::atomic_bool g_intermediate_scatter_retention{false};
 std::atomic_bool g_validated_warp_blend{false};
 std::atomic_bool g_show_debug_options{false};
 std::atomic_int g_validated_warp_mode{
@@ -446,18 +448,59 @@ void RestoreValidatedWarp() {
 // smoother than 2x despite double the counter. See midpoint.hpp.
 
 std::atomic_bool g_midpoint_patched{false};
+std::atomic_bool g_blackwell_temporal_patched{false};
 struct MidpointModulePatch {
   HMODULE module;
   std::vector<mfgunlock::midpoint::Patch> patches;
   void* allocation;
 };
+struct BlackwellTemporalModulePatch {
+  HMODULE module = nullptr;
+  std::vector<mfgunlock::blackwelltemporal::Redirect> redirects;
+  std::string provider_version;
+  std::string detail;
+  bool intermediate_scatter = false;
+};
 std::vector<MidpointModulePatch> g_midpoint_modules;
+std::vector<BlackwellTemporalModulePatch> g_blackwell_temporal_modules;
 std::vector<HMODULE> g_midpoint_rejected_modules;
+std::vector<HMODULE> g_blackwell_temporal_rejected_modules;
 std::string g_midpoint_detail;
-bool HasTemporalPatch(HMODULE mod) {
-  return std::any_of(g_midpoint_modules.begin(), g_midpoint_modules.end(),
-                     [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
+std::string g_blackwell_temporal_detail;
+
+bool HasBlackwellTemporalPatch(HMODULE mod) {
+  return std::any_of(
+      g_blackwell_temporal_modules.begin(), g_blackwell_temporal_modules.end(),
+      [mod](const BlackwellTemporalModulePatch& patch) { return patch.module == mod; });
 }
+
+bool HasTemporalPatch(HMODULE mod) {
+  return HasBlackwellTemporalPatch(mod) ||
+      std::any_of(g_midpoint_modules.begin(), g_midpoint_modules.end(),
+                  [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
+}
+
+bool BlackwellTemporalRejected(HMODULE mod) {
+  return std::find(g_blackwell_temporal_rejected_modules.begin(),
+                   g_blackwell_temporal_rejected_modules.end(), mod) !=
+      g_blackwell_temporal_rejected_modules.end();
+}
+
+void RejectBlackwellTemporal(HMODULE mod, const std::string& provider_version,
+                             const std::string& detail, bool midpoint_fallback = true) {
+  if (!BlackwellTemporalRejected(mod)) g_blackwell_temporal_rejected_modules.push_back(mod);
+  if (g_blackwell_temporal_modules.empty()) g_blackwell_temporal_detail = detail;
+  std::stringstream message;
+  message << "mfgunlock: Intermediate Scatter Retention not applied"
+          << (provider_version.empty() ? "" : " to DLSS-G " + provider_version)
+          << " -- "
+          << (detail.empty() ? "full Blackwell temporal backend did not match" : detail)
+          << (midpoint_fallback
+                  ? "; midpoint temporal fallback will be used."
+                  : "; MFG remains fail-closed for this provider.");
+  reshade::log::message(reshade::log::level::warning, message.str().c_str());
+}
+
 void PatchMidpointInModule(HMODULE mod) {
   if (mod == nullptr) return;
   const auto* profile = mfgunlock::architecture::ActiveProfile();
@@ -478,9 +521,9 @@ void PatchMidpointInModule(HMODULE mod) {
   if (!mfgunlock::midpoint::Apply(mod, patches, allocation, detail)) {
     char module_path[MAX_PATH] = {};
     GetModuleFileNameA(mod, module_path, MAX_PATH);
-    std::stringstream s;
-    s << "mfgunlock: temporal fix not applied to " << module_path << " -- " << detail << ".";
-    reshade::log::message(reshade::log::level::warning, s.str().c_str());
+    std::stringstream message;
+    message << "mfgunlock: temporal fix not applied to " << module_path << " -- " << detail << ".";
+    reshade::log::message(reshade::log::level::warning, message.str().c_str());
     g_midpoint_rejected_modules.push_back(mod);
     return;
   }
@@ -490,14 +533,76 @@ void PatchMidpointInModule(HMODULE mod) {
   g_midpoint_patched.store(true, std::memory_order_release);
   char module_path[MAX_PATH] = {};
   GetModuleFileNameA(mod, module_path, MAX_PATH);
-  std::stringstream s;
-  s << "mfgunlock: temporal fix applied to " << module_path << " -- " << detail
-    << "; generated frames should now land at their own time, not all at the midpoint.";
-  reshade::log::message(reshade::log::level::info, s.str().c_str());
+  std::stringstream message;
+  message << "mfgunlock: temporal fix applied to " << module_path << " -- " << detail
+          << "; generated frames should now land at their own time, not all at the midpoint.";
+  reshade::log::message(reshade::log::level::info, message.str().c_str());
+}
+
+void PatchAmpereProviderInModule(HMODULE mod) {
+  if (mod == nullptr) return;
+  const bool temporal_requested = g_temporal_fix.load(std::memory_order_relaxed);
+  const bool scatter_requested = temporal_requested &&
+      g_intermediate_scatter_retention.load(std::memory_order_relaxed) &&
+      !HasTemporalPatch(mod) && !BlackwellTemporalRejected(mod);
+
+  mfgunlock::blackwelltemporal::Plan temporal_plan;
+  mfgunlock::blackwelltemporal::Result temporal_result;
+  std::string temporal_version;
+  bool temporal_prepared = false;
+  if (scatter_requested) {
+    temporal_prepared = mfgunlock::blackwelltemporal::Prepare(
+        mod, true, temporal_plan, temporal_result, temporal_version);
+    if (!temporal_prepared) {
+      RejectBlackwellTemporal(mod, temporal_version, temporal_result.detail);
+    }
+  }
+
+  // Both quality paths inspect pristine provider fatbins. Prepare the complete
+  // temporal plan first; Warp may then run provider preparation before either
+  // temporal descriptor is published.
+  if (g_validated_warp_blend.load(std::memory_order_relaxed)) {
+    PatchValidatedWarpInModule(mod);
+  }
+
+  if (temporal_prepared) {
+    if (!mfgunlock::provider::PrepareProvider(mod)) {
+      RejectBlackwellTemporal(mod, temporal_version,
+                              "provider preparation failed before temporal redirect", false);
+      return;
+    } else {
+      std::vector<mfgunlock::blackwelltemporal::Redirect> redirects;
+      if (mfgunlock::blackwelltemporal::Commit(
+              temporal_plan, redirects, temporal_result)) {
+        g_blackwell_temporal_detail = temporal_result.detail;
+        g_blackwell_temporal_modules.push_back(
+            {mod, std::move(redirects), temporal_version, temporal_result.detail,
+             temporal_result.intermediate_scatter});
+        g_blackwell_temporal_patched.store(true, std::memory_order_release);
+        std::stringstream message;
+        message << "mfgunlock: Intermediate Scatter Retention applied to DLSS-G "
+                << temporal_version
+                << " on Ampere through the complete Blackwell temporal sm_86 backend -- "
+                << temporal_result.detail << ".";
+        reshade::log::message(reshade::log::level::info, message.str().c_str());
+      } else {
+        RejectBlackwellTemporal(mod, temporal_version, temporal_result.detail,
+                                temporal_result.fallback_safe);
+        if (!temporal_result.fallback_safe) return;
+      }
+    }
+  }
+
+  if (temporal_requested && !HasTemporalPatch(mod)) PatchMidpointInModule(mod);
+  PatchArchGatesInModule(mod);
 }
 
 void TryPatchMidpoint() {
   for (HMODULE mod : g_dlssg_modules) PatchMidpointInModule(mod);
+}
+
+void TryPatchAmpereProviders() {
+  for (HMODULE mod : g_dlssg_modules) PatchAmpereProviderInModule(mod);
 }
 
 // Loader and capability callbacks share the provider inventory. A loader
@@ -516,11 +621,12 @@ void ProcessLoadedDlssgModule(HMODULE mod) {
     return;
   }
   if (profile->NeedsRetarget()) {
-    if (profile->architecture == mfgunlock::Architecture::kAmpere &&
-        g_validated_warp_blend.load(std::memory_order_relaxed))
-      PatchValidatedWarpInModule(mod);
-    if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
-    PatchArchGatesInModule(mod);
+    if (profile->architecture == mfgunlock::Architecture::kAmpere) {
+      PatchAmpereProviderInModule(mod);
+    } else {
+      if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
+      PatchArchGatesInModule(mod);
+    }
   } else {
     PatchArchGatesInModule(mod);
     if (g_temporal_fix.load(std::memory_order_relaxed)) PatchMidpointInModule(mod);
@@ -539,11 +645,12 @@ void RunProviderMaintenance() {
     return;
   }
   if (profile->NeedsRetarget()) {
-    if (profile->architecture == mfgunlock::Architecture::kAmpere &&
-        g_validated_warp_blend.load(std::memory_order_relaxed))
-      TryPatchValidatedWarp();
-    if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
-    TryPatchDlssgArchGate();
+    if (profile->architecture == mfgunlock::Architecture::kAmpere) {
+      TryPatchAmpereProviders();
+    } else {
+      if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
+      TryPatchDlssgArchGate();
+    }
   } else {
     TryPatchDlssgArchGate();
     if (g_temporal_fix.load(std::memory_order_relaxed)) TryPatchMidpoint();
@@ -557,6 +664,16 @@ void InstallPresetForLoadedProviders() {
   AcquireSRWLockExclusive(&g_provider_maintenance_lock);
   for (HMODULE mod : g_dlssg_modules) mfgunlock::fgpreset::TryInstall(mod);
   ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
+}
+
+void RestoreBlackwellTemporal() {
+  for (auto& module : g_blackwell_temporal_modules) {
+    mfgunlock::blackwelltemporal::Restore(module.redirects);
+  }
+  g_blackwell_temporal_modules.clear();
+  g_blackwell_temporal_rejected_modules.clear();
+  g_blackwell_temporal_detail.clear();
+  g_blackwell_temporal_patched.store(false, std::memory_order_release);
 }
 
 void RestoreMidpoint() {
@@ -1957,6 +2074,38 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   }
 
   ImGui::Separator();
+  bool scatter = g_intermediate_scatter_retention.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Intermediate Scatter Retention (Ampere, 310.9.1)", &scatter)) {
+    g_intermediate_scatter_retention.store(scatter, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "IntermediateScatterRetention",
+                              scatter ? 1 : 0);
+  }
+  ImGui::TextDisabled("Experimental quality path; changes apply after restarting the game.");
+  if (scatter) {
+    if (!g_temporal_fix.load(std::memory_order_relaxed)) {
+      ImGui::TextDisabled("Intermediate Scatter Retention requires Temporal Fix.");
+    } else if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
+      if (!g_blackwell_temporal_modules.empty()) {
+        ImGui::TextUnformatted("Intermediate Scatter Retention: applied.");
+        if (debug_options)
+          ImGui::TextWrapped("Blackwell temporal backend: %s.",
+                             g_blackwell_temporal_detail.c_str());
+      } else if (!g_blackwell_temporal_detail.empty()) {
+        if (g_midpoint_patched.load(std::memory_order_acquire))
+          ImGui::TextUnformatted("Intermediate Scatter Retention: unavailable; midpoint fallback active.");
+        else
+          ImGui::TextUnformatted("Intermediate Scatter Retention: not applied.");
+        if (debug_options)
+          ImGui::TextWrapped("Blackwell temporal backend: %s.",
+                             g_blackwell_temporal_detail.c_str());
+      } else {
+        ImGui::TextDisabled("Intermediate Scatter Retention: waiting for provider load.");
+      }
+      ReleaseSRWLockShared(&g_provider_maintenance_lock);
+    }
+  }
+
+  ImGui::Separator();
   bool warp = g_validated_warp_blend.load(std::memory_order_relaxed);
   if (ImGui::Checkbox("Validated Warp Blend (Ampere, 310.9.1)", &warp)) {
     g_validated_warp_blend.store(warp, std::memory_order_relaxed);
@@ -1985,8 +2134,11 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     }
     ImGui::TextDisabled("Applied once at load; restart the game to change it.");
     if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
-      if (g_midpoint_patched.load(std::memory_order_acquire)) {
-        ImGui::TextWrapped("Temporal fix: %zu provider(s); last result: %s.",
+      if (g_blackwell_temporal_patched.load(std::memory_order_acquire)) {
+        ImGui::TextWrapped("Temporal fix: full Blackwell sm_86 backend; %zu provider(s).",
+                           g_blackwell_temporal_modules.size());
+      } else if (g_midpoint_patched.load(std::memory_order_acquire)) {
+        ImGui::TextWrapped("Temporal fix: midpoint fallback; %zu provider(s); last result: %s.",
                            g_midpoint_modules.size(), g_midpoint_detail.c_str());
       } else {
         ImGui::TextDisabled("Temporal fix: pending.");
@@ -2024,6 +2176,9 @@ void LoadConfig() {
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "TemporalFix", value)) {
     g_temporal_fix.store(value != 0, std::memory_order_relaxed);
+  }
+  if (reshade::get_config_value(nullptr, kConfigSection, "IntermediateScatterRetention", value)) {
+    g_intermediate_scatter_retention.store(value != 0, std::memory_order_relaxed);
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", value)) {
     g_validated_warp_blend.store(value != 0, std::memory_order_relaxed);
@@ -2124,9 +2279,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
         const auto* profile = mfgunlock::architecture::ActiveProfile();
         if (!g_enabled.load() || !profile) return false;
         if (!profile->NeedsRetarget()) return true;
+        const bool temporal_ready =
+            g_midpoint_patched.load(std::memory_order_acquire) ||
+            g_blackwell_temporal_patched.load(std::memory_order_acquire);
         return mfgunlock::provider::PreparedProviderCount() == 1 &&
-               g_midpoint_patched.load(std::memory_order_acquire) &&
-               g_gate_patched.load(std::memory_order_acquire);
+               temporal_ready && g_gate_patched.load(std::memory_order_acquire);
       };
       mfgunlock::framecount::g_dynamic_stack_ready = DynamicRuntimeStackReady;
       mfgunlock::ngx::g_capability_limit = []() -> unsigned int {
@@ -2207,6 +2364,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID /*lpv_reserved*
       ClearUiRuntimeCandidates();
       g_ui_candidate_d3d12.store(false, std::memory_order_relaxed);
       mfgunlock::fgpreset::Shutdown();
+      RestoreBlackwellTemporal();
       RestoreValidatedWarp();
       RestoreMidpoint();
       RestoreDlssgArchGate();
