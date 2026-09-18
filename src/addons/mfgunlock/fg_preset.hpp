@@ -71,7 +71,7 @@ inline uint64_t Fingerprint(const unsigned char* bytes, size_t count) {
   return hash;
 }
 
-inline bool MatchesProvider(HMODULE module) {
+inline bool MatchesProvider(HMODULE module, bool own_reader = false) {
   provider::internal::ImageIdentity identity;
   if (!provider::internal::ReadIdentity(module, identity) ||
       identity.timestamp != 0x6A986031u || identity.image_bytes != 0x737000u) return false;
@@ -83,7 +83,7 @@ inline bool MatchesProvider(HMODULE module) {
   if (!VirtualQuery(base + kReaderRva, &memory, sizeof(memory)) ||
       (memory.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0)
     return false;
-  return Fingerprint(base + kReaderRva, kReaderBytes) == kReaderHash &&
+  return (own_reader || Fingerprint(base + kReaderRva, kReaderBytes) == kReaderHash) &&
          Fingerprint(base + kSelectionRva, kSelectionBytes) == kSelectionHash &&
          Fingerprint(base + kReportOverridesRva, kReportOverridesBytes) == kReportOverridesHash;
 }
@@ -101,8 +101,7 @@ inline std::atomic_bool g_shutting_down{false};
 
 inline bool ReadSetting(size_t index, uint32_t setting, uint32_t* value, const void* caller) {
   auto& entry = g_readers[index].entry;
-  // InstallAddress publishes its trampoline after committing the detour. This
-  // lock also prevents detach from freeing a trampoline during a forwarded call.
+  // Keep teardown from freeing the trampoline during a forwarded call.
   AcquireSRWLockShared(&entry.lock);
   struct Unlock {
     SRWLOCK* lock;
@@ -184,10 +183,18 @@ inline constexpr std::array<ReportOverridesFn, 4> kObservers = {
 inline bool TryInstall(HMODULE module) {
   if (!g_enabled.load() || internal::g_shutting_down.load() ||
       g_requested.load() == Preset::kDefault) return false;
-  for (auto& reader : internal::g_readers) {
-    if (reader.entry.installed.load(std::memory_order_acquire) &&
-        reader.observer.installed.load(std::memory_order_acquire) &&
-        reader.retained == module) return true;
+  for (size_t i = 0; i < internal::g_readers.size(); ++i) {
+    auto& reader = internal::g_readers[i];
+    if (reader.retained != module || !reader.entry.installed.load(std::memory_order_acquire)) continue;
+    if (reader.observer.installed.load(std::memory_order_acquire)) return true;
+    // Our installed reader changes its prologue. Retry only the still-pristine
+    // observer after proving the retained module and our own exact hook target.
+    const auto target = reinterpret_cast<unsigned char*>(module) + internal::kReaderRva;
+    if (reader.entry.target.load(std::memory_order_acquire) != target ||
+        !internal::MatchesProvider(module, true)) return false;
+    return hook::InstallAddress(reader.observer,
+        reinterpret_cast<unsigned char*>(module) + internal::kReportOverridesRva,
+        reinterpret_cast<void*>(internal::kObservers[i]), "DLSS-G render preset observer");
   }
   if (!internal::MatchesProvider(module)) return false;
   for (size_t i = 0; i < internal::g_readers.size(); ++i) {

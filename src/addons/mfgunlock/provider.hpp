@@ -127,9 +127,11 @@ inline bool IsCurrent(HMODULE module, const ImageIdentity& expected) {
   return ReadIdentity(module, actual) && actual == expected;
 }
 inline std::string ModulePath(HMODULE module) {
-  char path[32768] = {};
-  const auto length = GetModuleFileNameA(module, path, ARRAYSIZE(path));
-  return length && length < ARRAYSIZE(path) ? std::string(path, length) : "<path unavailable>";
+  std::string path(32768, '\0');
+  const auto length = GetModuleFileNameA(module, path.data(), static_cast<DWORD>(path.size()));
+  if (length == 0 || length >= path.size()) return "<path unavailable>";
+  path.resize(length);
+  return path;
 }
 
 struct Image {
@@ -196,6 +198,32 @@ inline bool OwnCodeExport(const Image& image, HMODULE module, const char* name) 
   return false;
 }
 
+inline bool IsDlssgImage(const Image& image, HMODULE module) {
+  if (!OwnCodeExport(image, module, "NVSDK_NGX_GetGPUArchitecture") ||
+      (!OwnCodeExport(image, module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl") &&
+       !OwnCodeExport(image, module, "NVSDK_NGX_VULKAN_PopulateDeviceParameters_Impl"))) {
+    return false;
+  }
+  constexpr const char* kMarkers[] = {
+      "dlfg_kernel", "Kernel_EstimateIntermMvecsScatter", "Kernel_OutputPull"};
+  bool seen[3]{};
+  for (const auto& section : image.sections) {
+    if (!(section.Characteristics & IMAGE_SCN_MEM_READ)) continue;
+    const auto* begin = image.base + section.VirtualAddress;
+    const size_t bytes = section.Misc.VirtualSize;
+    if (!IsReadable(begin, bytes, module)) continue;
+    for (size_t index = 0; index < 3; ++index) {
+      const auto length = std::strlen(kMarkers[index]);
+      if (bytes >= length &&
+          std::search(begin, begin + bytes, kMarkers[index], kMarkers[index] + length) != begin + bytes)
+        seen[index] = true;
+    }
+  }
+  // The 310.9 family uses renamed kernel symbols. Neither a filename nor one
+  // generic interpolation symbol alone identifies a modern DLSS-G provider.
+  return seen[0] || (seen[1] && seen[2]);
+}
+
 // Writes never span protection regions: only the changed bytes are stored.
 // Both protection restoration and read-back are checked. Undo is registered
 // before calling this, including the case where the write succeeds but restore fails.
@@ -229,6 +257,12 @@ inline bool Undo(Provider& provider) {
   return ok;
 }
 }  // namespace internal
+
+inline bool IsDlssgProvider(HMODULE module) {
+  internal::Image image;
+  return internal::IsImageMapping(module) && internal::InspectImage(module, image) &&
+         internal::IsDlssgImage(image, module);
+}
 
 struct ProviderStatus {
   unsigned ready = 0;
@@ -332,6 +366,8 @@ inline bool PrepareProviderImpl(HMODULE module) {
   if (!internal::OwnCodeExport(image, module, "NVSDK_NGX_GetGPUArchitecture") ||
       !internal::OwnCodeExport(image, module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl"))
     return reject("incomplete or forwarded provider ABI");
+
+  if (!internal::IsDlssgImage(image, module)) return reject("not a DLSS-G provider");
 
   // Pre-write failures can be retried at the next normal maintenance boundary.
   // They are cleared ONLY after this same image passes the complete transaction.

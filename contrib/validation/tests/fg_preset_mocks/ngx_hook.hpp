@@ -11,6 +11,7 @@ inline void AcquireSRWLockShared(SRWLOCK* lock) { ++lock->shared; }
 namespace preset_mock {
 inline bool install_ok = true;
 inline unsigned installs = 0;
+inline unsigned fail_install = 0;
 inline void* original = nullptr;
 }
 
@@ -28,7 +29,7 @@ struct AddressHook {
 };
 inline bool InstallAddress(AddressHook& entry, void* target, void*, const char*) {
   ++preset_mock::installs;
-  if (!preset_mock::install_ok) return false;
+  if (!preset_mock::install_ok || preset_mock::installs == preset_mock::fail_install) return false;
   MEMORY_BASIC_INFORMATION memory{};
   if (!VirtualQuery(target, &memory, sizeof(memory))) return false;
   entry.identity.module = memory.AllocationBase;

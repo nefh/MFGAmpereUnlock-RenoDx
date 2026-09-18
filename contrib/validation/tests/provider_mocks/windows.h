@@ -9,6 +9,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <set>
 using DWORD=uint32_t; using WORD=uint16_t; using BOOL=int;
 using HMODULE=void*;using HANDLE=void*;using LPCWSTR=const wchar_t*;using FARPROC=void(*)();
 constexpr BOOL FALSE=0;
@@ -35,6 +36,10 @@ inline std::map<std::pair<HMODULE,std::string>,FARPROC> exports;
 inline std::map<HMODULE,std::string> paths;
 inline bool retain_ok=true,force_lock_busy=false;
 inline unsigned protection_calls=0,fail_protection_call=0,retains=0;
+inline std::set<unsigned> fail_protection_calls;
+inline std::set<void*> allocations;
+inline unsigned frees = 0;
+inline bool fail_free = false;
 }
 inline BOOL TryAcquireSRWLockExclusive(SRWLOCK* l){if(provider_mock::force_lock_busy||l->exclusive||l->shared)return 0;l->exclusive=true;return 1;}
 inline void AcquireSRWLockExclusive(SRWLOCK* l){l->exclusive=true;}
@@ -49,7 +54,8 @@ inline size_t VirtualQuery(const void* pointer,MEMORY_BASIC_INFORMATION* out,siz
 }
 inline BOOL VirtualProtect(void* pointer,size_t,DWORD desired,DWORD* old){
  ++provider_mock::protection_calls;
- if(provider_mock::protection_calls==provider_mock::fail_protection_call)return 0;
+ if(provider_mock::protection_calls==provider_mock::fail_protection_call ||
+    provider_mock::fail_protection_calls.contains(provider_mock::protection_calls))return 0;
  auto at=reinterpret_cast<uintptr_t>(pointer);
  for(auto& r:provider_mock::regions){auto base=reinterpret_cast<uintptr_t>(r.base);
   if(at>=base&&at-base<r.bytes){*old=r.protect;r.protect=desired;return 1;}}
@@ -74,5 +80,19 @@ inline const IMAGE_SECTION_HEADER* IMAGE_FIRST_SECTION(const IMAGE_NT_HEADERS64*
   return reinterpret_cast<const IMAGE_SECTION_HEADER*>(
       reinterpret_cast<const unsigned char*>(&nt->OptionalHeader) + nt->FileHeader.SizeOfOptionalHeader);
 }
-inline void* VirtualAlloc(void*, size_t bytes, DWORD, DWORD) { return std::malloc(bytes); }
-inline BOOL VirtualFree(void* memory, size_t, DWORD) { std::free(memory); return 1; }
+inline void* VirtualAlloc(void*, size_t bytes, DWORD, DWORD protection) {
+  void* result = std::malloc(bytes);
+  if (result) {
+    provider_mock::allocations.insert(result);
+    provider_mock::regions.push_back({result, bytes, MEM_COMMIT, protection});
+  }
+  return result;
+}
+inline BOOL VirtualFree(void* memory, size_t, DWORD) {
+  if (provider_mock::fail_free) return 0;
+  ++provider_mock::frees;
+  provider_mock::allocations.erase(memory);
+  std::erase_if(provider_mock::regions, [memory](const auto& region) { return region.base == memory; });
+  std::free(memory);
+  return 1;
+}

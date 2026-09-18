@@ -35,15 +35,23 @@ int main() {
   using mfgunlock::validatedwarp::ConfiguredMode;
   using mfgunlock::validatedwarp::Mode;
   for (int value : {-1, 0, 1, 2, 3, 255}) {
-    Check(ConfiguredMode(false, value) == Mode::kValidatedWarp, "hidden debug always uses production Warp");
     const auto expected = value >= 0 && value <= 2 ? static_cast<Mode>(value) : Mode::kValidatedWarp;
-    Check(ConfiguredMode(true, value) == expected, "visible debug preserves valid modes only");
+    Check(ConfiguredMode(value) == expected,
+          "configured Warp mode is independent of UI visibility");
   }
-  auto configured = ConfiguredMode(true, 0);
-  const auto applied = configured;
-  configured = ConfiguredMode(false, static_cast<int>(configured));
-  Check(configured == Mode::kValidatedWarp && applied == Mode::kRedirectControl,
-        "disabling debug resets configured mode without pretending to hot-swap applied Warp");
+  Check(mfgunlock::validatedwarp::ModeLabel(Mode::kBlackwellBaseline, 86) ==
+            "Blackwell baseline sm_86", "Ampere diagnostic label");
+  Check(mfgunlock::validatedwarp::ModeLabel(Mode::kValidatedWarp, 75) ==
+            "Validated Warp sm_75", "Turing diagnostic label");
+  Check(mfgunlock::validatedwarp::ModeLabel(Mode::kRedirectControl, 75) ==
+            "redirect control", "redirect control is target-neutral");
+
+  auto configured = ConfiguredMode(0);
+  Check(configured == Mode::kRedirectControl,
+        "redirect control can remain selected while advanced UI is hidden");
+  configured = ConfiguredMode(static_cast<int>(configured));
+  Check(configured == Mode::kRedirectControl,
+        "UI visibility never rewrites the selected Warp mode");
 
   std::string why;
   std::string ptx = Fixture();

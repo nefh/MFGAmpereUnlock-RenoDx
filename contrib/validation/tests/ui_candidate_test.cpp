@@ -57,7 +57,7 @@ int main() {
         "unsynchronized UI options fail closed");
   Check(!policy::CanInject(evidence, policy::kRequiredStableFrames,
                            true, true, false),
-        "experimental injection is opt-in");
+        "disabled UI injection remains fail-closed");
 
   evidence = ValidEvidence();
   evidence.output_match = false;

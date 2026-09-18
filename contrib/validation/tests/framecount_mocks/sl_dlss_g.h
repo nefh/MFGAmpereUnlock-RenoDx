@@ -96,6 +96,8 @@ struct DLSSGOptions {
   float dynamicTargetFrameRate = 0.0f;
 };
 struct DLSSGState {
+  static constexpr uint32_t s_structType = 0x646c7374;
+  uint32_t structType = s_structType;
   void* next = nullptr;
   uint32_t structVersion = kStructVersion2;
   uint32_t status = 0;

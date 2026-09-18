@@ -182,6 +182,20 @@ void ExactProvider(const char* path) {
   Check(preset::TryInstall(module), "verified provider hook installation");
   Check(preset::HasHook(), "installed selector hook reported");
   Check(preset::HasObserver(), "installed applied-preset observer reported");
+  mfgunlock::hook::UninstallAddress(internal::g_readers[0].observer);
+  image[internal::kReaderRva] ^= 1;
+  const auto partial_retains = provider_mock::retains;
+  preset_mock::fail_install = preset_mock::installs + 1;
+  Check(!preset::TryInstall(module), "observer retry failure is explicit");
+  Check(preset::HasHook() && !preset::HasObserver(), "reader survives observer-only failure");
+  image[internal::kReportOverridesRva] ^= 1;
+  Check(!preset::TryInstall(module), "observer retry rejects externally modified observer code");
+  image[internal::kReportOverridesRva] ^= 1;
+  preset_mock::fail_install = 0;
+  Check(preset::TryInstall(module) && preset::HasObserver(), "retry succeeds with our modified reader prologue");
+  Check(provider_mock::retains == partial_retains, "observer retry does not retain the module twice");
+  image[internal::kReaderRva] ^= 1;
+
   const auto installs = preset_mock::installs;
   // Detours changes the prologue in a real installation; a second maintenance
   // pass must recognize its own existing hook before pristine fingerprinting.

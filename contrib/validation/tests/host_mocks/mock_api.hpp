@@ -40,6 +40,11 @@ using LPCWSTR = const wchar_t*;
 using LPCSTR = const char*;
 using FARPROC = void (*)();
 using REFIID = int;
+inline thread_local DWORD g_mock_last_error = 0;
+inline DWORD GetLastError() { return g_mock_last_error; }
+inline void SetLastError(DWORD value) { g_mock_last_error = value; }
+inline thread_local DWORD g_mock_thread_id = 7;
+inline DWORD GetCurrentThreadId() { return g_mock_thread_id; }
 
 constexpr HRESULT S_OK = 0;
 #define FAILED(x) ((x) < 0)
@@ -155,6 +160,26 @@ inline void* LockResource(HGLOBAL handle) {
   return mock::resources[handle].data();
 }
 
+struct DXGI_SAMPLE_DESC { UINT Count = 1; UINT Quality = 0; };
+enum D3D12_RESOURCE_DIMENSION : uint32_t { D3D12_RESOURCE_DIMENSION_TEXTURE2D = 3 };
+using DXGI_FORMAT = uint32_t;
+using D3D12_RESOURCE_FLAGS = uint32_t;
+struct D3D12_RESOURCE_DESC {
+  D3D12_RESOURCE_DIMENSION Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  uint64_t Alignment = 0;
+  uint64_t Width = 0;
+  UINT Height = 0;
+  uint16_t DepthOrArraySize = 1;
+  uint16_t MipLevels = 1;
+  DXGI_FORMAT Format = 0;
+  DXGI_SAMPLE_DESC SampleDesc{};
+  uint32_t Layout = 0;
+  D3D12_RESOURCE_FLAGS Flags = 0;
+};
+struct ID3D12Resource {
+  D3D12_RESOURCE_DESC desc{};
+  D3D12_RESOURCE_DESC GetDesc() const { return desc; }
+};
 struct ID3D12GraphicsCommandList {};
 using VkInstance = void*;
 using VkPhysicalDevice = void*;
@@ -256,6 +281,7 @@ struct NVSDK_NGX_FeatureRequirement {
 };
 struct NVSDK_NGX_Parameter {
   std::map<std::string, uint32_t> values;
+  std::map<std::string, ID3D12Resource*> resources;
   unsigned int writes = 0;
   bool writable = true;
 
@@ -265,6 +291,13 @@ struct NVSDK_NGX_Parameter {
   }
   void Set(const char* name, int value) {
     Set(name, static_cast<unsigned int>(value));
+  }
+  NVSDK_NGX_Result Get(const char* name, unsigned long long* output) const {
+    if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    const auto found = values.find(name);
+    if (found == values.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    *output = found->second;
+    return NVSDK_NGX_Result_Success;
   }
   NVSDK_NGX_Result Get(const char* name, unsigned int* output) const {
     if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
@@ -278,6 +311,13 @@ struct NVSDK_NGX_Parameter {
     const auto found = values.find(name);
     if (found == values.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     *output = static_cast<int>(found->second);
+    return NVSDK_NGX_Result_Success;
+  }
+  NVSDK_NGX_Result Get(const char* name, ID3D12Resource** output) const {
+    if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    const auto found = resources.find(name);
+    if (found == resources.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    *output = found->second;
     return NVSDK_NGX_Result_Success;
   }
 };

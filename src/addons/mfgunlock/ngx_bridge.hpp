@@ -28,6 +28,8 @@
 #include "./provider.hpp"
 #include "./capability_policy.hpp"
 #include "./ngx_hook.hpp"
+#include "./count_observer.hpp"
+#include "./diagnostic_bridge.hpp"
 
 namespace mfgunlock::ngx {
 
@@ -45,9 +47,15 @@ using provider::g_create_seen;
 // Set by addon.cpp. This deliberately reuses the addon's existing provider
 // inventory and maintenance lock instead of maintaining a second module model.
 inline void (*g_prepare_loaded_providers)() = nullptr;
+// Optional startup barrier. It never treats feature release as CUDA cache unload.
+using BeforeFgCreate = bool (*)();
+inline std::atomic<BeforeFgCreate> g_before_fg_create{nullptr};
 // Zero leaves capability values alone. The addon shares this readiness decision
 // with its existing frame-count path.
 inline unsigned int (*g_capability_limit)() = nullptr;
+// Zero means there is no active Streamline structural ceiling (for example,
+// direct NGX). A known Streamline plugin publishes its compiled ceiling here.
+inline unsigned int (*g_streamline_ceiling)() = nullptr;
 
 struct Status {
   std::atomic_bool capabilities_seen{false};
@@ -243,11 +251,11 @@ inline bool EqualsInsensitive(const wchar_t* a, const wchar_t* b) {
 
 inline bool IsModuleNamed(HMODULE module, const wchar_t* wanted) {
   if (module == nullptr) return false;
-  wchar_t path[32768] = {};
-  const DWORD length = GetModuleFileNameW(module, path, ARRAYSIZE(path));
-  if (length == 0 || length >= ARRAYSIZE(path)) return false;
-  const wchar_t* slash = std::wcsrchr(path, L'\\');
-  const wchar_t* name = slash == nullptr ? path : slash + 1;
+  std::wstring path(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+  if (length == 0 || length >= path.size()) return false;
+  const wchar_t* slash = std::wcsrchr(path.c_str(), L'\\');
+  const wchar_t* name = slash == nullptr ? path.c_str() : slash + 1;
   return EqualsInsensitive(name, wanted);
 }
 
@@ -284,7 +292,7 @@ struct NgxRuntime {
   std::array<ParametersFn, 4> parameters{};
   std::array<std::atomic_bool, 4> parameters_seen{};
   std::array<const NVSDK_NGX_Handle*, 16> fg_handles{};
-  SRWLOCK handles_lock = SRWLOCK_INIT;
+  std::array<bool, 16> fg_active{};
 };
 
 inline std::array<NgxRuntime, 4> g_slots;
@@ -293,13 +301,229 @@ inline thread_local bool g_in_requirements = false;
 inline thread_local bool g_in_capabilities = false;
 inline thread_local bool g_installing = false;
 
+struct FgLifecycle {
+  uint32_t handles = 0;
+  uint32_t evaluates = 0;
+  uint32_t creates = 0;
+  uint32_t releases = 0;
+  uint64_t epoch = 0;
+  uint64_t sequence = 0;
+  uint64_t last_create = 0;
+  uint64_t last_release = 0;
+  bool zero_boundary = false;
+  bool uncertain = false;
+};
+inline std::mutex g_lifecycle_lock;
+inline FgLifecycle g_lifecycle;
+
+inline FgLifecycle LifecycleSnapshot() {
+  std::lock_guard lock(g_lifecycle_lock);
+  return g_lifecycle;
+}
+inline bool IsTrackedLocked(const NgxRuntime& slot, const NVSDK_NGX_Handle* handle) {
+  return handle && std::find(slot.fg_handles.begin(), slot.fg_handles.end(), handle) != slot.fg_handles.end();
+}
 inline bool IsTracked(NgxRuntime& slot, const NVSDK_NGX_Handle* handle) {
-  if (handle == nullptr) return false;
-  AcquireSRWLockShared(&slot.handles_lock);
-  const bool found =
-      std::find(slot.fg_handles.begin(), slot.fg_handles.end(), handle) != slot.fg_handles.end();
-  ReleaseSRWLockShared(&slot.handles_lock);
-  return found;
+  std::lock_guard lock(g_lifecycle_lock);
+  return IsTrackedLocked(slot, handle);
+}
+inline void UpdateFeatureStatus() {
+  bool active = false;
+  uint32_t handles = 0;
+  for (const auto& slot : g_slots) {
+    for (size_t i = 0; i < slot.fg_handles.size(); ++i) {
+      if (!slot.fg_handles[i]) continue;
+      ++handles;
+      active |= slot.fg_active[i];
+    }
+  }
+  g_lifecycle.handles = handles;
+  g_status.feature_created.store(handles != 0, std::memory_order_release);
+  g_status.feature_active.store(active, std::memory_order_release);
+}
+inline diagnostic::LifecycleEvent LifecycleEvent(diagnostic::LifecycleKind kind,
+                                                 const NVSDK_NGX_Handle* handle = nullptr) {
+  diagnostic::LifecycleEvent event;
+  event.kind = kind;
+  event.thread = GetCurrentThreadId();
+  event.epoch = g_lifecycle.epoch;
+  event.handle = reinterpret_cast<uint64_t>(handle);
+  event.handles = g_lifecycle.handles;
+  event.evaluates = g_lifecycle.evaluates;
+  event.creates = g_lifecycle.creates;
+  event.releases = g_lifecycle.releases;
+  event.tracking_uncertain = g_lifecycle.uncertain;
+  return event;
+}
+
+enum class FgCallKind { kCreate, kEvaluate, kRelease };
+struct FgCall {
+  NgxRuntime& slot;
+  FgCallKind kind;
+  const NVSDK_NGX_Handle* handle;
+  bool tracked;
+  bool finished = false;
+
+  FgCall(NgxRuntime& runtime, FgCallKind type, const NVSDK_NGX_Handle* object = nullptr)
+      : slot(runtime), kind(type), handle(object) {
+    std::lock_guard lock(g_lifecycle_lock);
+    tracked = kind == FgCallKind::kCreate || IsTrackedLocked(slot, handle);
+    if (tracked) ++Counter();
+  }
+  uint32_t& Counter() {
+    if (kind == FgCallKind::kCreate) return g_lifecycle.creates;
+    if (kind == FgCallKind::kEvaluate) return g_lifecycle.evaluates;
+    return g_lifecycle.releases;
+  }
+  void Finish(NVSDK_NGX_Result result, const NVSDK_NGX_Handle* created = nullptr) {
+    if (!tracked) return;
+    const DWORD last_error = GetLastError();
+    struct RestoreError {
+      DWORD value;
+      ~RestoreError() { SetLastError(value); }
+    } restore_error{last_error};
+    diagnostic::LifecycleEvent event;
+    bool zero = false;
+    bool lost = false;
+    {
+      std::lock_guard lock(g_lifecycle_lock);
+      --Counter();
+      finished = true;
+      const bool success = result == NVSDK_NGX_Result_Success;
+      const auto previous_handles = g_lifecycle.handles;
+      const bool previously_uncertain = g_lifecycle.uncertain;
+      if (kind == FgCallKind::kCreate) {
+        g_lifecycle.last_create = ++g_lifecycle.sequence;
+        if (success) {
+          const auto free = std::find(slot.fg_handles.begin(), slot.fg_handles.end(), nullptr);
+          if (!created || IsTrackedLocked(slot, created) || free == slot.fg_handles.end()) {
+            g_lifecycle.uncertain = true;
+          } else {
+            const size_t i = static_cast<size_t>(free - slot.fg_handles.begin());
+            slot.fg_handles[i] = created;
+            slot.fg_active[i] = false;
+            if (previous_handles == 0) ++g_lifecycle.epoch;
+          }
+        }
+      } else if (kind == FgCallKind::kRelease && success) {
+        for (size_t i = 0; i < slot.fg_handles.size(); ++i) {
+          if (slot.fg_handles[i] != handle) continue;
+          slot.fg_handles[i] = nullptr;
+          slot.fg_active[i] = false;
+        }
+        g_lifecycle.last_release = ++g_lifecycle.sequence;
+      } else if (kind == FgCallKind::kEvaluate) {
+        for (size_t i = 0; i < slot.fg_handles.size(); ++i) {
+          if (slot.fg_handles[i] == handle) slot.fg_active[i] = success;
+        }
+      }
+      UpdateFeatureStatus();
+      zero = kind == FgCallKind::kRelease && success && previous_handles != 0 &&
+          g_lifecycle.handles == 0 && !g_lifecycle.uncertain;
+      if (zero) g_lifecycle.zero_boundary = true;
+      if (kind == FgCallKind::kCreate && success) g_lifecycle.zero_boundary = false;
+      event = LifecycleEvent(kind == FgCallKind::kCreate ? diagnostic::LifecycleKind::kCreated
+                                                       : diagnostic::LifecycleKind::kReleased,
+                             kind == FgCallKind::kCreate ? created : handle);
+      event.result = static_cast<uint32_t>(result);
+      lost = !previously_uncertain && g_lifecycle.uncertain;
+    }
+    if (kind == FgCallKind::kEvaluate) return;
+    diagnostic::Emit(event);
+    if (lost) {
+      event.kind = diagnostic::LifecycleKind::kTrackingLost;
+      diagnostic::Emit(event);
+    }
+    if (zero) {
+      event.kind = diagnostic::LifecycleKind::kZeroHandles;
+      diagnostic::Emit(event);
+    }
+  }
+  ~FgCall() {
+    if (!tracked || finished) return;
+    std::lock_guard lock(g_lifecycle_lock);
+    --Counter();
+    g_lifecycle.uncertain = true;
+    g_lifecycle.zero_boundary = false;
+  }
+  FgCall(const FgCall&) = delete;
+  FgCall& operator=(const FgCall&) = delete;
+};
+
+
+inline void SnapshotUnsigned(const NVSDK_NGX_Parameter* parameters, const char* name,
+                             uint32_t& known, uint32_t& value) {
+  if (!parameters || !name) return;
+  unsigned int read = 0;
+  if (parameters->Get(name, &read) != NVSDK_NGX_Result_Success) return;
+  known = 1;
+  value = read;
+}
+
+inline void SnapshotUnsigned64(const NVSDK_NGX_Parameter* parameters, const char* name,
+                               uint32_t& known, uint64_t& value) {
+  if (!parameters || !name) return;
+  unsigned long long read = 0;
+  if (parameters->Get(name, &read) == NVSDK_NGX_Result_Success) {
+    known = 1;
+    value = static_cast<uint64_t>(read);
+    return;
+  }
+  unsigned int read32 = 0;
+  if (parameters->Get(name, &read32) != NVSDK_NGX_Result_Success) return;
+  known = 1;
+  value = read32;
+}
+
+inline void SnapshotResource(const NVSDK_NGX_Parameter* parameters, const char* name,
+                             diagnostic::ResourceKey key,
+                             diagnostic::ResourceSnapshot& output) {
+  output.key = static_cast<uint32_t>(key);
+  if (!parameters || !name) return;
+  ID3D12Resource* resource = nullptr;
+  if (parameters->Get(name, &resource) != NVSDK_NGX_Result_Success || !resource) return;
+  const auto desc = resource->GetDesc();
+  output.known = 1;
+  output.object = reinterpret_cast<uint64_t>(resource);
+  output.width = desc.Width;
+  output.height = desc.Height;
+  output.depth_or_array = desc.DepthOrArraySize;
+  output.mip_levels = desc.MipLevels;
+  output.format = static_cast<uint32_t>(desc.Format);
+  output.dimension = static_cast<uint32_t>(desc.Dimension);
+  output.flags = static_cast<uint32_t>(desc.Flags);
+  output.sample_count = desc.SampleDesc.Count;
+}
+
+inline void SnapshotEvaluate(const NVSDK_NGX_Parameter* parameters,
+                             diagnostic::EvaluateEvent& event) {
+  SnapshotUnsigned(parameters, "DLSSG.MultiFrameCount", event.generated_count_known,
+                   event.generated_count);
+  SnapshotUnsigned(parameters, "DLSSG.MultiFrameIndex", event.generated_index_known,
+                   event.generated_index);
+  SnapshotUnsigned(parameters, "DLSSG.Reset", event.reset_known, event.reset);
+  SnapshotUnsigned(parameters, "DLSSG.AutomodeOverrideReset", event.automode_reset_known,
+                   event.automode_reset);
+  SnapshotUnsigned64(parameters, "DLSSG.BackbufferFrameID", event.backbuffer_frame_id_known,
+                     event.backbuffer_frame_id);
+  struct ResourceName {
+    const char* name;
+    diagnostic::ResourceKey key;
+  };
+  static constexpr ResourceName kResources[] = {
+      {"DLSSG.Backbuffer", diagnostic::ResourceKey::kBackbuffer},
+      {"DLSSG.Depth", diagnostic::ResourceKey::kDepth},
+      {"DLSSG.MVecs", diagnostic::ResourceKey::kMotionVectors},
+      {"DLSSG.HUDLess", diagnostic::ResourceKey::kHudLess},
+      {"DLSSG.UI", diagnostic::ResourceKey::kUi},
+      {"DLSSG.UIAlpha", diagnostic::ResourceKey::kUiAlpha},
+      {"DLSSG.BidirectionalDistortionField", diagnostic::ResourceKey::kBidirectionalDistortionField},
+      {"DLSSG.OutputInterpolated", diagnostic::ResourceKey::kOutputInterpolated},
+      {"DLSSG.OutputReal", diagnostic::ResourceKey::kOutputReal},
+      {"DLSSG.OutputDisableInterpolation", diagnostic::ResourceKey::kOutputDisableInterpolation},
+  };
+  for (size_t i = 0; i < std::size(kResources); ++i)
+    SnapshotResource(parameters, kResources[i].name, kResources[i].key, event.resources[i]);
 }
 
 inline NVSDK_NGX_Result FinalizeRequirements(NVSDK_NGX_Result result,
@@ -440,27 +664,16 @@ NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList* commands, NVSDK_NG
     return real(commands, feature, parameters, handle);
   const bool fg = static_cast<uint32_t>(feature) ==
       static_cast<uint32_t>(NVSDK_NGX_Feature_FrameGeneration);
-  if (fg) g_create_seen.store(true, std::memory_order_relaxed);
-  const NVSDK_NGX_Result result = real(commands, feature, parameters, handle);
-  if (fg) {
-    const NVSDK_NGX_Handle* created =
-        result == NVSDK_NGX_Result_Success && handle != nullptr ? *handle : nullptr;
-    if (created != nullptr) {
-      AcquireSRWLockExclusive(&slot.handles_lock);
-      const auto free = std::find(slot.fg_handles.begin(), slot.fg_handles.end(), nullptr);
-      if (free != slot.fg_handles.end()) *free = created;
-      ReleaseSRWLockExclusive(&slot.handles_lock);
-    }
-    if (result == NVSDK_NGX_Result_Success && created != nullptr) {
-      if (!g_status.feature_created.exchange(true, std::memory_order_relaxed))
-        Log("DLSS-G feature created");
-    } else if (result != NVSDK_NGX_Result_Success) {
-      std::stringstream message;
-      message << "DLSS-G CreateFeature failed (0x" << std::hex
-              << static_cast<uint32_t>(result) << ')';
-      Log(message.str(), true);
-    }
+  if (!fg) return real(commands, feature, parameters, handle);
+  const auto before_create = g_before_fg_create.load(std::memory_order_acquire);
+  if (before_create && !before_create()) {
+    if (handle) *handle = nullptr;
+    return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
   }
+  g_create_seen.store(true, std::memory_order_release);
+  FgCall call(slot, FgCallKind::kCreate);
+  const NVSDK_NGX_Result result = real(commands, feature, parameters, handle);
+  call.Finish(result, result == NVSDK_NGX_Result_Success && handle ? *handle : nullptr);
   return result;
 }
 
@@ -474,18 +687,41 @@ NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandList* commands,
   if (!real) return NVSDK_NGX_Result_FAIL_InvalidParameter;
   if (g_shutting_down.load(std::memory_order_acquire))
     return real(commands, handle, parameters, callback);
-  const bool fg = IsTracked(slot, handle);
+  FgCall call(slot, FgCallKind::kEvaluate, handle);
+  const bool fg = call.tracked;
+  const auto observer = diagnostic::g_evaluate_callback.load(std::memory_order_acquire);
+  diagnostic::EvaluateEvent observed;
+  if (fg && observer) {
+    struct LastError {
+      DWORD value = GetLastError();
+      ~LastError() { SetLastError(value); }
+    } last_error;
+    observed.phase = diagnostic::EvaluatePhase::kBegin;
+    observed.thread = GetCurrentThreadId();
+    observed.evaluation_id = diagnostic::g_evaluation_sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+    observed.caller = countobserver::CallerAddress();
+    observed.commands = reinterpret_cast<uint64_t>(commands);
+    observed.handle = reinterpret_cast<uint64_t>(handle);
+    observed.parameters = reinterpret_cast<uint64_t>(parameters);
+    SnapshotEvaluate(parameters, observed);
+    observer(&observed);
+  }
   const NVSDK_NGX_Result result = real(commands, handle, parameters, callback);
-  if (fg) {
-    if (result == NVSDK_NGX_Result_Success) {
-      if (!g_status.feature_active.exchange(true, std::memory_order_relaxed))
-        Log("DLSS-G active");
-    } else {
-      std::stringstream message;
-      message << "DLSS-G EvaluateFeature failed (0x" << std::hex
-              << static_cast<uint32_t>(result) << ')';
-      Log(message.str(), true);
-    }
+  if (fg && observer) {
+    struct LastError {
+      DWORD value = GetLastError();
+      ~LastError() { SetLastError(value); }
+    } last_error;
+    observed.phase = diagnostic::EvaluatePhase::kEnd;
+    observed.result = static_cast<uint32_t>(result);
+    observer(&observed);
+  }
+  call.Finish(result);
+  if (fg && result != NVSDK_NGX_Result_Success) {
+    std::stringstream message;
+    message << "DLSS-G EvaluateFeature failed (0x" << std::hex
+            << static_cast<uint32_t>(result) << ')';
+    Log(message.str(), true);
   }
   return result;
 }
@@ -496,25 +732,41 @@ NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle) {
   const auto real = slot.entry_release;
   if (!real) return NVSDK_NGX_Result_FAIL_InvalidParameter;
   if (g_shutting_down.load(std::memory_order_acquire)) return real(handle);
+  FgCall call(slot, FgCallKind::kRelease, handle);
   const NVSDK_NGX_Result result = real(handle);
-  if (result == NVSDK_NGX_Result_Success && handle != nullptr) {
-    AcquireSRWLockExclusive(&slot.handles_lock);
-    for (auto& entry : slot.fg_handles) {
-      if (entry == handle) entry = nullptr;
-    }
-    ReleaseSRWLockExclusive(&slot.handles_lock);
-  }
+  call.Finish(result);
   return result;
 }
 
 // Update the vendor-owned block before the caller caches capabilities. This
 // covers both signed and unsigned Get overloads without replacing its vtable.
-inline void ApplyCapabilities(NVSDK_NGX_Parameter* parameters, unsigned int limit) {
+inline void ObserveCapabilityCount(NVSDK_NGX_Parameter* parameters, int value,
+                                   NVSDK_NGX_Result result, countobserver::Operation operation,
+                                   countobserver::Backend backend, uint64_t caller) {
+  countobserver::Event event;
+  event.backend = backend;
+  event.operation = operation;
+  event.origin = countobserver::Origin::kCapabilityPolicy;
+  event.key = countobserver::Key::kMaximum;
+  event.value = value;
+  event.value_known = operation == countobserver::Operation::kWrite || result == NVSDK_NGX_Result_Success;
+  event.result = operation == countobserver::Operation::kWrite
+      ? countobserver::kUnknown : static_cast<uint32_t>(result);
+  event.object = reinterpret_cast<uint64_t>(parameters);
+  event.caller = caller;
+  countobserver::Emit(event);
+}
+
+inline void ApplyCapabilities(NVSDK_NGX_Parameter* parameters, unsigned int limit,
+                              unsigned int structural_ceiling = 0,
+                              countobserver::Backend backend = countobserver::Backend::kNgxD3D12,
+                              uint64_t caller = 0) {
   if (!parameters) return;
   int available = 0;
   int maximum = 0;
   const auto available_result = parameters->Get("FrameGeneration.Available", &available);
   const auto maximum_result = parameters->Get("DLSSG.MultiFrameCountMax", &maximum);
+  ObserveCapabilityCount(parameters, maximum, maximum_result, countobserver::Operation::kRead, backend, caller);
   const auto* profile = architecture::ActiveProfile();
   const bool ready = g_enabled.load() && profile && profile->NeedsRetarget() && limit != 0;
 
@@ -536,12 +788,15 @@ inline void ApplyCapabilities(NVSDK_NGX_Parameter* parameters, unsigned int limi
   }
   if (ready && available_result == NVSDK_NGX_Result_Success && available > 0 &&
       maximum_result == NVSDK_NGX_Result_Success && maximum >= 0) {
-    const auto wanted = CapabilityFrameCount(maximum, limit);
+    const auto wanted = CapabilityFrameCount(maximum, limit, structural_ceiling);
     if (wanted != maximum) {
       parameters->Set("DLSSG.MultiFrameCountMax", wanted);
+      ObserveCapabilityCount(parameters, wanted, NVSDK_NGX_Result_Success,
+                             countobserver::Operation::kWrite, backend, caller);
       int stored = maximum;
-      if (parameters->Get("DLSSG.MultiFrameCountMax", &stored) == NVSDK_NGX_Result_Success &&
-          stored != maximum) {
+      const auto readback = parameters->Get("DLSSG.MultiFrameCountMax", &stored);
+      ObserveCapabilityCount(parameters, stored, readback, countobserver::Operation::kRead, backend, caller);
+      if (readback == NVSDK_NGX_Result_Success && stored != maximum) {
         if (g_status.capability_max.load() != static_cast<unsigned int>(stored))
           Log("DLSSG.MultiFrameCountMax: " + std::to_string(maximum) + " -> " + std::to_string(stored));
         maximum = stored;
@@ -581,7 +836,10 @@ NVSDK_NGX_Result NVSDK_CONV Capabilities(NVSDK_NGX_Parameter** output) {
   try {
     // The native call can load the provider while populating the block.
     if (g_prepare_loaded_providers) g_prepare_loaded_providers();
-    ApplyCapabilities(*output, g_capability_limit ? g_capability_limit() : 0);
+    ApplyCapabilities(*output, g_capability_limit ? g_capability_limit() : 0,
+                      g_streamline_ceiling ? g_streamline_ceiling() : 0,
+                      Api >= 2 ? countobserver::Backend::kNgxVulkan : countobserver::Backend::kNgxD3D12,
+                      countobserver::CallerAddress());
   } catch (...) {
     Log("NGX capability update failed", true);
   }
@@ -635,7 +893,15 @@ inline void ClearRuntime(size_t index) {
   slot.module = nullptr;
   slot.identity = {};
   for (auto& seen : slot.parameters_seen) seen.store(false);
+  std::lock_guard lock(g_lifecycle_lock);
+  if (std::any_of(slot.fg_handles.begin(), slot.fg_handles.end(),
+                  [](const auto* handle) { return handle != nullptr; })) {
+    g_lifecycle.uncertain = true;
+    g_lifecycle.zero_boundary = false;
+  }
   slot.fg_handles.fill(nullptr);
+  slot.fg_active.fill(false);
+  UpdateFeatureStatus();
 }
 
 inline bool IsTargetName(const char* name) {

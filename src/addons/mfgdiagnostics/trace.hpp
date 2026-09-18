@@ -11,17 +11,19 @@
 
 #include <sl.h>
 #include <sl_dlss_g.h>
+#include "../mfgunlock/diagnostic_bridge.hpp"
 
 namespace mfgdiagnostics {
 
 constexpr uint64_t kUnknown = UINT64_MAX;
-enum class Kind { options, constants, tag, state, output, tag_batch };
+enum class Kind { options, constants, tag, state, output, tag_batch, frame_count, evaluate, lifecycle };
 
 // Native resource/command/swapchain addresses are opaque identity tokens only.
 // Export replaces them with session-local IDs; they are never dereferenced later.
 struct Event {
   Kind kind{};
   uint64_t generation = 0;
+  uint64_t sequence = 0;
   uint64_t begin = 0, end = 0;
   uint32_t thread = 0, viewport = UINT32_MAX, frame = UINT32_MAX;
   uint32_t result = UINT32_MAX;
@@ -29,7 +31,7 @@ struct Event {
   bool recognized = false;
   // Schema 1 readers use indexes 0-23. Later observer-only metadata is appended
   // so old captures and comparison tooling remain compatible.
-  std::array<uint64_t, 32> values{};
+  std::array<uint64_t, 104> values{};
   std::array<float, 112> floats{};
 
   Event(Kind type = Kind::tag) : kind(type) {
@@ -37,6 +39,30 @@ struct Event {
     floats.fill(std::numeric_limits<float>::quiet_NaN());
   }
 };
+
+inline Event SnapshotLifecycle(const mfgunlock::diagnostic::LifecycleEvent& source) {
+  Event event(Kind::lifecycle);
+  event.version = source.version;
+  using namespace mfgunlock::diagnostic;
+  if (source.version != kLifecycleVersion || source.bytes < sizeof(LifecycleEvent) ||
+      static_cast<uint32_t>(source.kind) > static_cast<uint32_t>(LifecycleKind::kLiveReapply)) return event;
+  event.recognized = true;
+  event.thread = source.thread;
+  event.viewport = source.viewport;
+  event.result = source.result;
+  event.values[0] = static_cast<uint32_t>(source.kind);
+  event.values[1] = source.epoch;
+  event.values[2] = source.handle;
+  event.values[3] = source.handles == kUnknown32 ? kUnknown : source.handles;
+  event.values[4] = source.evaluates == kUnknown32 ? kUnknown : source.evaluates;
+  event.values[5] = source.creates == kUnknown32 ? kUnknown : source.creates;
+  event.values[6] = source.releases == kUnknown32 ? kUnknown : source.releases;
+  event.values[7] = source.tracking_uncertain == kUnknown32 ? kUnknown : source.tracking_uncertain;
+  event.values[8] = source.requested_quality == kUnknown32 ? kUnknown : source.requested_quality;
+  event.values[9] = source.prepared_quality == kUnknown32 ? kUnknown : source.prepared_quality;
+  event.values[10] = source.mode == kUnknown32 ? kUnknown : source.mode;
+  return event;
+}
 
 inline Event SnapshotOptions(const sl::DLSSGOptions& source) {
   Event event(Kind::options);
@@ -177,11 +203,13 @@ class Capture {
   std::mutex mutex;
   std::vector<Event> events;
   uint64_t generation = 0;
+  uint64_t sequence = 0;
 
   void Start(uint64_t now_ms, uint64_t duration_ms) {
     std::lock_guard lock(mutex);
     active.store(0, std::memory_order_release);
     events.clear();
+    sequence = 0;
     events.reserve(Capacity); // Allocation only when starting, never in hooks.
     dropped.store(0, std::memory_order_relaxed);
     full.store(false, std::memory_order_relaxed);
@@ -207,6 +235,7 @@ class Capture {
       return;
     }
     if (active.load(std::memory_order_acquire) != event.generation) return;
+    if (event.sequence == 0) event.sequence = ++sequence;
     if (events.size() == Capacity) {
       full.store(true, std::memory_order_relaxed);
       active.store(0, std::memory_order_release);

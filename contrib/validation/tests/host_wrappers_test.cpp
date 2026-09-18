@@ -95,6 +95,10 @@ NVSDK_NGX_Result g_evaluate_result = NVSDK_NGX_Result_Success;
 NVSDK_NGX_Result g_release_result = NVSDK_NGX_Result_Success;
 NVSDK_NGX_Handle g_handle{99};
 bool g_return_handle = true;
+std::vector<mfgunlock::diagnostic::EvaluateEvent> g_evaluate_observed;
+void ObserveEvaluateEvent(const mfgunlock::diagnostic::EvaluateEvent* event) noexcept {
+  if (event) g_evaluate_observed.push_back(*event);
+}
 
 NVSDK_NGX_Result RealCreate(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
                             NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** output) {
@@ -131,6 +135,11 @@ void PrepareProviders() {
 
 unsigned int CapabilityLimit() {
   return 3;
+}
+
+unsigned int g_structural_ceiling = 0;
+unsigned int StreamlineCeiling() {
+  return g_structural_ceiling;
 }
 
 sl::Result g_sl_result = sl::Result::eErrorNoSupportedAdapterFound;
@@ -173,6 +182,13 @@ bool g_plugin_result = true;
 unsigned int g_loads = 0;
 unsigned int g_startups = 0;
 const char* g_plugin_json = "{\"supportedAdapters\":0}";
+unsigned int g_plugin_bound_calls = 0;
+HMODULE g_bound_plugin = nullptr;
+
+void ObservePlugin(HMODULE module) {
+  ++g_plugin_bound_calls;
+  g_bound_plugin = module;
+}
 
 bool RealLoad(sl::param::IParameters*, const char*, const char** output) {
   ++g_loads;
@@ -264,6 +280,7 @@ int main() {
   ngx_internal::g_bound_gpu = g_gpu;
   mfgunlock::ngx::g_prepare_loaded_providers = PrepareProviders;
   mfgunlock::ngx::g_capability_limit = CapabilityLimit;
+  mfgunlock::ngx::g_streamline_ceiling = StreamlineCeiling;
 
   NVSDK_NGX_FeatureDiscoveryInfo discovery{};
   discovery.FeatureID = NVSDK_NGX_Feature_FrameGeneration;
@@ -315,6 +332,16 @@ int main() {
   Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 5,
         "larger native capability is never reduced");
 
+  ResetParameters(1, 5, 0);
+  ngx_internal::ApplyCapabilities(&g_parameters, 5, 3);
+  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 3,
+        "known Streamline ceiling caps NGX capability advertising");
+
+  ResetParameters(1, 1, 0);
+  ngx_internal::ApplyCapabilities(&g_parameters, 5, 0);
+  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 5,
+        "direct NGX capability path has no Streamline ceiling");
+
   ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
   g_provider_maintenance_calls = 0;
   NVSDK_NGX_Parameter* output_parameters = nullptr;
@@ -348,8 +375,43 @@ int main() {
   mfgunlock::ngx::g_status.feature_active = false;
   ngx_internal::Evaluate<0>(nullptr, &unrelated, nullptr, nullptr);
   Check(!mfgunlock::ngx::g_status.feature_active.load(), "unrelated Evaluate not marked active");
-  ngx_internal::Evaluate<0>(nullptr, &g_handle, nullptr, nullptr);
+  ID3D12Resource interpolated{};
+  interpolated.desc.Width = 1920;
+  interpolated.desc.Height = 1080;
+  interpolated.desc.Format = 28;
+  NVSDK_NGX_Parameter evaluate_parameters;
+  evaluate_parameters.values["DLSSG.MultiFrameCount"] = 3;
+  evaluate_parameters.values["DLSSG.MultiFrameIndex"] = 2;
+  evaluate_parameters.values["DLSSG.Reset"] = 0;
+  evaluate_parameters.values["DLSSG.AutomodeOverrideReset"] = 0;
+  evaluate_parameters.values["DLSSG.BackbufferFrameID"] = 41;
+  evaluate_parameters.resources["DLSSG.OutputInterpolated"] = &interpolated;
+  g_evaluate_observed.clear();
+  mfgunlock::diagnostic::g_evaluate_callback.store(ObserveEvaluateEvent, std::memory_order_release);
+  ngx_internal::Evaluate<0>(nullptr, &g_handle, &evaluate_parameters, nullptr);
+  mfgunlock::diagnostic::g_evaluate_callback.store(nullptr, std::memory_order_release);
   Check(mfgunlock::ngx::g_status.feature_active.load(), "tracked FG Evaluate marked active");
+  Check(g_evaluate_observed.size() == 2 &&
+            g_evaluate_observed[0].phase == mfgunlock::diagnostic::EvaluatePhase::kBegin &&
+            g_evaluate_observed[1].phase == mfgunlock::diagnostic::EvaluatePhase::kEnd,
+        "tracked Evaluate publishes begin and end only when observer attached");
+  Check(g_evaluate_observed[0].evaluation_id != 0 &&
+            g_evaluate_observed[0].evaluation_id == g_evaluate_observed[1].evaluation_id &&
+            g_evaluate_observed[0].generated_count_known && g_evaluate_observed[0].generated_count == 3 &&
+            g_evaluate_observed[0].generated_index_known && g_evaluate_observed[0].generated_index == 2 &&
+            g_evaluate_observed[0].reset_known && g_evaluate_observed[0].reset == 0 &&
+            g_evaluate_observed[0].automode_reset_known &&
+            g_evaluate_observed[0].automode_reset == 0 &&
+            g_evaluate_observed[0].backbuffer_frame_id_known &&
+            g_evaluate_observed[0].backbuffer_frame_id == 41,
+        "Evaluate observer captures exact DLSS-G count, index, reset state and backbuffer frame id");
+  const auto& output_snapshot = g_evaluate_observed[0].resources[
+      static_cast<size_t>(mfgunlock::diagnostic::ResourceKey::kOutputInterpolated)];
+  Check(output_snapshot.known && output_snapshot.object == reinterpret_cast<uint64_t>(&interpolated) &&
+            output_snapshot.width == 1920 && output_snapshot.height == 1080 && output_snapshot.format == 28,
+        "Evaluate observer snapshots interpolated output metadata");
+  Check(g_evaluate_observed[1].result == static_cast<uint32_t>(g_evaluate_result),
+        "Evaluate observer end preserves real result");
 
   g_release_result = NVSDK_NGX_Result_FAIL_InvalidParameter;
   ngx_internal::Release<0>(&g_handle);
@@ -405,8 +467,11 @@ int main() {
   const auto plugin_module = Module(0x6161);
   mock::paths[plugin_module] = L"X:\\fixture\\sl.dlss_g.dll";
   SetVersion(plugin_module, 2, 12);
+  mfgunlock::streamline::g_on_dlssg_plugin_bound = ObservePlugin;
   Check(streamline_internal::BindPlugin(plugin_module, Proc(RealGateway)) == Proc(RealGateway),
         "plugin binding preserves native gateway pointer");
+  Check(g_plugin_bound_calls == 1 && g_bound_plugin == plugin_module,
+        "plugin binding publishes the active Streamline module");
   auto& plugin = streamline_internal::g_plugins[0];
   Check(plugin.gateway_hook.installed.load(), "plugin gateway detour installed");
   auto gateway = reinterpret_cast<streamline_internal::GatewayFn>(

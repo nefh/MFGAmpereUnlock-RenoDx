@@ -18,3 +18,19 @@ jobs:
         run: cmake --build build.validation
       - name: Test
         run: ctest --test-dir build.validation --output-on-failure
+      - name: Probe self-tests
+        run: |
+          python3 tools/probe_blackwell_temporal.py --self-test
+          python3 tools/probe_intermediate_scatter.py --self-test
+          git diff --check
+
+  windows-small-stack:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S contrib/validation -B build.validation.windows -A x64 -DMFG_NATIVE_STACK_TESTS=ON
+      - name: Build native harness
+        run: cmake --build build.validation.windows --config Release --target small_stack_test
+      - name: Test real Windows stacks
+        run: ctest --test-dir build.validation.windows -C Release -R "^small_stack_" --output-on-failure

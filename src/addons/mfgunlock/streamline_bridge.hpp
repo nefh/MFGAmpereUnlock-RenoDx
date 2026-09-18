@@ -26,6 +26,7 @@ namespace mfgunlock::streamline {
 using provider::GetProviderStatus;
 using provider::Log;
 inline void (*g_on_interposer_loaded)() = nullptr;
+inline void (*g_on_dlssg_plugin_bound)(HMODULE) = nullptr;
 namespace internal {
 inline HMODULE g_self = nullptr;
 inline std::atomic_bool g_shutting_down{false};
@@ -320,6 +321,7 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
       plugin.version = {};
       return original;
     }
+    if (g_on_dlssg_plugin_bound) g_on_dlssg_plugin_bound(module);
     return original;
   }
   Log("DLSS-G plugin limit reached", true);
@@ -413,6 +415,7 @@ inline void Shutdown() {
   internal::g_real_legacy_init = nullptr;
   internal::g_self = nullptr;
   g_on_interposer_loaded = nullptr;
+  g_on_dlssg_plugin_bound = nullptr;
 }
 
 inline void Draw() {

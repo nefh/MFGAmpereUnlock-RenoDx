@@ -82,6 +82,12 @@ int main() {
         "maximum signed limit accepted");
   Check(CapabilityFrameCount(1, static_cast<unsigned int>(INT_MAX) + 1u) == 1,
         "out-of-range limit rejected");
+  Check(CapabilityFrameCount(1, 5, 3) == 3,
+        "Streamline structural ceiling caps an advertised raise");
+  Check(CapabilityFrameCount(5, 5, 3) == 3,
+        "Streamline structural ceiling caps a larger native capability");
+  Check(CapabilityFrameCount(1, 5, 0) == 5,
+        "direct NGX has no artificial Streamline ceiling");
 
   std::printf("PASS capability policy: %u checks\n", g_checks);
 }

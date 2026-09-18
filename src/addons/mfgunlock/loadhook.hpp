@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <atomic>
 #include <cstring>
+#include <string>
 
 #include <include/reshade.hpp>
 
@@ -58,9 +59,10 @@ inline bool NameContains(const wchar_t* path, const wchar_t* needle) {
 inline void Notify(HMODULE module, const wchar_t* path) {
   if (module == nullptr || (reinterpret_cast<uintptr_t>(module) & 3u) != 0) return;
   // Resolve basename-only and OTA loads before classifying the image.
-  wchar_t resolved_path[32768] = {};
-  const DWORD length = GetModuleFileNameW(module, resolved_path, ARRAYSIZE(resolved_path));
-  if (length != 0 && length < ARRAYSIZE(resolved_path)) path = resolved_path;
+  std::wstring resolved_path(32768, L'\0');
+  const DWORD length = GetModuleFileNameW(
+      module, resolved_path.data(), static_cast<DWORD>(resolved_path.size()));
+  if (length != 0 && length < resolved_path.size()) path = resolved_path.c_str();
   if (g_on_dlssg_loaded && (NameContains(path, kNeedle) || NameContains(path, kOtaNeedle))) {
     g_on_dlssg_loaded(module);
   }

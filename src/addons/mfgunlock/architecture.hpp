@@ -62,6 +62,14 @@ inline constexpr const char* Name(Architecture value) {
   }
 }
 
+inline constexpr bool SupportsDynamicMfg(Architecture value) {
+  return value == Architecture::kAmpere || value == Architecture::kTuring;
+}
+
+inline constexpr bool SupportsQualityBackport(Architecture value) {
+  return value == Architecture::kAmpere || value == Architecture::kTuring;
+}
+
 inline bool EqualsInsensitive(std::string_view a, std::string_view b) {
   if (a.size() != b.size()) return false;
   for (size_t i = 0; i < a.size(); ++i) {

@@ -95,6 +95,7 @@ struct Image {
     std::copy(payload.begin(), payload.end(), fatbin.begin() + 80);
     std::copy(fatbin.begin(), fatbin.end(), bytes.begin() + 0x2000);
 
+    std::memcpy(bytes.data() + 0x2f00, "dlfg_kernel", 12);
     mock::regions.push_back({module, bytes.size()});
     mock::paths[module] = "X:\\fixture\\provider_" + std::to_string(id) + "\\nvngx_dlssg.dll";
     mock::exports[{module, "NVSDK_NGX_GetGPUArchitecture"}] =
@@ -138,6 +139,35 @@ bool Allowed() {
 
 int main() {
   try {
+    Reset();
+    // Same version and valid-looking architecture exports are insufficient.
+    for (const char* name : {"nvngx_dlss.dll", "nvngx_dlssd.dll", "nvngx_dlssnr.dll",
+                             "nvngx_deepdvc.dll", "nvngx_dlssg.dll", "renamed.dll"}) {
+      Image sibling(0x6a986031);
+      mock::paths[sibling.module] = std::string("X:\\fixture\\") + name;
+      std::memset(sibling.bytes.data() + 0x2f00, 0, 12);
+      const auto before = sibling.bytes;
+      Check(!provider::IsDlssgProvider(sibling.module), "sibling identity rejected regardless of filename");
+      Check(!provider::PrepareProvider(sibling.module), "sibling preparation rejected");
+      Check(sibling.bytes == before && mock::protection_calls == 0,
+            "same-version sibling is never written");
+      sibling.Unmap();
+    }
+    Reset();
+    Image renamed(0x6a986031);
+    mock::paths[renamed.module] = "X:\\fixture\\renamed-provider.dll";
+    Check(provider::IsDlssgProvider(renamed.module), "genuine renamed provider identity accepted");
+    Check(provider::PrepareProvider(renamed.module), "genuine renamed provider qualified");
+    provider::Restore();
+    Reset();
+    Image modern(0x6a986031);
+    std::memset(modern.bytes.data() + 0x2f00, 0, 128);
+    std::strcpy(reinterpret_cast<char*>(modern.bytes.data() + 0x2f00), "Kernel_EstimateIntermMvecsScatter");
+    Check(!provider::IsDlssgProvider(modern.module), "one modern symbol is not enough");
+    std::strcpy(reinterpret_cast<char*>(modern.bytes.data() + 0x2f40), "Kernel_OutputPull");
+    Check(provider::IsDlssgProvider(modern.module), "renamed modern DLSS-G kernel family accepted");
+    Check(provider::PrepareProvider(modern.module), "modern identity passes existing provider qualification");
+    provider::Restore();
     Reset();
     Image ready(1);
     const auto original = ready.bytes;

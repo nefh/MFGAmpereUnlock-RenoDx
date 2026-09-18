@@ -36,31 +36,50 @@ using HookItem = std::tuple<const char*, void**, void*>;
 
 namespace internal {
 
-// Every thread in this process except the caller.
-inline std::vector<HANDLE> OpenOtherThreads() {
-  std::vector<HANDLE> threads;
+inline void CloseThreads(const std::vector<HANDLE>& threads) {
+  for (HANDLE thread : threads) CloseHandle(thread);
+}
+
+// A failed snapshot/access check is not an empty process. Only a thread which
+// exited between enumeration and OpenThread may be omitted.
+inline bool OpenOtherThreads(std::vector<HANDLE>& threads) {
   const DWORD pid = GetCurrentProcessId();
   const DWORD self = GetCurrentThreadId();
-  HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-  if (snap == INVALID_HANDLE_VALUE) return threads;
-
-  THREADENTRY32 te = {};
-  te.dwSize = sizeof(te);
-  if (Thread32First(snap, &te)) {
-    do {
-      if (te.dwSize < FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID)
-                          + sizeof(te.th32OwnerProcessID)) {
-        continue;
-      }
-      if (te.th32OwnerProcessID != pid) continue;
-      if (te.th32ThreadID == self) continue;
-      HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
-                            FALSE, te.th32ThreadID);
-      if (h != nullptr) threads.push_back(h);
-    } while (Thread32Next(snap, &te));
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if (snapshot == INVALID_HANDLE_VALUE) return false;
+  THREADENTRY32 entry = {};
+  entry.dwSize = sizeof(entry);
+  BOOL present = Thread32First(snapshot, &entry);
+  bool ok = present || GetLastError() == ERROR_NO_MORE_FILES;
+  while (present && ok) {
+    if (entry.dwSize < FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) +
+                           sizeof(entry.th32OwnerProcessID)) {
+      ok = false;
+      break;
+    }
+    if (entry.th32OwnerProcessID == pid && entry.th32ThreadID != self) {
+      HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                    THREAD_SET_CONTEXT, FALSE, entry.th32ThreadID);
+      if (thread != nullptr) threads.push_back(thread);
+      else if (GetLastError() != ERROR_INVALID_PARAMETER) ok = false;
+    }
+    entry.dwSize = sizeof(entry);
+    present = Thread32Next(snapshot, &entry);
+    if (!present && GetLastError() != ERROR_NO_MORE_FILES) ok = false;
   }
-  CloseHandle(snap);
-  return threads;
+  CloseHandle(snapshot);
+  if (!ok) {
+    CloseThreads(threads);
+    threads.clear();
+  }
+  return ok;
+}
+
+inline bool EnlistThreads(const std::vector<HANDLE>& threads) {
+  bool ok = DetourUpdateThread(GetCurrentThread()) == NO_ERROR;
+  for (HANDLE thread : threads)
+    if (DetourUpdateThread(thread) != NO_ERROR) ok = false;
+  return ok;
 }
 
 }  // namespace internal
@@ -87,18 +106,17 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
     resolved.emplace_back(real, replacement, reinterpret_cast<void*>(proc));
   }
 
-  if (DetourTransactionBegin() != NO_ERROR) return false;
+  std::vector<HANDLE> threads;
+  if (!internal::OpenOtherThreads(threads)) return false;
+  if (DetourTransactionBegin() != NO_ERROR) {
+    internal::CloseThreads(threads);
+    return false;
+  }
   // Publish only after every export has been resolved. A missing optional
   // export must not leave an unhooked address looking like an installed hook.
   for (auto& [real, replacement, address] : resolved) *real = address;
 
-  auto threads = internal::OpenOtherThreads();
-  bool threads_ok = true;
-  for (HANDLE h : threads) {
-    if (DetourUpdateThread(h) != NO_ERROR) threads_ok = false;
-  }
-  if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) threads_ok = false;
-
+  const bool threads_ok = internal::EnlistThreads(threads);
   if (!threads_ok) {
     DetourTransactionAbort();
     for (HANDLE h : threads) CloseHandle(h);
@@ -138,17 +156,21 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
   return true;
 }
 
-// Mirror of Install. Best-effort: used only on process detach.
+// Explicit teardown only. Process termination leaves cleanup to the OS.
 inline void Uninstall(const std::vector<HookItem>& hooks) {
-  if (DetourTransactionBegin() != NO_ERROR) return;
-  auto threads = internal::OpenOtherThreads();
-  for (HANDLE h : threads) DetourUpdateThread(h);
-  DetourUpdateThread(GetCurrentThread());
-  for (const auto& [name, real, replacement] : hooks) {
-    if (*real != nullptr) DetourDetach(real, replacement);
+  std::vector<HANDLE> threads;
+  if (!internal::OpenOtherThreads(threads)) return;
+  if (DetourTransactionBegin() != NO_ERROR) {
+    internal::CloseThreads(threads);
+    return;
   }
-  if (DetourTransactionCommit() != NO_ERROR) DetourTransactionAbort();
-  for (HANDLE h : threads) CloseHandle(h);
+  bool ok = internal::EnlistThreads(threads);
+  for (const auto& [name, real, replacement] : hooks) {
+    if (ok && *real != nullptr && DetourDetach(real, replacement) != NO_ERROR) ok = false;
+  }
+  if (ok) DetourTransactionCommit();
+  else DetourTransactionAbort();
+  internal::CloseThreads(threads);
 }
 
 // Hook native entries so callers keep the original function address.
@@ -276,37 +298,39 @@ inline bool InstallAddress(AddressHook& state, void* target, void* replacement,
   if (!CaptureModule(reinterpret_cast<HMODULE>(memory.AllocationBase), identity)) return false;
 
   void* trampoline = target;
-  if (DetourTransactionBegin() != NO_ERROR) return false;
-  auto threads = internal::OpenOtherThreads();
-  bool threads_ok = true;
-  for (HANDLE thread : threads) {
-    if (DetourUpdateThread(thread) != NO_ERROR) threads_ok = false;
+  std::vector<HANDLE> threads;
+  if (!internal::OpenOtherThreads(threads)) return false;
+  if (DetourTransactionBegin() != NO_ERROR) {
+    internal::CloseThreads(threads);
+    return false;
   }
-  if (DetourUpdateThread(GetCurrentThread()) != NO_ERROR) threads_ok = false;
-  if (!threads_ok) {
+  if (!internal::EnlistThreads(threads)) {
     DetourTransactionAbort();
-    for (HANDLE thread : threads) CloseHandle(thread);
-    reshade::log::message(
-        reshade::log::level::error,
-        "mfgunlock::hook: address hook setup failed.");
+    internal::CloseThreads(threads);
     return false;
   }
 
-  const bool attached = DetourAttach(&trampoline, replacement) == NO_ERROR;
+  PDETOUR_TRAMPOLINE prepared = nullptr;
+  const bool attached = DetourAttachEx(&trampoline, replacement, &prepared, nullptr, nullptr) == NO_ERROR;
+  if (attached) {
+    state.identity = identity;
+    state.target.store(target, std::memory_order_release);
+    state.replacement.store(replacement, std::memory_order_release);
+    // Commit resumes target threads before returning. Publish the prepared
+    // trampoline first so a newly entered callback never sees a null original.
+    state.trampoline.store(reinterpret_cast<void*>(prepared), std::memory_order_release);
+  }
   const LONG commit = attached ? DetourTransactionCommit() : ERROR_INVALID_OPERATION;
   if (!attached) DetourTransactionAbort();
-  for (HANDLE thread : threads) CloseHandle(thread);
+  internal::CloseThreads(threads);
   if (!attached || commit != NO_ERROR) {
+    ClearAddressState(state);
     std::stringstream message;
     message << "mfgunlock::hook: failed to hook " << label << ".";
     reshade::log::message(reshade::log::level::error, message.str().c_str());
     return false;
   }
 
-  state.identity = identity;
-  state.target.store(target, std::memory_order_release);
-  state.replacement.store(replacement, std::memory_order_release);
-  state.trampoline.store(trampoline, std::memory_order_release);
   state.installed.store(true, std::memory_order_release);
   return true;
 }
@@ -331,11 +355,18 @@ inline void UninstallAddress(AddressHook& state) {
 
   void* trampoline = state.trampoline.load(std::memory_order_acquire);
   void* replacement = state.replacement.load(std::memory_order_acquire);
-  if (!trampoline || !replacement || DetourTransactionBegin() != NO_ERROR) return;
-
-  auto threads = internal::OpenOtherThreads();
-  for (HANDLE thread : threads) DetourUpdateThread(thread);
-  DetourUpdateThread(GetCurrentThread());
+  if (!trampoline || !replacement) return;
+  std::vector<HANDLE> threads;
+  if (!internal::OpenOtherThreads(threads)) return;
+  if (DetourTransactionBegin() != NO_ERROR) {
+    internal::CloseThreads(threads);
+    return;
+  }
+  if (!internal::EnlistThreads(threads)) {
+    DetourTransactionAbort();
+    internal::CloseThreads(threads);
+    return;
+  }
   const bool detached = DetourDetach(&trampoline, replacement) == NO_ERROR;
   const LONG commit = detached ? DetourTransactionCommit() : ERROR_INVALID_OPERATION;
   if (!detached) DetourTransactionAbort();

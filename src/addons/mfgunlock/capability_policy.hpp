@@ -51,11 +51,17 @@ inline bool CanExposeArchitecture(bool enabled, bool fg_requirements_scope, bool
          same_physical_gpu && provider_ready && nvapi_result == 0;
 }
 
-// Counts are generated frames, not presentation multipliers. Never reduce a
-// larger native capability or invent a value for an invalid one.
-inline int CapabilityFrameCount(int reported, unsigned int limit) {
+// Counts are generated frames, not presentation multipliers. A nonzero
+// structural ceiling is authoritative for Streamline; direct NGX leaves it 0.
+inline int CapabilityFrameCount(int reported, unsigned int limit,
+                                unsigned int structural_ceiling = 0) {
   if (reported < 0 || limit == 0 || limit > static_cast<unsigned int>(INT_MAX)) return reported;
-  return reported < static_cast<int>(limit) ? static_cast<int>(limit) : reported;
+  int wanted = reported < static_cast<int>(limit) ? static_cast<int>(limit) : reported;
+  if (structural_ceiling == 0 || structural_ceiling > static_cast<unsigned int>(INT_MAX))
+    return wanted;
+  return wanted > static_cast<int>(structural_ceiling)
+      ? static_cast<int>(structural_ceiling)
+      : wanted;
 }
 
 

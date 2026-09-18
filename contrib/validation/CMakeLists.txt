@@ -25,7 +25,7 @@ if(NOT WIN32)
     configure_file("${header}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   foreach(name architecture.hpp streamline_bridge.hpp ngx_bridge.hpp capability_policy.hpp
-               framecount.hpp ui_candidate.hpp)
+               framecount.hpp ui_candidate.hpp count_observer.hpp diagnostic_bridge.hpp quality_config.hpp)
     configure_file("${REPO_ROOT}/src/addons/mfgunlock/${name}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/quality_guard.hpp"
@@ -33,6 +33,10 @@ if(NOT WIN32)
   add_executable(host_wrappers_test "${TEST_ROOT}/host_wrappers_test.cpp")
   target_include_directories(host_wrappers_test PRIVATE "${mock_dir}")
   add_test(NAME host_wrappers_test COMMAND host_wrappers_test)
+
+  add_executable(runtime_settings_test "${TEST_ROOT}/runtime_settings_test.cpp")
+  target_include_directories(runtime_settings_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME runtime_settings_test COMMAND runtime_settings_test)
 
   add_executable(framecount_profile_test "${TEST_ROOT}/framecount_profile_test.cpp")
   target_include_directories(framecount_profile_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
@@ -80,3 +84,58 @@ target_include_directories(temporal_runtime_test PRIVATE "${TEST_ROOT}/provider_
 add_test(NAME temporal_runtime_test COMMAND temporal_runtime_test)
 
 add_executable(inspect_provider "${CMAKE_CURRENT_SOURCE_DIR}/tools/inspect_provider.cpp")
+
+add_executable(lifecycle_test "${TEST_ROOT}/lifecycle_test.cpp")
+target_include_directories(lifecycle_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME lifecycle_test COMMAND lifecycle_test)
+
+add_executable(hook_lifecycle_test "${TEST_ROOT}/hook_lifecycle_test.cpp")
+target_include_directories(hook_lifecycle_test PRIVATE "${TEST_ROOT}/hook_mocks" "${TEST_ROOT}/provider_mocks")
+add_test(NAME hook_lifecycle_test COMMAND hook_lifecycle_test)
+
+add_executable(mfg_probe_test "${TEST_ROOT}/mfg_probe_test.cpp")
+target_include_directories(mfg_probe_test PRIVATE "${TEST_ROOT}/probe_mocks" "${TEST_ROOT}/hook_mocks"
+                                                 "${TEST_ROOT}/provider_mocks")
+add_test(NAME mfg_probe_test COMMAND mfg_probe_test)
+
+add_executable(diagnostics_timeline_test "${TEST_ROOT}/diagnostics_timeline_test.cpp")
+add_test(NAME diagnostics_timeline_test COMMAND diagnostics_timeline_test)
+
+add_executable(diagnostics_trace_test "${TEST_ROOT}/diagnostics_trace_test.cpp")
+target_include_directories(diagnostics_trace_test PRIVATE "${TEST_ROOT}/diagnostics_mocks")
+add_test(NAME diagnostics_trace_test COMMAND diagnostics_trace_test)
+
+option(MFG_NATIVE_STACK_TESTS "Exercise production preflight with real Windows/Detours on small stacks" OFF)
+set(MFG_DETOURS_SOURCE_DIR "" CACHE PATH "Optional local Microsoft Detours source tree (contains src/detours.h)")
+if(MFG_NATIVE_STACK_TESTS)
+  if(NOT WIN32 OR NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "MFG_NATIVE_STACK_TESTS requires Windows x64 and MSVC")
+  endif()
+  if(NOT MFG_DETOURS_SOURCE_DIR)
+    include(FetchContent)
+    FetchContent_Declare(mfg_detours
+      GIT_REPOSITORY https://github.com/microsoft/Detours.git
+      GIT_TAG v4.0.1
+      GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(mfg_detours)
+    set(MFG_DETOURS_SOURCE_DIR "${mfg_detours_SOURCE_DIR}")
+  endif()
+  set(detours_files detours modules disasm image creatwth disolx86 disolx64 disolia64 disolarm disolarm64)
+  set(detours_sources "")
+  foreach(file IN LISTS detours_files)
+    list(APPEND detours_sources "${MFG_DETOURS_SOURCE_DIR}/src/${file}.cpp")
+  endforeach()
+  add_library(stack_detours STATIC ${detours_sources})
+  target_include_directories(stack_detours PUBLIC "${MFG_DETOURS_SOURCE_DIR}/src")
+  target_compile_definitions(stack_detours PRIVATE WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+  target_compile_options(stack_detours PRIVATE /Zc:gotoScope-)
+  add_executable(small_stack_test "${TEST_ROOT}/small_stack_test.cpp")
+  target_include_directories(small_stack_test PRIVATE "${TEST_ROOT}/native_stack")
+  target_compile_definitions(small_stack_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+  target_compile_options(small_stack_test PRIVATE /W4 /permissive- /EHsc)
+  target_link_libraries(small_stack_test PRIVATE stack_detours)
+  foreach(kib IN ITEMS 64 128)
+    add_test(NAME small_stack_${kib} COMMAND small_stack_test ${kib})
+    set_tests_properties(small_stack_${kib} PROPERTIES TIMEOUT 25)
+  endforeach()
+endif()

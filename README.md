@@ -42,14 +42,22 @@ binaries are redistributed.**
 
 ### Dynamic MFG and Validated Warp Blend
 
-- Both features are for **Ampere (RTX 30)**; Turing keeps the fixed MFG path.
-- **Dynamic MFG** lets NVIDIA vary the multiplier toward the selected output FPS.
-  Use D3D12, Streamline **2.14.1**, DLSS-G **310.9.1** and driver **595.41+**.
-  Enable it in MFG Unlock and toggle Frame Generation off/on if needed.
-- **Validated Warp Blend** is an Ampere quality patch for DLSS-G **310.9.1**.
-  Enable it and restart the game.
-- Advanced/debug exposes Warp diagnostic modes; normal use stays on
-  **Validated Warp sm_86**.
+- **Dynamic MFG** is available on **Ampere (RTX 30)** and **Turing (RTX 20)** with
+  the supported Streamline/DLSS-G stack. NVIDIA varies the multiplier toward the
+  selected output FPS.
+- **Validated Warp Blend** improves later-stage reprojection on RTX 20/30 with
+  DLSS-G **310.9.1**. Enable it and restart the game.
+- Advanced/debug contains Warp diagnostic modes; normal use stays on
+  **Validated Warp**.
+
+### Intermediate Scatter Retention and Boundary Artifact Mitigation
+
+- **Intermediate Scatter Retention** improves preservation of thin geometry and
+  small moving details in generated frames on RTX 20/30 with DLSS-G **310.9.1**.
+- **Boundary Artifact Mitigation** controls how ISR behaves near object edges.
+  **Off** keeps the `0.10-pre1` ISR behavior; **Balanced** and **Aggressive** add
+  progressively stronger boundary handling.
+- ISR, Boundary and Warp quality changes require a game restart.
 
 ### Frame Generation Presets A/B
 
@@ -64,12 +72,13 @@ binaries are redistributed.**
 
 - **Automatic UI Composition** is enabled by default on SDR and keeps the native
   HUD-less path when no usable UI buffer is available.
-- **Inject detected UI Color+Alpha (experimental)** is available under
-  advanced/debug for D3D12 games that do not provide a Streamline UI tag.
+- **Inject detected UI Color+Alpha** is enabled by default for D3D12 games that
+  do not provide a Streamline UI tag. If no usable target is available, the
+  native HUD-less path is preserved.
 - Dialog/menu UI-target changes are reacquired automatically and transient tag
   failures are retried instead of disabling UIR for the session.
-- If UI composition looks wrong, disable the experimental injection; Automatic
-  UI Composition can stay enabled.
+- If UI composition looks wrong, disable UI Color+Alpha injection; Automatic UI
+  Composition can stay enabled.
 
 ## Tested Games
 
@@ -124,7 +133,7 @@ binaries are redistributed.**
 - ReShade with addon support.
 - A game with NVIDIA DLSS Frame Generation through Streamline or NGX.
 - A recent `nvngx_dlssg.dll` when 3x/4x/6x MFG is unavailable.
-- For Dynamic MFG on Ampere: Direct3D 12, Streamline 2.14.1, DLSS 310.9.1, and
+- For Dynamic MFG on Ampere or Turing: Direct3D 12, Streamline 2.14.1, DLSS 310.9.1, and
   NVIDIA driver 595.41 or newer.
 
 ## Vulkan
@@ -158,29 +167,38 @@ MFG settings.
 
 Settings use `[RenoDX.MFGUnlock]` in `ReShade.ini`.
 
+Most multiplier, Dynamic MFG and UI controls can update while the game is running.
+If a safe update point is unavailable, toggle Frame Generation off and on in the
+in-game menu. Preset A/B is shown as applied only after the provider reports it.
+Temporal Fix, ISR, Boundary and Warp changes require a game restart.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `Enabled` | `1` | Enables the addon |
 | `Architecture` | `Auto` | `Auto`, `Ada`, `Ampere`, or `Turing` |
 | `MaxCount` | `4` | Reported `DLSSG.MultiFrameCountMax` |
-| `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` forces that exact multiplier |
-| `DynamicMFG` | `0` | Enables native Dynamic MFG on Ampere; takes priority over `ForceMultiplier` |
+| `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` requests that multiplier within the active Streamline structural limit |
+| `DynamicMFG` | `0` | Enables native Dynamic MFG on Ampere/Turing when the runtime reports support; takes priority over `ForceMultiplier` |
 | `DynamicTargetFPS` | `0` | Dynamic output target; `0` follows display refresh |
-| `ValidatedWarpBlend` | `0` | Ampere quality patch for DLSS-G 310.9.1; restart required |
+| `IntermediateScatterRetention` | `0` | Preserves thin-geometry motion on RTX 20/30 with exact DLSS-G 310.9.1; restart required |
+| `BoundaryArtifactMitigationMode` | `0` | `0` keeps the `0.10-pre1` ISR behavior; `1` Balanced, `2` Aggressive; restart required |
+| `ValidatedWarpBlend` | `0` | Validated Warp quality path for RTX 20/30 with exact DLSS-G 310.9.1; restart required |
 | `ShowDebugOptions` | `0` | Shows diagnostic and advanced compatibility controls |
-| `WarpDiagnosticMode` | `2` | `0` relocation control, `1` baseline rebuild, `2` normal Warp; modes 0/1 require `ShowDebugOptions=1` |
+| `WarpDiagnosticMode` | `2` | `0` relocation control, `1` baseline rebuild, `2` normal Warp; advanced/debug only changes visibility |
 | `FrameGenerationPreset` | `0` | `0` application/driver default, `1` A, `2` B; supported 310.9.1 build only |
 | `UIComposition` | `1` | Automatic guarded UI recomposition on SDR |
-| `UICandidateInjection` | `0` | Experimental D3D12 UI Color+Alpha injection; requires `ShowDebugOptions=1` |
+| `UICandidateInjection` | `1` | Automatic guarded D3D12 UI Color+Alpha injection |
 | `TemporalFix` | `1` | Corrects generated-frame temporal positions |
 | `ForceFlipMeteringOff` | `0` | Legacy software pacing fallback |
-| `RaiseFrameCeiling` | `0` | Raises an old Streamline plugin's compiled limit to 6x |
 | `RuntimeSelectionMode` | `0` | `0` keeps the game policy, `1` prefers local Streamline plugins, `2` forces NVIDIA OTA flags |
 
-Hidden diagnostic Warp modes in old configurations are migrated to mode `2`
-before provider preparation. Hiding advanced options does not reset existing
-compatibility values such as `TemporalFix`, `MaxCount`, `ForceFlipMeteringOff`,
-`RaiseFrameCeiling`, `Architecture` or `RuntimeSelectionMode`.
+Advanced/debug is presentation-only. Hiding it does not rewrite Warp mode, UI
+injection, `TemporalFix`, `MaxCount`, `ForceFlipMeteringOff`, `Architecture` or
+`RuntimeSelectionMode`.
+
+When updating from `0.10-pre1`, an existing `IntermediateScatterRetention=1`
+configuration without a boundary setting keeps the previous ISR behavior until
+**Balanced** or **Aggressive** is selected.
 
 ## Troubleshooting
 
@@ -207,7 +225,7 @@ compatibility values such as `TemporalFix`, `MaxCount`, `ForceFlipMeteringOff`,
 
 - Dialog/menu changes should be reacquired automatically after a short handover.
 - If UIR does not return or UI artifacts appear, disable **Inject detected UI
-  Color+Alpha (experimental)**. Automatic UI Composition can remain enabled.
+  Color+Alpha**. Automatic UI Composition can remain enabled.
 
 ### 3x/4x freezes or pacing becomes unusable
 
@@ -238,16 +256,20 @@ selected architecture:
    Frame Generation as available for the selected GPU.
 6. At higher MFG multipliers, the temporal fix preserves a distinct intended
    temporal position for each generated frame.
-7. On Ampere D3D12 with the supported Streamline/DLSS-G stack, Dynamic MFG
+7. On Ampere/Turing D3D12 with the supported Streamline/DLSS-G stack, Dynamic MFG
    requests NVIDIA's native `DLSSGMode::eDynamic`; NVIDIA selects the multiplier
    and owns pacing.
 8. For DLSS-G 310.9.1, Validated Warp Blend ports the MFGAdaUnlock quality path
-   to Ampere and checks later-stage reprojection candidates before blending.
+   to Ampere/Turing and checks later-stage reprojection candidates before blending.
 9. Automatic UI Composition keeps native HUD-less fallback when a usable UI
    partner is unavailable; advanced injection can supply a detected D3D12 UI
    Color+Alpha target and recover across short UI-target handovers.
 
 Unknown provider layouts are left untouched.
+
+Detailed regression and architecture qualification notes live under
+[`contrib/validation`](contrib/validation/README.md), including the RTX 20 / SM75
+compatibility path.
 
 ## Building
 
@@ -271,6 +293,10 @@ Remove-Item Env:CL
 Output: `build.vs/Release/renodx-mfgunlock.addon64`
 
 Prebuilt binaries are attached to [Releases](../../releases).
+
+For development, the separate `mfgdiagnostics` addon records Streamline/NGX
+activity without changing it. Keep diagnostics disabled for performance tests.
+See [validation](contrib/validation/README.md) for regression and capture tooling.
 
 ## Credits
 
@@ -296,7 +322,7 @@ Prebuilt binaries are attached to [Releases](../../releases).
 - Tony Joaca, author of DLSSG-Transfusion, publicly identified
   `Kernel_BlendCandidatesFused` as the useful intervention point behind the
   `qualityValidWarp` option. That public research informed MFGAdaUnlock's
-  Validated Warp Blend path, which this repository ports to Ampere.
+  Validated Warp Blend path, which this repository ports to Ampere and Turing.
 - Special thanks to [Coldwood1026](https://github.com/Coldwood1026) for sharing
   `ptx_out.zip` with the DLSS-G PTX and demonstrating successful cubin
   compilation for SM 8.6 and SM 7.5, providing the starting point for the

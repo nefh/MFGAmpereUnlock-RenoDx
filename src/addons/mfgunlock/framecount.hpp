@@ -5,8 +5,8 @@
  * Capability advertising and request forcing are separate. Hosts with a native
  * multiplier selector only need the verified maximum exposed through GetState;
  * hosts with an on/off control can optionally have numFramesToGenerate raised
- * at slDLSSGSetOptions. The caller-owned options structure is always restored
- * before returning.
+ * at slDLSSGSetOptions. Modified requests use addon-owned storage; the
+ * caller-owned options structure is never written.
  */
 
 #pragma once
@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <type_traits>
 #include <utility>
@@ -30,28 +31,56 @@
 
 #include "./architecture.hpp"
 #include "./ngx_hook.hpp"
+#include "./count_observer.hpp"
+#include "./diagnostic_bridge.hpp"
+#include <optional>
 #include "./quality_guard.hpp"
 #include "./ui_candidate.hpp"
 
 namespace mfgunlock::framecount {
 
+enum class FixedOverrideStatus : unsigned int {
+  kNative = 0,
+  kPending,
+  kApplied,
+  kAppliedAfterRetry,
+  kAlreadyMatched,
+  kRejectedNativeFallback,
+  kBlockedBackend,
+  kBlockedPacing,
+  kBlockedStructuralCeiling,
+  kUnknownStructuralCeiling,
+  kUnknownOptionsAbi,
+  kNativeRejected,
+  kFallbackRejected,
+};
+
 // 0 = leave the game's request alone. 2..6 = force that total multiplier.
 inline std::atomic<unsigned int> g_force_multiplier{0};
 inline std::atomic_bool g_feature_function_hooked{false};
+inline std::atomic<uint64_t> g_options_revision{1};
+inline std::atomic<uint64_t> g_options_cache_epoch{1};
+inline std::atomic<uint32_t> g_present_thread{0};
+inline void NotifyLiveOptionsChanged() {
+  g_options_revision.fetch_add(1, std::memory_order_release);
+}
 inline std::atomic_bool g_init_hooked{false};
-inline std::atomic_bool g_intercepted{false};
+inline std::atomic<FixedOverrideStatus> g_fixed_override_status{FixedOverrideStatus::kNative};
 inline std::atomic<unsigned int> g_last_requested{0};
-inline std::atomic<unsigned int> g_last_forced{0};
+inline std::atomic<unsigned int> g_last_effective_generated{0};
 inline std::atomic_bool g_declined_no_pacing{false};
 inline std::atomic<unsigned int> g_force_failed_for{0};
+inline std::atomic<unsigned int> g_ceiling_blocked_for{0};
+inline std::atomic_bool g_unknown_ceiling_logged{false};
+inline std::atomic_bool g_unknown_fixed_abi_logged{false};
 inline std::atomic_bool g_state_seen{false};
 inline std::atomic<unsigned int> g_dlssg_status{0};
 inline std::atomic_bool g_failure_status_logged{false};
 
-// Published by addon.cpp after the active Streamline wrapper's pacing and hard
-// ceiling have been verified. Native multiplier selectors may read this value
-// from DLSSGState rather than from the NGX parameter block.
-inline std::atomic<unsigned int> g_advertised_max_generated{0};
+// Zero means no Streamline plugin is active or its structural ceiling is not
+// known yet. Direct NGX intentionally leaves this at zero.
+inline std::atomic_bool g_streamline_plugin_seen{false};
+inline std::atomic<unsigned int> g_streamline_max_generated{0};
 inline std::atomic_bool g_capacity_advertised{false};
 inline std::atomic<unsigned int> g_runtime_max_generated{0};
 
@@ -94,10 +123,11 @@ inline std::atomic<unsigned long long> g_ui_optional_tags_suppressed{0};
 inline std::atomic_bool g_ui_tag_batch_too_large{false};
 inline std::atomic_bool g_ui_viewport_capacity_exhausted{false};
 
-// UI resource discovery is always observational. Injection is an explicit
-// advanced opt-in because metadata cannot prove premultiplied UI pixels.
-inline std::atomic_bool g_ui_candidate_injection_enabled{false};
+// UI resource discovery is observational. Automatic injection is enabled by
+// default, but still fails closed unless the candidate passes every metadata gate.
+inline std::atomic_bool g_ui_candidate_injection_enabled{true};
 inline std::atomic_bool g_ui_candidate_active{false};
+inline std::atomic_bool g_ui_candidate_ready{false};
 inline std::atomic<uint32_t> g_ui_candidate_format{0};
 inline std::atomic_bool g_ui_candidate_options_synced{false};
 inline std::atomic_bool g_ui_candidate_runtime_declined{false};
@@ -170,6 +200,16 @@ inline SetOptionsFn g_real_set_options = nullptr;
 inline GetStateFn g_real_get_state = nullptr;
 inline hook::AddressHook g_set_options_entry;
 inline hook::AddressHook g_get_state_entry;
+
+inline SetOptionsFn RealSetOptions() {
+  const auto entry = g_set_options_entry.Original<SetOptionsFn>();
+  return entry ? entry : g_real_set_options;
+}
+
+inline GetStateFn RealGetState() {
+  const auto entry = g_get_state_entry.Original<GetStateFn>();
+  return entry ? entry : g_real_get_state;
+}
 inline std::atomic_bool g_entry_shutting_down{false};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
@@ -179,8 +219,29 @@ inline SetConstantsFn g_real_set_constants = nullptr;
 inline std::vector<hook::HookItem> g_ui_hooks;
 inline std::atomic_bool g_ui_hooks_installed{false};
 
+inline bool KnownOptionsAbi(const sl::DLSSGOptions& options) {
+  return options.structType == sl::DLSSGOptions::s_structType &&
+         options.structVersion >= sl::kStructVersion1 &&
+         options.structVersion <= sl::kStructVersion5;
+}
+
+inline bool SetFixedOverrideState(FixedOverrideStatus status, unsigned int requested,
+                                  unsigned int effective) {
+  const auto previous_status = g_fixed_override_status.exchange(status, std::memory_order_relaxed);
+  const unsigned int previous_requested =
+      g_last_requested.exchange(requested, std::memory_order_relaxed);
+  const unsigned int previous_effective =
+      g_last_effective_generated.exchange(effective, std::memory_order_relaxed);
+  return previous_status != status || previous_requested != requested ||
+         previous_effective != effective;
+}
+
 inline bool DynamicStackReady() {
-  return g_dynamic_d3d12.load(std::memory_order_relaxed) &&
+  const auto* profile = architecture::ActiveProfile();
+  return profile && architecture::SupportsDynamicMfg(profile->architecture) &&
+         g_dynamic_d3d12.load(std::memory_order_relaxed) &&
+         g_streamline_plugin_seen.load(std::memory_order_acquire) &&
+         g_streamline_max_generated.load(std::memory_order_acquire) != 0 &&
          g_dynamic_stack_ready != nullptr && g_dynamic_stack_ready();
 }
 
@@ -197,6 +258,7 @@ inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result
   const bool previous = g_dynamic_supported.exchange(supported, std::memory_order_acq_rel);
   const bool seen = g_dynamic_support_seen.exchange(true, std::memory_order_release);
   if (!seen || previous != supported) {
+    if (g_dynamic_mfg_enabled.load(std::memory_order_relaxed)) NotifyLiveOptionsChanged();
     reshade::log::message(
         reshade::log::level::info,
         supported
@@ -209,6 +271,16 @@ inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result
 constexpr uint32_t kUnusedViewport = (std::numeric_limits<uint32_t>::max)();
 
 struct UiViewportState {
+  // Only SetOptions calls are serialized here, never provider maintenance or
+  // Evaluate. Automatic submission uses try_lock on the observed native thread.
+  std::recursive_mutex options_lock;
+  sl::DLSSGOptions native_options{};
+  bool native_options_valid = false;
+  bool options_in_call = false;
+  uint32_t options_thread = 0;
+  uint64_t attempted_revision = 0;
+  uint64_t cache_epoch = 0;
+  const void* options_entry = nullptr;
   SRWLOCK lock = SRWLOCK_INIT;
   std::atomic<uint32_t> key{kUnusedViewport};
   std::atomic_bool options_seen{false};
@@ -339,11 +411,20 @@ inline qualityguard::OutputDescription ExpectedUiOutput(const UiViewportState* s
 
 inline void UpdateUiCandidateFormat(uint32_t format) {
   if (format == 0) return;
+  const bool was_ready = g_ui_candidate_ready.exchange(true, std::memory_order_acq_rel);
   const uint32_t previous = g_ui_candidate_format.exchange(
       format, std::memory_order_acq_rel);
-  if (previous != format) {
+  if (!was_ready || previous != format) {
     g_ui_candidate_options_synced.store(false, std::memory_order_release);
+    NotifyLiveOptionsChanged();
   }
+}
+
+inline void NotifyUiCandidateUnavailable() {
+  g_ui_candidate_ready.store(false, std::memory_order_release);
+  g_ui_candidate_format.store(0, std::memory_order_release);
+  g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  g_ui_candidate_options_synced.store(false, std::memory_order_release);
 }
 
 inline bool CandidateInjectionRequested() {
@@ -363,19 +444,12 @@ inline bool ConsumeCandidateRetryFrame() {
   return false;
 }
 
-inline bool BuildUiCompositionOptions(const sl::DLSSGOptions& source,
-                                      sl::DLSSGOptions& destination) {
+inline bool CopyOptions(const sl::DLSSGOptions& source, sl::DLSSGOptions& destination) {
+  if (!KnownOptionsAbi(source)) return false;
   const size_t version = source.structVersion;
-  if (source.structType != sl::DLSSGOptions::s_structType ||
-      version < sl::kStructVersion1 || version > sl::kStructVersion5) {
-    return false;
-  }
-
   destination = sl::DLSSGOptions{};
   destination.next = source.next;
-  destination.structVersion = version < sl::kStructVersion4
-                                  ? sl::kStructVersion4
-                                  : version;
+  destination.structVersion = version;
   destination.mode = source.mode;
   destination.numFramesToGenerate = source.numFramesToGenerate;
   destination.flags = source.flags;
@@ -391,17 +465,27 @@ inline bool BuildUiCompositionOptions(const sl::DLSSGOptions& source,
   destination.depthBufferFormat = source.depthBufferFormat;
   destination.hudLessBufferFormat = source.hudLessBufferFormat;
   destination.uiBufferFormat = source.uiBufferFormat;
-  const uint32_t candidate_format =
-      g_ui_candidate_format.load(std::memory_order_acquire);
-  if (CandidateInjectionRequested() && candidate_format != 0)
-    destination.uiBufferFormat = candidate_format;
   destination.onErrorCallback = source.onErrorCallback;
   if (version >= sl::kStructVersion2) destination.bReserved15 = source.bReserved15;
   if (version >= sl::kStructVersion3)
     destination.queueParallelismMode = source.queueParallelismMode;
-  destination.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
+  if (version >= sl::kStructVersion4)
+    destination.enableUserInterfaceRecomposition = source.enableUserInterfaceRecomposition;
   if (version >= sl::kStructVersion5)
     destination.dynamicTargetFrameRate = source.dynamicTargetFrameRate;
+  return true;
+}
+
+inline bool BuildUiCompositionOptions(const sl::DLSSGOptions& source,
+                                      sl::DLSSGOptions& destination) {
+  if (!CopyOptions(source, destination)) return false;
+  if (destination.structVersion < sl::kStructVersion4)
+    destination.structVersion = sl::kStructVersion4;
+  const uint32_t candidate_format = g_ui_candidate_format.load(std::memory_order_acquire);
+  if (CandidateInjectionRequested() &&
+      g_ui_candidate_ready.load(std::memory_order_acquire) && candidate_format != 0)
+    destination.uiBufferFormat = candidate_format;
+  destination.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
   return true;
 }
 
@@ -435,17 +519,55 @@ inline bool ShouldRequestUiComposition(const sl::DLSSGOptions& options) {
              g_hdr_active.load(std::memory_order_relaxed));
 }
 
+using ModeObserver = void (*)(uint32_t, uint32_t, uint32_t);
+inline std::atomic<ModeObserver> g_mode_observer{nullptr};
+
+inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
+                                 const sl::DLSSGOptions& options,
+                                 countobserver::Origin origin = countobserver::Origin::kNative,
+                                 bool ui_fallback = false) {
+  const auto real = RealSetOptions();
+  if (!real) return sl::Result::eErrorNotInitialized;
+  const auto result = real(viewport, options);
+  const auto observer = g_mode_observer.load(std::memory_order_acquire);
+  if (KnownOptionsAbi(options) && observer) {
+    const DWORD last_error = GetLastError();
+    observer(static_cast<uint32_t>(viewport), static_cast<uint32_t>(options.mode),
+             static_cast<uint32_t>(result));
+    SetLastError(last_error);
+  }
+  if (!countobserver::g_callback.load(std::memory_order_relaxed)) return result;
+  countobserver::Event event;
+  event.operation = countobserver::Operation::kForward;
+  event.origin = origin;
+  event.viewport = static_cast<uint32_t>(viewport);
+  event.requested = countobserver::g_context.requested;
+  event.caller = countobserver::g_context.caller;
+  const void* target = g_set_options_entry.target.load(std::memory_order_acquire);
+  event.callee = reinterpret_cast<uint64_t>(target ? target : reinterpret_cast<const void*>(real));
+  event.ui_fallback = ui_fallback;
+  if (KnownOptionsAbi(options)) {
+    event.value_known = 1;
+    event.value = options.numFramesToGenerate;
+    event.mode = static_cast<uint32_t>(options.mode);
+  }
+  event.result = static_cast<uint32_t>(result);
+  countobserver::Emit(event);
+  return result;
+}
+
 inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
-                                    const sl::DLSSGOptions& options) {
-  if (g_real_set_options == nullptr) return sl::Result::eErrorNotInitialized;
+                                    const sl::DLSSGOptions& options,
+                                    countobserver::Origin origin = countobserver::Origin::kNative) {
+  if (RealSetOptions() == nullptr) return sl::Result::eErrorNotInitialized;
 
   const bool recompose = ShouldRequestUiComposition(options);
   if (!recompose) {
     ObserveUiOptionsTransition(viewport, options);
-    const sl::Result result = g_real_set_options(viewport, options);
-    if (options.mode == sl::DLSSGMode::eOff ||
+    const sl::Result result = CallSetOptions(viewport, options, origin);
+    if (result == sl::Result::eOk && (options.mode == sl::DLSSGMode::eOff ||
         !g_ui_composition_enabled.load(std::memory_order_relaxed) ||
-        g_hdr_active.load(std::memory_order_relaxed)) {
+        g_hdr_active.load(std::memory_order_relaxed))) {
       g_ui_composition_applied.store(false, std::memory_order_relaxed);
       g_ui_candidate_options_synced.store(false, std::memory_order_release);
     }
@@ -466,12 +588,12 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
           "unknown DLSSGOptions ABI; native options were preserved.");
     }
     ObserveUiOptionsTransition(viewport, options);
-    return g_real_set_options(viewport, options);
+    return CallSetOptions(viewport, options, origin);
   }
 
   g_ui_composition_source_version.store(
       static_cast<unsigned int>(options.structVersion), std::memory_order_relaxed);
-  const sl::Result result = g_real_set_options(viewport, forwarded);
+  const sl::Result result = CallSetOptions(viewport, forwarded, origin);
   g_ui_composition_result.store(static_cast<unsigned int>(result),
                                 std::memory_order_relaxed);
   if (result == sl::Result::eOk) {
@@ -479,6 +601,7 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
     const uint32_t candidate_format =
         g_ui_candidate_format.load(std::memory_order_acquire);
     const bool candidate_synced = CandidateInjectionRequested() &&
+        g_ui_candidate_ready.load(std::memory_order_acquire) &&
         candidate_format != 0 && forwarded.uiBufferFormat == candidate_format;
     g_ui_candidate_options_synced.store(candidate_synced, std::memory_order_release);
     g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
@@ -491,7 +614,6 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
     return result;
   }
 
-  g_ui_composition_applied.store(false, std::memory_order_relaxed);
   g_ui_candidate_options_synced.store(false, std::memory_order_release);
   if (!g_ui_composition_fell_back.exchange(true, std::memory_order_relaxed)) {
     std::stringstream message;
@@ -501,43 +623,45 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
     reshade::log::message(reshade::log::level::warning, message.str().c_str());
   }
   ObserveUiOptionsTransition(viewport, options);
-  return g_real_set_options(viewport, options);
+  const auto fallback = CallSetOptions(viewport, options, origin, true);
+  if (fallback == sl::Result::eOk)
+    g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  return fallback;
+}
+
+inline sl::Result ForwardFixedNative(const sl::ViewportHandle& viewport,
+                                     const sl::DLSSGOptions& options,
+                                     FixedOverrideStatus status) {
+  const unsigned int requested = options.numFramesToGenerate;
+  const sl::Result result = ForwardSetOptions(viewport, options,
+      status == FixedOverrideStatus::kRejectedNativeFallback
+          ? countobserver::Origin::kNativeFallback : countobserver::Origin::kNative);
+  if (result == sl::Result::eOk)
+    g_dynamic_applied.store(options.mode == sl::DLSSGMode::eDynamic, std::memory_order_relaxed);
+  SetFixedOverrideState(result != sl::Result::eOk && status == FixedOverrideStatus::kAlreadyMatched
+                            ? FixedOverrideStatus::kNativeRejected : status,
+                       requested, result == sl::Result::eOk ? requested : 0);
+  return result;
+}
+
+inline sl::Result ForwardFixedCount(const sl::ViewportHandle& viewport,
+                                    const sl::DLSSGOptions& options, uint32_t count,
+                                    countobserver::Origin origin = countobserver::Origin::kFixed) {
+  sl::DLSSGOptions forwarded{};
+  if (!CopyOptions(options, forwarded)) return CallSetOptions(viewport, options, origin);
+  forwarded.numFramesToGenerate = count;
+  const sl::Result result = ForwardSetOptions(viewport, forwarded, origin);
+  if (result == sl::Result::eOk)
+    g_dynamic_applied.store(options.mode == sl::DLSSGMode::eDynamic, std::memory_order_relaxed);
+  return result;
 }
 
 inline bool BuildDynamicOptions(const sl::DLSSGOptions& source,
                                 sl::DLSSGOptions& destination) {
-  const size_t version = source.structVersion;
-  if (version < sl::kStructVersion1 || version > sl::kStructVersion5) return false;
-
-  destination = sl::DLSSGOptions{};
-  destination.next = source.next;
+  if (!CopyOptions(source, destination)) return false;
   destination.structVersion = sl::kStructVersion5;
-
-  // Version 1.
   destination.mode = source.mode == sl::DLSSGMode::eOff
-                         ? sl::DLSSGMode::eOff
-                         : sl::DLSSGMode::eDynamic;
-  destination.numFramesToGenerate = source.numFramesToGenerate;
-  destination.flags = source.flags;
-  destination.dynamicResWidth = source.dynamicResWidth;
-  destination.dynamicResHeight = source.dynamicResHeight;
-  destination.numBackBuffers = source.numBackBuffers;
-  destination.mvecDepthWidth = source.mvecDepthWidth;
-  destination.mvecDepthHeight = source.mvecDepthHeight;
-  destination.colorWidth = source.colorWidth;
-  destination.colorHeight = source.colorHeight;
-  destination.colorBufferFormat = source.colorBufferFormat;
-  destination.mvecBufferFormat = source.mvecBufferFormat;
-  destination.depthBufferFormat = source.depthBufferFormat;
-  destination.hudLessBufferFormat = source.hudLessBufferFormat;
-  destination.uiBufferFormat = source.uiBufferFormat;
-  destination.onErrorCallback = source.onErrorCallback;
-
-  if (version >= sl::kStructVersion2) destination.bReserved15 = source.bReserved15;
-  if (version >= sl::kStructVersion3)
-    destination.queueParallelismMode = source.queueParallelismMode;
-  if (version >= sl::kStructVersion4)
-    destination.enableUserInterfaceRecomposition = source.enableUserInterfaceRecomposition;
+                         ? sl::DLSSGMode::eOff : sl::DLSSGMode::eDynamic;
   destination.dynamicTargetFrameRate = static_cast<float>(
       g_dynamic_target_fps.load(std::memory_order_relaxed));
   return true;
@@ -585,16 +709,49 @@ inline sl::Result HookedInit(const sl::Preferences& pref, uint64_t sdk_version) 
                    : InitWithPreferences(pref, sdk_version);
 }
 
-inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
-                                   const sl::DLSSGOptions& options) {
-  if (g_real_set_options == nullptr) return sl::Result::eErrorNotInitialized;
+inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
+                                  const sl::DLSSGOptions& options, uint64_t caller,
+                                  bool automatic = false) {
+  if (RealSetOptions() == nullptr) return sl::Result::eErrorNotInitialized;
+  const bool known = KnownOptionsAbi(options);
+  const countobserver::Scope scope(caller,
+      known ? options.numFramesToGenerate : countobserver::kUnknown);
+  if (countobserver::g_callback.load(std::memory_order_relaxed)) {
+    countobserver::Event event;
+    event.caller = countobserver::g_context.caller;
+    event.viewport = static_cast<uint32_t>(viewport);
+    event.origin = countobserver::Origin::kNative;
+    event.value_known = known;
+    event.requested = countobserver::g_context.requested;
+    if (known) {
+      event.value = options.numFramesToGenerate;
+      event.mode = static_cast<uint32_t>(options.mode);
+    }
+    countobserver::Emit(event);
+  }
   const auto* profile = architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile) return g_real_set_options(viewport, options);
+  if (!g_enabled.load() || !profile) {
+    const auto result = CallSetOptions(viewport, options);
+    if (known && result == sl::Result::eOk) {
+      g_dynamic_applied.store(false, std::memory_order_relaxed);
+      SetFixedOverrideState(FixedOverrideStatus::kNative,
+                            options.numFramesToGenerate, options.numFramesToGenerate);
+    }
+    return result;
+  }
+
+  if (!KnownOptionsAbi(options)) {
+    SetFixedOverrideState(FixedOverrideStatus::kUnknownOptionsAbi, 0, 0);
+    g_dynamic_applied.store(false, std::memory_order_relaxed);
+    return CallSetOptions(viewport, options);
+  }
 
   if (options.mode == sl::DLSSGMode::eOff) {
     g_dynamic_applied.store(false, std::memory_order_relaxed);
     g_dynamic_runtime_declined.store(false, std::memory_order_relaxed);
-    return ForwardSetOptions(viewport, options);
+    const sl::Result result = ForwardSetOptions(viewport, options);
+    SetFixedOverrideState(FixedOverrideStatus::kNative, 0, 0);
+    return result;
   }
 
   const bool dynamic_requested =
@@ -608,15 +765,17 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     if (backend_ready) {
       sl::DLSSGOptions dynamic_options{};
       if (BuildDynamicOptions(options, dynamic_options)) {
-        sl::Result result = ForwardSetOptions(viewport, dynamic_options);
+        sl::Result result = ForwardSetOptions(viewport, dynamic_options, countobserver::Origin::kDynamic);
         if (result != sl::Result::eOk) {
           // Feature-manager startup can be transient. Retry the same validated
           // request once, then preserve the game's fixed request as fallback.
-          result = ForwardSetOptions(viewport, dynamic_options);
+          result = ForwardSetOptions(viewport, dynamic_options, countobserver::Origin::kDynamic);
         }
         g_dynamic_result.store(static_cast<unsigned int>(result),
                                std::memory_order_relaxed);
         if (result == sl::Result::eOk) {
+          SetFixedOverrideState(FixedOverrideStatus::kNative,
+                                options.numFramesToGenerate, 0);
           if (!g_dynamic_applied.exchange(true, std::memory_order_relaxed)) {
             std::stringstream message;
             const unsigned int target =
@@ -656,13 +815,22 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
     }
   }
 
+  if (options.mode == sl::DLSSGMode::eDynamic) {
+    const auto result = ForwardSetOptions(viewport, options);
+    g_dynamic_applied.store(result == sl::Result::eOk, std::memory_order_relaxed);
+    SetFixedOverrideState(result == sl::Result::eOk ? FixedOverrideStatus::kNative
+                                                   : FixedOverrideStatus::kNativeRejected,
+                          options.numFramesToGenerate, 0);
+    return result;
+  }
+
   const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
   // Backported providers need temporal correction before a native 3x/4x request.
   if (profile->NeedsRetarget() && g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
       options.numFramesToGenerate > 1) {
     bool ready = g_multi_frame_ready();
     if (ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
-        g_ensure_pacing != nullptr) {
+        g_ensure_pacing != nullptr && !automatic) {
       g_ensure_pacing();
     }
     if (ready && g_pacing_ready != nullptr) ready = g_pacing_ready();
@@ -672,16 +840,16 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
             reshade::log::level::warning,
             "mfgunlock: provider not ready for MFG; using 2x.");
       }
-      auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
       const uint32_t requested = options.numFramesToGenerate;
-      mutable_options.numFramesToGenerate = 1;
-      const sl::Result result = ForwardSetOptions(viewport, options);
-      mutable_options.numFramesToGenerate = requested;
+      const sl::Result result = ForwardFixedCount(viewport, options, 1, countobserver::Origin::kBackendFallback);
+      SetFixedOverrideState(multiplier >= 2 ? FixedOverrideStatus::kBlockedBackend
+                                            : FixedOverrideStatus::kNative,
+                            requested, result == sl::Result::eOk ? 1 : 0);
       return result;
     }
   }
-  if (multiplier < 2 || options.mode == sl::DLSSGMode::eOff)
-    return ForwardSetOptions(viewport, options);
+  if (multiplier < 2)
+    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kNative);
 
   const uint32_t desired = multiplier - 1;  // generated frames, not total
   const uint32_t requested = options.numFramesToGenerate;
@@ -691,16 +859,49 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
           reshade::log::level::warning,
           "mfgunlock: provider not ready for MFG; multiplier unchanged.");
     }
-    return ForwardSetOptions(viewport, options);
+    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kBlockedBackend);
   }
-  g_last_requested.store(requested, std::memory_order_relaxed);
-  if (requested == desired) return ForwardSetOptions(viewport, options);
 
   // Fixed multi-frame compatibility can use the legacy software-pacing path.
   // Dynamic MFG returns above and leaves pacing to the current NVIDIA runtime.
   if (desired > 1) {
-    if (g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr) {
+    unsigned int ceiling = g_streamline_max_generated.load(std::memory_order_acquire);
+    if (ceiling != 0 && desired > ceiling) {
+      if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
+        std::stringstream message;
+        message << "mfgunlock: fixed " << multiplier
+                << "x not submitted: Streamline structural maximum is " << (ceiling + 1)
+                << "x; preserving the game's request.";
+        reshade::log::message(reshade::log::level::warning, message.str().c_str());
+      }
+      return ForwardFixedNative(
+          viewport, options, FixedOverrideStatus::kBlockedStructuralCeiling);
+    }
+
+    if (g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr && !automatic) {
       g_ensure_pacing();
+    }
+    ceiling = g_streamline_max_generated.load(std::memory_order_acquire);
+    if (ceiling != 0 && desired > ceiling) {
+      if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
+        std::stringstream message;
+        message << "mfgunlock: fixed " << multiplier
+                << "x not submitted: Streamline structural maximum is " << (ceiling + 1)
+                << "x; preserving the game's request.";
+        reshade::log::message(reshade::log::level::warning, message.str().c_str());
+      }
+      return ForwardFixedNative(
+          viewport, options, FixedOverrideStatus::kBlockedStructuralCeiling);
+    }
+    if (g_streamline_plugin_seen.load(std::memory_order_acquire) && ceiling == 0) {
+      if (!g_unknown_ceiling_logged.exchange(true, std::memory_order_relaxed)) {
+        reshade::log::message(
+            reshade::log::level::warning,
+            "mfgunlock: fixed multiplier not submitted because the active Streamline plugin's "
+            "structural frame ceiling is unknown; preserving the game's request.");
+      }
+      return ForwardFixedNative(
+          viewport, options, FixedOverrideStatus::kUnknownStructuralCeiling);
     }
     if (g_pacing_ready != nullptr && !g_pacing_ready()) {
       if (!g_declined_no_pacing.exchange(true, std::memory_order_relaxed)) {
@@ -710,33 +911,32 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
             "asking for more than one generated frame without software pacing freezes "
             "presentation. Leaving the game's own request alone.");
       }
-      return ForwardSetOptions(viewport, options);
+      return ForwardFixedNative(viewport, options, FixedOverrideStatus::kBlockedPacing);
     }
   }
 
-  // The caller owns this structure, so restore it before returning.
-  auto& mutable_options = const_cast<sl::DLSSGOptions&>(options);
-  mutable_options.numFramesToGenerate = desired;
-  sl::Result result = ForwardSetOptions(viewport, options);
-  mutable_options.numFramesToGenerate = requested;
+  if (requested == desired)
+    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kAlreadyMatched);
+
+  SetFixedOverrideState(FixedOverrideStatus::kPending, requested, 0);
+  const sl::Result result = ForwardFixedCount(viewport, options, desired);
 
   // Fall back to the original request if the override is rejected.
   if (result != sl::Result::eOk) {
     // The feature manager can reject the first call while still initializing.
     // Retry the same request once before treating the count as unsupported.
-    mutable_options.numFramesToGenerate = desired;
-    const sl::Result retry = ForwardSetOptions(viewport, options);
-    mutable_options.numFramesToGenerate = requested;
+    const sl::Result retry = ForwardFixedCount(viewport, options, desired, countobserver::Origin::kRetry);
 
     if (retry == sl::Result::eOk) {
-      if (!g_intercepted.exchange(true, std::memory_order_relaxed)) {
+      g_force_failed_for.store(0, std::memory_order_relaxed);
+      if (SetFixedOverrideState(
+              FixedOverrideStatus::kAppliedAfterRetry, requested, desired)) {
         std::stringstream s;
         s << "mfgunlock: slDLSSGSetOptions returned " << static_cast<unsigned int>(result)
           << " on the first attempt but accepted numFramesToGenerate=" << desired
-          << " on retry -- that first failure was feature-manager state, not the count.";
+          << " on retry.";
         reshade::log::message(reshade::log::level::info, s.str().c_str());
       }
-      g_last_forced.store(desired, std::memory_order_relaxed);
       return retry;
     }
 
@@ -745,20 +945,101 @@ inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
       s << "mfgunlock: slDLSSGSetOptions refused numFramesToGenerate=" << desired
         << " twice (sl::Result " << static_cast<unsigned int>(result) << " then "
         << static_cast<unsigned int>(retry) << "); falling back to the game's own request of "
-        << requested << ". The count itself is being refused, not a transient state.";
+        << requested << ".";
       reshade::log::message(reshade::log::level::warning, s.str().c_str());
     }
-    return ForwardSetOptions(viewport, options);
+    const sl::Result fallback = ForwardSetOptions(viewport, options, countobserver::Origin::kNativeFallback);
+    g_dynamic_applied.store(fallback == sl::Result::eOk && options.mode == sl::DLSSGMode::eDynamic,
+                            std::memory_order_relaxed);
+    SetFixedOverrideState(fallback == sl::Result::eOk ? FixedOverrideStatus::kRejectedNativeFallback
+                                                     : FixedOverrideStatus::kFallbackRejected,
+                          requested, fallback == sl::Result::eOk ? requested : 0);
+    return fallback;
   }
 
-  if (!g_intercepted.exchange(true, std::memory_order_relaxed)) {
+  g_force_failed_for.store(0, std::memory_order_relaxed);
+  if (SetFixedOverrideState(FixedOverrideStatus::kApplied, requested, desired)) {
     std::stringstream s;
     s << "mfgunlock: forcing DLSS-G numFramesToGenerate from " << requested << " to " << desired
       << " (" << multiplier << "x). slDLSSGSetOptions accepted it.";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
-  g_last_forced.store(desired, std::memory_order_relaxed);
   return result;
+}
+
+inline sl::Result HookedSetOptions(const sl::ViewportHandle& viewport,
+                                   const sl::DLSSGOptions& options) {
+  const uint64_t caller = countobserver::CallerAddress();
+  auto* state = GetUiState(viewport);
+  if (!state) return SetOptionsImpl(viewport, options, caller);
+  std::lock_guard lock(state->options_lock);
+  // Reentrant callbacks are forwarded, but disqualify this snapshot for replay.
+  if (state->options_in_call) {
+    state->native_options_valid = false;
+    return SetOptionsImpl(viewport, options, caller);
+  }
+  state->options_in_call = true;
+  struct Finish {
+    UiViewportState& state;
+    ~Finish() { state.options_in_call = false; }
+  } finish{*state};
+  state->native_options_valid = false;
+  state->cache_epoch = g_options_cache_epoch.load(std::memory_order_acquire);
+  state->options_thread = GetCurrentThreadId();
+  state->options_entry = reinterpret_cast<const void*>(RealSetOptions());
+  state->attempted_revision = g_options_revision.load(std::memory_order_acquire);
+  // next and error callbacks belong to the game. Their lifetime is not extended
+  // by copying DLSSGOptions, so such options are forwarded only synchronously.
+  if (KnownOptionsAbi(options) && options.next == nullptr && options.onErrorCallback == nullptr)
+    state->native_options_valid = CopyOptions(options, state->native_options);
+  const auto result = SetOptionsImpl(viewport, options, caller);
+  if (result != sl::Result::eOk) state->native_options_valid = false;
+  return result;
+}
+
+inline void ApplyLiveOptions(const sl::ViewportHandle& viewport) {
+  auto* state = GetUiState(viewport);
+  if (!state || g_entry_shutting_down.load(std::memory_order_acquire)) return;
+  std::unique_lock lock(state->options_lock, std::try_to_lock);
+  if (!lock || state->options_in_call || !state->native_options_valid ||
+      state->cache_epoch != g_options_cache_epoch.load(std::memory_order_acquire) ||
+      state->options_thread != GetCurrentThreadId() ||
+      g_present_thread.load(std::memory_order_acquire) != GetCurrentThreadId() ||
+      state->options_entry != reinterpret_cast<const void*>(RealSetOptions())) return;
+  const auto revision = g_options_revision.load(std::memory_order_acquire);
+  if (state->attempted_revision == revision) return;
+  // Do not re-enable a game-disabled feature, including pauses and resizes.
+  if (state->native_options.mode == sl::DLSSGMode::eOff) return;
+  state->attempted_revision = revision;
+  state->options_in_call = true;
+  struct Finish {
+    UiViewportState& state;
+    ~Finish() { state.options_in_call = false; }
+  } finish{*state};
+  sl::DLSSGOptions options{};
+  CopyOptions(state->native_options, options);
+  diagnostic::LifecycleEvent event;
+  event.kind = diagnostic::LifecycleKind::kLiveReapply;
+  event.thread = GetCurrentThreadId();
+  event.viewport = static_cast<uint32_t>(viewport);
+  event.mode = static_cast<uint32_t>(options.mode);
+  // Replay only on the observed presenting AND native-options thread. Never
+  // impersonate the game caller; tracing retains override/retry/fallback.
+  try {
+    event.result = static_cast<uint32_t>(SetOptionsImpl(viewport, options, 0, true));
+  } catch (...) {
+    state->native_options_valid = false;
+    diagnostic::Emit(event);
+    return;
+  }
+  if (event.result != static_cast<uint32_t>(sl::Result::eOk))
+    state->native_options_valid = false;
+  diagnostic::Emit(event);
+}
+
+inline void InvalidateLiveOptions() {
+  g_options_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
+  g_present_thread.store(0, std::memory_order_release);
 }
 
 inline void MarkInjectedUiPair(UiViewportState* state) {
@@ -869,7 +1150,7 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
             << " consecutive times on resource 0x" << std::hex
             << candidate.native_resource << std::dec << " (sl::Result "
             << static_cast<unsigned int>(result)
-            << "); disabling experimental UI injection until the option is toggled.";
+            << "); disabling automatic UI injection until the option is toggled.";
     reshade::log::message(reshade::log::level::warning, message.str().c_str());
   } else if (failure_streak == 1) {
     std::stringstream message;
@@ -1115,6 +1396,7 @@ inline sl::Result HookedSetConstants(const sl::Constants& values,
                                      const sl::FrameToken& frame,
                                      const sl::ViewportHandle& viewport) {
   if (g_real_set_constants == nullptr) return sl::Result::eErrorNotInitialized;
+  ApplyLiveOptions(viewport);
   if (!g_enabled.load(std::memory_order_relaxed) ||
       !g_ui_composition_enabled.load(std::memory_order_relaxed)) {
     return g_real_set_constants(values, frame, viewport);
@@ -1153,11 +1435,42 @@ inline sl::Result HookedSetConstants(const sl::Constants& values,
 
 inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
                                  const sl::DLSSGOptions* options) {
-  if (g_real_get_state == nullptr) return sl::Result::eErrorNotInitialized;
+  if (RealGetState() == nullptr) return sl::Result::eErrorNotInitialized;
   if (!g_enabled.load() || !architecture::ActiveProfile())
-    return g_real_get_state(viewport, state, options);
+    return RealGetState()(viewport, state, options);
 
-  const sl::Result result = g_real_get_state(viewport, state, options);
+  const sl::Result result = RealGetState()(viewport, state, options);
+  struct StateObservation {
+    const sl::DLSSGState& state;
+    countobserver::Event event;
+    explicit StateObservation(const sl::DLSSGState& value) : state(value) {}
+    ~StateObservation() {
+      event.operation = countobserver::Operation::kAdvertise;
+      if (event.value_known) event.value = state.numFramesToGenerateMax;
+      countobserver::Emit(event);
+    }
+  };
+  std::optional<StateObservation> observation;
+  if (countobserver::g_callback.load(std::memory_order_relaxed)) {
+    observation.emplace(state);
+    auto& event = observation->event;
+    event.operation = countobserver::Operation::kRead;
+    event.key = countobserver::Key::kMaximum;
+    event.origin = countobserver::Origin::kCapabilityPolicy;
+    event.viewport = static_cast<uint32_t>(viewport);
+    event.caller = countobserver::CallerAddress();
+    const void* target = g_get_state_entry.target.load(std::memory_order_acquire);
+    event.callee = reinterpret_cast<uint64_t>(target ? target : reinterpret_cast<const void*>(RealGetState()));
+    event.result = static_cast<uint32_t>(result);
+    event.value_known = result == sl::Result::eOk &&
+        state.structType == sl::DLSSGState::s_structType &&
+        state.structVersion >= sl::kStructVersion2 && state.structVersion <= sl::kStructVersion4;
+    if (event.value_known) event.value = state.numFramesToGenerateMax;
+    countobserver::Emit(event);
+  }
+  if (state.structType != sl::DLSSGState::s_structType ||
+      state.structVersion < sl::kStructVersion1 || state.structVersion > sl::kStructVersion4)
+    return result;
   if (result == sl::Result::eOk) {
     ObserveDynamicSupport(state, result);
     if (!g_dynamic_support_seen.load(std::memory_order_acquire) &&
@@ -1169,7 +1482,7 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
       sl::DLSSGState extended{};
       extended.next = state.next;
       extended.structVersion = sl::kStructVersion4;
-      const sl::Result probe = g_real_get_state(viewport, extended, options);
+      const sl::Result probe = RealGetState()(viewport, extended, options);
       ObserveDynamicSupport(extended, probe);
     }
 
@@ -1191,15 +1504,15 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
     return result;
   }
 
-  const unsigned int wanted = g_advertised_max_generated.load(std::memory_order_relaxed);
-  if (wanted < 2 || reported >= wanted) return result;
+  const unsigned int wanted = g_streamline_max_generated.load(std::memory_order_relaxed);
+  if (wanted == 0 || reported == wanted) return result;
 
   state.numFramesToGenerateMax = wanted;
   if (!g_capacity_advertised.exchange(true, std::memory_order_relaxed)) {
     std::stringstream s;
     s << "mfgunlock: slDLSSGGetState reported a maximum of " << reported
-      << " generated frame(s); advertising the verified Streamline ceiling of " << wanted
-      << " so the game's native multiplier selector can expose up to " << (wanted + 1) << "x.";
+      << " generated frame(s); using the Streamline structural ceiling of " << wanted
+      << " (" << (wanted + 1) << "x).";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
   return result;
@@ -1212,6 +1525,9 @@ inline sl::Result HookedGetFeatureFunction(sl::Feature feature, const char* func
   if (feature != sl::kFeatureDLSS_G || g_entry_shutting_down.load(std::memory_order_acquire)) return result;
 
   if (std::strcmp(function_name, "slDLSSGSetOptions") == 0) {
+    if (!g_set_options_entry.installed.load(std::memory_order_acquire) ||
+        g_set_options_entry.target.load(std::memory_order_acquire) != function)
+      InvalidateLiveOptions();
     if (hook::InstallAddress(g_set_options_entry, function,
                              reinterpret_cast<void*>(&HookedSetOptions),
                              "slDLSSGSetOptions")) {
@@ -1321,6 +1637,7 @@ inline void NotifyHdrState(bool hdr) {
     internal::ForgetUiOutputs();
     internal::RequestAllUiResets();
     g_ui_composition_applied.store(false, std::memory_order_relaxed);
+    NotifyLiveOptionsChanged();
   }
 }
 
@@ -1328,13 +1645,55 @@ inline void NotifyOutputUnknown() {
   g_hdr_state_seen.store(false, std::memory_order_release);
   g_hdr_active.store(false, std::memory_order_relaxed);
   g_ui_composition_applied.store(false, std::memory_order_relaxed);
-  g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  internal::NotifyUiCandidateUnavailable();
   internal::ForgetUiOutputs();
   internal::RequestAllUiResets();
 }
 
+inline const char* LiveOptionsActionText() {
+  const auto revision = g_options_revision.load(std::memory_order_acquire);
+  bool seen = false;
+  for (auto& state : internal::g_ui_viewports) {
+    if (state.key.load(std::memory_order_acquire) == internal::kUnusedViewport) continue;
+    seen = true;
+    std::unique_lock lock(state.options_lock, std::try_to_lock);
+    if (!lock) return "Runtime options update in progress.";
+    if (state.attempted_revision == revision) continue;
+    if (!state.native_options_valid || state.cache_epoch != g_options_cache_epoch.load())
+      return "Runtime options pending. Turn Frame Generation off and on in the game menu to apply.";
+    if (state.native_options.mode == sl::DLSSGMode::eOff)
+      return "Runtime options saved. Enable Frame Generation to apply.";
+    return "Runtime options pending automatic submission. If unchanged, turn Frame Generation off and on in the game menu.";
+  }
+  return seen ? nullptr : "Runtime options will apply when the game next configures Frame Generation.";
+}
+
+inline void ApplyLiveOptionsOnPresent() {
+  const uint32_t thread = GetCurrentThreadId();
+  const uint64_t revision = g_options_revision.load(std::memory_order_acquire);
+  const uint64_t cache_epoch = g_options_cache_epoch.load(std::memory_order_acquire);
+  const void* options_entry = reinterpret_cast<const void*>(internal::RealSetOptions());
+  g_present_thread.store(thread, std::memory_order_release);
+  uint32_t key = internal::kUnusedViewport;
+  for (auto& state : internal::g_ui_viewports) {
+    const auto candidate = state.key.load(std::memory_order_acquire);
+    if (candidate == internal::kUnusedViewport) continue;
+    std::unique_lock lock(state.options_lock, std::try_to_lock);
+    if (!lock) return;
+    if (!state.native_options_valid || state.cache_epoch != cache_epoch ||
+        state.options_thread != thread || state.options_entry != options_entry ||
+        state.native_options.mode == sl::DLSSGMode::eOff ||
+        state.attempted_revision == revision) {
+      continue;
+    }
+    if (key != internal::kUnusedViewport) return;
+    key = candidate;
+  }
+  if (key != internal::kUnusedViewport) internal::ApplyLiveOptions(sl::ViewportHandle(key));
+}
+
 inline void NotifyUiCompositionChanged() {
-  g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  // Keep the last accepted options evidence while the new request is pending.
   g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
   g_ui_composition_result.store(0, std::memory_order_relaxed);
   g_hud_inputs_suppressed.store(false, std::memory_order_relaxed);
@@ -1349,6 +1708,7 @@ inline void NotifyUiCompositionChanged() {
   g_ui_candidate_options_synced.store(false, std::memory_order_release);
   internal::ForgetUiOutputs();
   internal::RequestAllUiResets();
+  NotifyLiveOptionsChanged();
 }
 
 inline void NotifyUiCandidateInjectionChanged() {
@@ -1366,18 +1726,32 @@ inline void NotifyUiCandidateInjectionChanged() {
   g_ui_candidate_full_batches.store(0, std::memory_order_relaxed);
   g_ui_candidate_tags_injected.store(0, std::memory_order_relaxed);
   internal::RequestAllUiResets();
+  NotifyLiveOptionsChanged();
 }
 
 inline void NotifyDynamicD3D12(bool d3d12) {
   g_dynamic_d3d12.store(d3d12, std::memory_order_relaxed);
 }
 
+inline void NotifyFixedMultiplierChanged() {
+  const bool enabled = g_force_multiplier.load(std::memory_order_relaxed) >= 2;
+  g_fixed_override_status.store(
+      enabled ? FixedOverrideStatus::kPending : FixedOverrideStatus::kNative,
+      std::memory_order_relaxed);
+  g_declined_no_pacing.store(false, std::memory_order_relaxed);
+  g_force_failed_for.store(0, std::memory_order_relaxed);
+  g_ceiling_blocked_for.store(0, std::memory_order_relaxed);
+  g_unknown_ceiling_logged.store(false, std::memory_order_relaxed);
+  g_unknown_fixed_abi_logged.store(false, std::memory_order_relaxed);
+  NotifyLiveOptionsChanged();
+}
+
 inline void NotifyDynamicModeChanged() {
-  g_dynamic_applied.store(false, std::memory_order_relaxed);
   g_dynamic_fell_back.store(false, std::memory_order_relaxed);
   g_dynamic_runtime_declined.store(false, std::memory_order_release);
   g_dynamic_result.store(0, std::memory_order_relaxed);
   g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
+  NotifyLiveOptionsChanged();
 }
 
 // Install before the host caches DLSS-G function pointers.
@@ -1414,6 +1788,7 @@ inline void TryInstall() {
 }
 
 inline void Uninstall() {
+  internal::InvalidateLiveOptions();
   internal::g_entry_shutting_down.store(true, std::memory_order_release);
   if (internal::g_ui_hooks_installed.load(std::memory_order_acquire) &&
       !internal::g_ui_hooks.empty()) {

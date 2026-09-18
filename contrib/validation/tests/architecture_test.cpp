@@ -34,6 +34,14 @@ int main() {
   Check(arch::kAda.native_arch == 0x190 && arch::kAda.target_sm == 89, "Ada target");
   Check(arch::kAmpere.native_arch == 0x170 && arch::kAmpere.target_sm == 86, "Ampere target");
   Check(arch::kTuring.native_arch == 0x160 && arch::kTuring.target_sm == 75, "Turing target");
+  Check(!arch::SupportsDynamicMfg(Architecture::kAda), "Ada uses native Dynamic path");
+  Check(arch::SupportsDynamicMfg(Architecture::kAmpere), "Ampere Dynamic backport");
+  Check(arch::SupportsDynamicMfg(Architecture::kTuring), "Turing Dynamic backport");
+  Check(!arch::SupportsDynamicMfg(Architecture::kUnknown), "unknown Dynamic profile rejected");
+  Check(!arch::SupportsQualityBackport(Architecture::kAda), "Ada uses native quality path");
+  Check(arch::SupportsQualityBackport(Architecture::kAmpere), "Ampere quality backport");
+  Check(arch::SupportsQualityBackport(Architecture::kTuring), "Turing quality backport");
+  Check(!arch::SupportsQualityBackport(Architecture::kUnknown), "unknown quality profile rejected");
   Check(arch::Parse("aMpErE") == Architecture::kAmpere, "case-insensitive name");
   Check(arch::Parse(" \tTURING\r\n") == Architecture::kTuring, "trim name");
   Check(arch::Parse("auto") == Architecture::kAuto, "auto name");

@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <d3d12.h>
+#include <bcrypt.h>
 #include <algorithm>
 #include <array>
 #include <filesystem>
@@ -13,10 +14,14 @@
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
 #include "../mfgunlock/ngx_hook.hpp"
+#include "../mfgunlock/diagnostic_bridge.hpp"
 #include "./nvapi_observer.hpp"
 #include "./trace.hpp"
+#include "./mfg_probe.hpp"
+#include "./timeline.hpp"
 
 #pragma comment(lib, "version.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 namespace {
 using namespace mfgdiagnostics;
@@ -26,7 +31,25 @@ constexpr const char* kLabels[] = {"BASELINE", "DLSSG_2x", "DLSSG_3x",
                                  "DLSSG_4x", "DLSSG_5x", "DLSSG_6x"};
 Capture<16384> g_capture;
 bool g_enabled = false;
+bool g_count_bridge_connected = false;
+bool g_evaluate_bridge_connected = false;
+bool g_state_bridge_connected = false;
+bool g_lifecycle_bridge_connected = false;
+bool g_capture_had_lifecycle_bridge = false;
+bool g_capture_had_count_bridge = false;
+bool g_capture_had_evaluate_bridge = false;
+bool g_capture_had_state_bridge = false;
+mfgunlock::countobserver::Register g_register_count = nullptr;
+mfgunlock::diagnostic::RegisterEvaluate g_register_evaluate = nullptr;
+mfgunlock::diagnostic::RegisterLifecycle g_register_lifecycle = nullptr;
+mfgunlock::diagnostic::QueryState g_query_state = nullptr;
+timeline::OneShotCapture g_evaluate_capture;
+std::atomic<uint64_t> g_last_evaluation_id{0};
+std::atomic<uint32_t> g_last_frame_kind{static_cast<uint32_t>(timeline::FrameKind::kUnknown)};
+std::atomic<uint32_t> g_last_generated_index{0};
+std::atomic<uint32_t> g_last_generated_count{0};
 std::atomic_bool g_d3d12{false}, g_installed{false}, g_saving{false};
+std::atomic_bool g_capture_pending_export{false};
 std::atomic<uint32_t> g_truncated_tag_batches{0};
 std::atomic<uint32_t> g_optional_exports{0};
 SRWLOCK g_install_lock = SRWLOCK_INIT;
@@ -337,10 +360,190 @@ sl::Result HookOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOption
   return result;
 }
 
+// Capture owner identity now; export never attributes a reused module address
+// to the previous image or dereferences an expired parameter/resource pointer.
+void CaptureOwner(Event& event, uint64_t address, size_t offset) {
+  MEMORY_BASIC_INFORMATION memory{};
+  if (!address || !VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory))) return;
+  mfgunlock::hook::ModuleIdentity identity;
+  if (!mfgunlock::hook::CaptureModule(static_cast<HMODULE>(memory.AllocationBase), identity)) return;
+  event.values[offset] = reinterpret_cast<uint64_t>(identity.module);
+  event.values[offset + 1] = identity.timestamp;
+  event.values[offset + 2] = identity.image_bytes;
+}
+
+void ObserveCount(const mfgunlock::countobserver::Event* source) noexcept {
+  struct LastError {
+    DWORD value = GetLastError();
+    ~LastError() { SetLastError(value); }
+  } last_error;
+  try {
+    const uint64_t ticket = Ticket();
+    if (!ticket || !source || source->version != mfgunlock::countobserver::kVersion ||
+        source->bytes != sizeof(*source) ||
+        static_cast<uint32_t>(source->backend) > 3 || static_cast<uint32_t>(source->operation) > 4 ||
+        static_cast<uint32_t>(source->origin) > 7 || static_cast<uint32_t>(source->key) > 2) return;
+    Event event(Kind::frame_count);
+    event.version = source->version;
+    event.recognized = true;
+    event.values[0] = static_cast<uint32_t>(source->backend);
+    event.values[1] = static_cast<uint32_t>(source->operation);
+    event.values[2] = static_cast<uint32_t>(source->origin);
+    event.values[3] = static_cast<uint32_t>(source->key);
+    event.values[4] = static_cast<uint64_t>(source->value);
+    event.values[5] = source->value_known;
+    event.values[6] = source->requested;
+    event.values[7] = source->mode;
+    event.values[8] = source->ui_fallback;
+    event.values[9] = source->caller;
+    event.values[10] = source->callee;
+    event.values[11] = source->object;
+    CaptureOwner(event, source->caller, 12);
+    CaptureOwner(event, source->callee, 15);
+    Submit(event, ticket, Ticks(), source->viewport, UINT32_MAX,
+           static_cast<sl::Result>(source->result));
+  } catch (...) {
+    g_capture.dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void ObserveEvaluate(const mfgunlock::diagnostic::EvaluateEvent* source) noexcept {
+  struct LastError {
+    DWORD value = GetLastError();
+    ~LastError() { SetLastError(value); }
+  } last_error;
+  try {
+    const uint64_t ticket = Ticket();
+    if (!ticket) {
+      if (g_capture.active.load(std::memory_order_acquire) == 0 && g_register_evaluate)
+        g_register_evaluate(mfgunlock::diagnostic::kEvaluateVersion, nullptr);
+      return;
+    }
+    if (!source || source->version != mfgunlock::diagnostic::kEvaluateVersion ||
+        source->bytes != sizeof(*source) ||
+        static_cast<uint32_t>(source->backend) != 0 ||
+        static_cast<uint32_t>(source->phase) > 1) return;
+
+    const auto classification = timeline::Classify(*source);
+    g_last_evaluation_id.store(source->evaluation_id, std::memory_order_relaxed);
+    g_last_frame_kind.store(static_cast<uint32_t>(classification.kind), std::memory_order_relaxed);
+    g_last_generated_index.store(classification.generated_index, std::memory_order_relaxed);
+    g_last_generated_count.store(classification.generated_count, std::memory_order_relaxed);
+    g_evaluate_capture.Observe(*source);
+
+    Event event(Kind::evaluate);
+    event.version = source->version;
+    event.recognized = true;
+    event.values[0] = static_cast<uint32_t>(source->phase);
+    event.values[1] = source->evaluation_id;
+    event.values[2] = static_cast<uint32_t>(source->backend);
+    event.values[3] = source->caller;
+    event.values[4] = source->commands;
+    event.values[5] = source->handle;
+    event.values[6] = source->parameters;
+    event.values[7] = source->generated_count_known;
+    event.values[8] = source->generated_count;
+    event.values[9] = source->generated_index_known;
+    event.values[10] = source->generated_index;
+    event.values[11] = source->reset_known;
+    event.values[12] = source->reset;
+    event.values[13] = source->automode_reset_known;
+    event.values[14] = source->automode_reset;
+    event.values[15] = source->backbuffer_frame_id_known;
+    event.values[16] = source->backbuffer_frame_id;
+    for (size_t i = 0; i < source->resources.size(); ++i) {
+      const auto& resource = source->resources[i];
+      const size_t base = 18 + i * 8;
+      event.values[base] = resource.key;
+      event.values[base + 1] = resource.known;
+      event.values[base + 2] = resource.object;
+      event.values[base + 3] = resource.width;
+      event.values[base + 4] = resource.height;
+      event.values[base + 5] = static_cast<uint64_t>(resource.depth_or_array) |
+          (static_cast<uint64_t>(resource.mip_levels) << 16) |
+          (static_cast<uint64_t>(resource.sample_count) << 32);
+      event.values[base + 6] = resource.format;
+      event.values[base + 7] = static_cast<uint64_t>(resource.dimension) |
+          (static_cast<uint64_t>(resource.flags) << 32);
+    }
+    CaptureOwner(event, source->caller, 98);
+    const auto result = source->result == mfgunlock::diagnostic::kUnknown32
+        ? static_cast<sl::Result>(UINT32_MAX)
+        : static_cast<sl::Result>(source->result);
+    Submit(event, ticket, Ticks(), UINT32_MAX, UINT32_MAX, result);
+  } catch (...) {
+    g_capture.dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void ObserveLifecycle(const mfgunlock::diagnostic::LifecycleEvent* source) noexcept {
+  const auto ticket = Ticket();
+  if (!ticket || !source) return;
+  const DWORD saved_error = GetLastError();
+  try {
+    auto event = SnapshotLifecycle(*source);
+    if (event.recognized) {
+      Submit(event, ticket, Ticks(), source->viewport, UINT32_MAX,
+             static_cast<sl::Result>(source->result));
+    }
+  } catch (...) {
+    g_capture.dropped.fetch_add(1, std::memory_order_relaxed);
+  }
+  SetLastError(saved_error);
+}
+
+void InstallCoreObservation() {
+  HMODULE own = nullptr;
+  // Explicit opt-in observers may outlive a UI toggle. The module is pinned so
+  // an in-flight callback can never return through unloaded diagnostic code.
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+                          reinterpret_cast<LPCWSTR>(&ObserveCount), &own)) return;
+  const auto core = GetModuleHandleW(L"renodx-mfgunlock.addon64");
+  if (core) {
+    g_register_count = reinterpret_cast<mfgunlock::countobserver::Register>(
+        GetProcAddress(core, "MfgUnlockSetCountObserver"));
+    g_register_evaluate = reinterpret_cast<mfgunlock::diagnostic::RegisterEvaluate>(
+        GetProcAddress(core, "MfgUnlockSetEvaluateObserver"));
+    g_register_lifecycle = reinterpret_cast<mfgunlock::diagnostic::RegisterLifecycle>(
+        GetProcAddress(core, "MfgUnlockSetLifecycleObserver"));
+    g_query_state = reinterpret_cast<mfgunlock::diagnostic::QueryState>(
+        GetProcAddress(core, "MfgUnlockGetDiagnosticState"));
+  }
+  g_count_bridge_connected = g_register_count &&
+      g_register_count(mfgunlock::countobserver::kVersion, ObserveCount);
+  g_evaluate_bridge_connected = g_register_evaluate &&
+      g_register_evaluate(mfgunlock::diagnostic::kEvaluateVersion, ObserveEvaluate);
+  g_state_bridge_connected = g_query_state != nullptr;
+  g_lifecycle_bridge_connected = g_register_lifecycle &&
+      g_register_lifecycle(mfgunlock::diagnostic::kLifecycleVersion, ObserveLifecycle);
+  probe::g_sink = ObserveCount;
+  probe::g_recording = [] { return Ticket() != 0; };
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snapshot == INVALID_HANDLE_VALUE) return;
+  MODULEENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Module32FirstW(snapshot, &entry)) do {
+    probe::Install(entry.hModule);
+  } while (Module32NextW(snapshot, &entry));
+  CloseHandle(snapshot);
+}
+
+void UninstallHotObservers() {
+  if (g_register_lifecycle && g_lifecycle_bridge_connected)
+    g_register_lifecycle(mfgunlock::diagnostic::kLifecycleVersion, nullptr);
+  g_lifecycle_bridge_connected = false;
+  if (g_register_evaluate && g_evaluate_bridge_connected)
+    g_register_evaluate(mfgunlock::diagnostic::kEvaluateVersion, nullptr);
+  if (g_register_count && g_count_bridge_connected)
+    g_register_count(mfgunlock::countobserver::kVersion, nullptr);
+  g_evaluate_bridge_connected = false;
+  g_count_bridge_connected = false;
+}
+
 bool ObserveDynamicCapability(const sl::DLSSGState& state, sl::Result result,
                               bool from_probe) {
   if (result != sl::Result::eOk || state.structType != sl::DLSSGState::s_structType ||
-      state.structVersion < sl::kStructVersion4) return false;
+      state.structVersion != sl::kStructVersion4) return false;
   if (state.bIsDynamicMFGSupported != sl::Boolean::eTrue &&
       state.bIsDynamicMFGSupported != sl::Boolean::eFalse) return false;
   g_dynamic_supported.store(state.bIsDynamicMFGSupported == sl::Boolean::eTrue,
@@ -364,7 +567,8 @@ sl::Result HookState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
 
   if (!capability_seen && g_dynamic_probe_armed.load(std::memory_order_acquire) &&
       g_d3d12.load(std::memory_order_relaxed)) {
-    if (state.structVersion < sl::kStructVersion4 &&
+    if (state.structType == sl::DLSSGState::s_structType &&
+        state.structVersion >= sl::kStructVersion1 && state.structVersion < sl::kStructVersion4 &&
         g_dynamic_probe_armed.exchange(false, std::memory_order_acq_rel)) {
       sl::DLSSGState extended{};
       extended.next = state.next;
@@ -465,8 +669,7 @@ sl::Result ObserveTags(const sl::ViewportHandle& viewport, uint32_t frame,
   if (ticket == 0) return call();
   const uint64_t begin = Ticks();
   // No allocations or unbounded traversal on the application's tagging path.
-  std::array<Event, 64> samples = {
-      Event(Kind::tag)};
+  static thread_local std::array<Event, 64> samples;
   const uint32_t size = tags == nullptr ? 0 : (std::min)(count, uint32_t{64});
   if (count > 64) g_truncated_tag_batches.fetch_add(1, std::memory_order_relaxed);
   for (uint32_t i = 0; i < size; ++i) {
@@ -563,12 +766,14 @@ const std::vector<mfgunlock::hook::HookItem> kLoaderHooks = {
 };
 
 Json ModuleInfo(HMODULE module) {
-  wchar_t path[32768]{};
-  if (module == nullptr || GetModuleFileNameW(module, path, std::size(path)) == 0) return nullptr;
+  std::wstring path(32768, L'\0');
+  const DWORD length = module ? GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size())) : 0;
+  if (length == 0 || length >= path.size()) return nullptr;
+  path.resize(length);
   Json info = {{"file", std::filesystem::path(path).filename().string()}};
   DWORD ignored = 0;
-  std::vector<unsigned char> data(GetFileVersionInfoSizeW(path, &ignored));
-  if (!data.empty() && GetFileVersionInfoW(path, 0, static_cast<DWORD>(data.size()), data.data())) {
+  std::vector<unsigned char> data(GetFileVersionInfoSizeW(path.c_str(), &ignored));
+  if (!data.empty() && GetFileVersionInfoW(path.c_str(), 0, static_cast<DWORD>(data.size()), data.data())) {
     VS_FIXEDFILEINFO* version = nullptr;
     UINT size = 0;
     if (VerQueryValueW(data.data(), L"\\", reinterpret_cast<void**>(&version), &size) &&
@@ -585,6 +790,35 @@ Json FunctionOwner(const void* function) {
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(function), &module);
   return ModuleInfo(module);
+}
+
+Json CountOwner(const Event& event, size_t address_index, size_t identity_index) {
+  const uint64_t address = event.values[address_index];
+  const uint64_t base = event.values[identity_index];
+  if (!address || address == kUnknown || !base || base == kUnknown) return nullptr;
+  const mfgunlock::hook::ModuleIdentity identity{
+      reinterpret_cast<HMODULE>(base), static_cast<DWORD>(event.values[identity_index + 1]),
+      static_cast<DWORD>(event.values[identity_index + 2])};
+  Json owner = {{"rva", address >= base ? Json(address - base) : Json(nullptr)},
+                {"timestamp", identity.timestamp}, {"image_bytes", identity.image_bytes}};
+  owner["module"] = mfgunlock::hook::IsCurrent(identity) ? ModuleInfo(identity.module) : Json(nullptr);
+  return owner;
+}
+
+Json CountEvent(const Event& event) {
+  static constexpr const char* kBackends[] = {"streamline", "ngx_d3d12", "ngx_vulkan", "ngx_c_api"};
+  static constexpr const char* kOperations[] = {"request", "forward", "read", "advertise", "write"};
+  static constexpr const char* kOrigins[] = {"unknown", "native", "fixed_override", "retry", "native_fallback",
+                                          "dynamic", "backend_fallback", "capability_policy"};
+  static constexpr const char* kKeys[] = {"generated", "maximum_generated", "generated_index"};
+  Json row = {{"backend", kBackends[event.values[0]]}, {"operation", kOperations[event.values[1]]},
+              {"origin", kOrigins[event.values[2]]}, {"key", kKeys[event.values[3]]},
+              {"value", event.values[5] ? Json(static_cast<int64_t>(event.values[4])) : Json(nullptr)},
+              {"requested", event.values[6] == UINT32_MAX ? Json(nullptr) : Json(event.values[6])},
+              {"mode", event.values[7] == UINT32_MAX ? Json(nullptr) : Json(event.values[7])},
+              {"ui_fallback", event.values[8] != 0},
+              {"caller", CountOwner(event, 9, 12)}, {"callee", CountOwner(event, 10, 15)}};
+  return row;
 }
 
 Json ObserveNvapi() {
@@ -673,10 +907,259 @@ uint64_t UiCandidateScore(const UiCandidateStats& candidate) {
          candidate.rtv_bind_count;
 }
 
+
+const char* KindName(Kind kind) {
+  switch (kind) {
+    case Kind::options: return "streamline_options";
+    case Kind::constants: return "streamline_constants";
+    case Kind::tag: return "resource_tag";
+    case Kind::state: return "streamline_state";
+    case Kind::output: return "host_present";
+    case Kind::tag_batch: return "resource_tag_batch";
+    case Kind::frame_count: return "frame_count";
+    case Kind::evaluate: return "ngx_evaluate";
+    case Kind::lifecycle: return "fg_lifecycle";
+    default: return "unknown";
+  }
+}
+
+Json OptionalValue(uint64_t value) {
+  return value == kUnknown ? Json(nullptr) : Json(value);
+}
+
+Json EvaluateResourceJson(const Event& event, size_t index,
+                          std::unordered_map<uint64_t, uint64_t>& identities) {
+  const size_t base = 18 + index * 8;
+  const bool known = event.values[base + 1] != 0 && event.values[base + 1] != kUnknown;
+  static constexpr const char* kNames[] = {
+      "backbuffer", "depth", "motion_vectors", "hudless", "ui", "ui_alpha",
+      "bidirectional_distortion_field", "output_interpolated", "output_real",
+      "output_disable_interpolation"};
+  Json row = {{"key", index < std::size(kNames) ? kNames[index] : "unknown"},
+              {"known", known}, {"state", nullptr}, {"content_hash", nullptr},
+              {"binary_file", nullptr}, {"readback_available", false},
+              {"readback_reason", "resource state and DLSS-G pacer synchronization are not verified"}};
+  if (!known) return row;
+  const uint64_t object = event.values[base + 2];
+  Json object_id = nullptr;
+  if (object != 0 && object != kUnknown) {
+    auto [it, inserted] = identities.try_emplace(object, identities.size() + 1);
+    object_id = it->second;
+  }
+  const uint64_t packed = event.values[base + 5];
+  const uint64_t dimension_flags = event.values[base + 7];
+  row.update({{"resource", object_id}, {"width", event.values[base + 3]},
+              {"height", event.values[base + 4]},
+              {"depth_or_array", static_cast<uint16_t>(packed & 0xffff)},
+              {"mip_levels", static_cast<uint16_t>((packed >> 16) & 0xffff)},
+              {"sample_count", static_cast<uint32_t>(packed >> 32)},
+              {"format", event.values[base + 6]},
+              {"dimension", static_cast<uint32_t>(dimension_flags & 0xffffffffu)},
+              {"flags", static_cast<uint32_t>(dimension_flags >> 32)}});
+  return row;
+}
+
+Json EvaluateEventJson(const Event& event, std::unordered_map<uint64_t, uint64_t>& identities) {
+  const bool input_reset_known = event.values[11] != kUnknown && event.values[11] != 0;
+  const bool automode_reset_known = event.values[13] != kUnknown && event.values[13] != 0;
+  const bool input_reset = input_reset_known && event.values[12] != 0;
+  const bool automode_reset = automode_reset_known && event.values[14] != 0;
+  const bool reset = input_reset || automode_reset;
+  const bool reset_known = reset || (input_reset_known && automode_reset_known);
+  const bool count_known = event.values[7] != kUnknown && event.values[7] != 0;
+  const bool index_known = event.values[9] != kUnknown && event.values[9] != 0;
+  const uint32_t count = static_cast<uint32_t>(event.values[8]);
+  const uint32_t index = static_cast<uint32_t>(event.values[10]);
+  const size_t output_base = 18 + static_cast<size_t>(mfgunlock::diagnostic::ResourceKey::kOutputInterpolated) * 8;
+  const bool output_known = event.values[output_base + 1] != 0 &&
+      event.values[output_base + 1] != kUnknown && event.values[output_base + 2] != 0 &&
+      event.values[output_base + 2] != kUnknown;
+  timeline::Classification classification;
+  if (reset) classification.kind = timeline::FrameKind::kReset;
+  else if (reset_known && count_known && index_known && count != 0 && index != 0 &&
+           index <= count && output_known)
+    classification = {timeline::FrameKind::kGenerated, index, count};
+  Json row = {
+      {"evaluation_id", event.values[1]},
+      {"phase", event.values[0] == 0 ? "begin" : "end"},
+      {"backend", "ngx_d3d12"},
+      {"caller", CountOwner(event, 3, 98)},
+      {"generated_count", count_known ? Json(count) : Json(nullptr)},
+      {"generated_index", index_known ? Json(index) : Json(nullptr)},
+      {"reset", reset_known ? Json(reset) : Json(nullptr)},
+      {"input_reset", input_reset_known ? Json(input_reset) : Json(nullptr)},
+      {"automode_override_reset", automode_reset_known ? Json(automode_reset) : Json(nullptr)},
+      {"backbuffer_frame_id", event.values[15] != kUnknown && event.values[15] != 0 ? OptionalValue(event.values[16]) : Json(nullptr)},
+      {"frame_kind", timeline::FrameKindName(classification.kind)},
+      {"marker_label", timeline::MarkerLabel(classification).empty() ? Json(nullptr) : Json(timeline::MarkerLabel(classification))},
+      {"displayed", nullptr},
+      {"display_note", "provider-generated candidate; Streamline pacing may drop generated frames"},
+      {"resources", Json::array()},
+  };
+  for (size_t i = 0; i < static_cast<size_t>(mfgunlock::diagnostic::ResourceKey::kCount); ++i)
+    row["resources"].push_back(EvaluateResourceJson(event, i, identities));
+  return row;
+}
+
+Json BridgeResourceJson(const mfgunlock::diagnostic::ResourceSnapshot& resource,
+                        std::unordered_map<uint64_t, uint64_t>& identities) {
+  static constexpr const char* kNames[] = {
+      "backbuffer", "depth", "motion_vectors", "hudless", "ui", "ui_alpha",
+      "bidirectional_distortion_field", "output_interpolated", "output_real",
+      "output_disable_interpolation"};
+  const size_t index = resource.key;
+  Json row = {{"key", index < std::size(kNames) ? kNames[index] : "unknown"},
+              {"known", resource.known != 0}, {"state", nullptr}, {"content_hash", nullptr},
+              {"binary_file", nullptr}, {"readback_available", false},
+              {"readback_reason", "resource state and DLSS-G pacer synchronization are not verified"}};
+  if (!resource.known) return row;
+  Json object = nullptr;
+  if (resource.object != 0) {
+    auto [it, inserted] = identities.try_emplace(resource.object, identities.size() + 1);
+    object = it->second;
+  }
+  row.update({{"resource", object}, {"width", resource.width}, {"height", resource.height},
+              {"depth_or_array", resource.depth_or_array}, {"mip_levels", resource.mip_levels},
+              {"sample_count", resource.sample_count}, {"format", resource.format},
+              {"dimension", resource.dimension}, {"flags", resource.flags}});
+  return row;
+}
+
+Json BridgeEvaluateJson(const mfgunlock::diagnostic::EvaluateEvent& event,
+                        std::unordered_map<uint64_t, uint64_t>& identities) {
+  const auto classification = timeline::Classify(event);
+  const bool reset = timeline::ResetTrue(event);
+  const bool reset_known = timeline::ResetKnown(event);
+  Json row = {{"evaluation_id", event.evaluation_id},
+              {"phase", event.phase == mfgunlock::diagnostic::EvaluatePhase::kBegin ? "begin" : "end"},
+              {"backend", "ngx_d3d12"}, {"viewport", nullptr},
+              {"generated_count", event.generated_count_known ? Json(event.generated_count) : Json(nullptr)},
+              {"generated_index", event.generated_index_known ? Json(event.generated_index) : Json(nullptr)},
+              {"reset", reset_known ? Json(reset) : Json(nullptr)},
+              {"input_reset", event.reset_known ? Json(event.reset != 0) : Json(nullptr)},
+              {"automode_override_reset", event.automode_reset_known ? Json(event.automode_reset != 0) : Json(nullptr)},
+              {"backbuffer_frame_id", event.backbuffer_frame_id_known ? Json(event.backbuffer_frame_id) : Json(nullptr)},
+              {"frame_kind", timeline::FrameKindName(classification.kind)},
+              {"marker_label", timeline::MarkerLabel(classification).empty() ? Json(nullptr) : Json(timeline::MarkerLabel(classification))},
+              {"result", event.result == mfgunlock::diagnostic::kUnknown32 ? Json(nullptr) : Json(event.result)},
+              {"resources", Json::array()}};
+  for (const auto& resource : event.resources)
+    row["resources"].push_back(BridgeResourceJson(resource, identities));
+  return row;
+}
+
+Json DiagnosticStateJson() {
+  if (!g_query_state) return nullptr;
+  mfgunlock::diagnostic::DiagnosticState state;
+  if (!g_query_state(mfgunlock::diagnostic::kStateVersion, &state)) return nullptr;
+  static constexpr const char* kArchitectures[] = {"auto", "ada", "ampere", "turing", "unknown"};
+  static constexpr const char* kTemporal[] = {"none", "midpoint", "blackwell"};
+  const uint32_t architecture = state.architecture;
+  const uint32_t temporal = static_cast<uint32_t>(state.temporal_backend);
+  return {
+      {"architecture", architecture < std::size(kArchitectures) ? Json(kArchitectures[architecture]) : Json(nullptr)},
+      {"target_sm", state.target_sm ? Json(state.target_sm) : Json(nullptr)},
+      {"temporal_backend", temporal < std::size(kTemporal) ? Json(kTemporal[temporal]) : Json(nullptr)},
+      {"temporal_target_sm", state.temporal_target_sm ? Json(state.temporal_target_sm) : Json(nullptr)},
+      {"boundary_mode", state.boundary_mode == UINT32_MAX ? Json(nullptr) : Json(state.boundary_mode)},
+      {"warp_applied", state.warp_applied != 0},
+      {"warp_target_sm", state.warp_target_sm ? Json(state.warp_target_sm) : Json(nullptr)},
+      {"dynamic_requested", state.dynamic_requested != 0},
+      {"dynamic_applied", state.dynamic_applied != 0},
+      {"fixed_multiplier", state.fixed_multiplier},
+      {"effective_generated", state.effective_generated},
+      {"preset_requested", state.preset_requested},
+      {"preset_supplied", state.preset_supplied < 0 ? Json(nullptr) : Json(state.preset_supplied)},
+      {"preset_applied", state.preset_applied < 0 ? Json(nullptr) : Json(state.preset_applied)},
+      {"ui_composition_requested", state.ui_composition_requested != 0},
+      {"ui_composition_applied", state.ui_composition_applied != 0},
+      {"ui_composition_fallback", state.ui_composition_fallback != 0},
+      {"prepared_provider_count", state.prepared_provider_count},
+  };
+}
+
+std::wstring ModulePath(HMODULE module) {
+  std::wstring path(32768, L'\0');
+  const DWORD length = module ? GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size())) : 0;
+  if (length == 0 || length >= path.size()) return {};
+  path.resize(length);
+  return path;
+}
+
+HMODULE FindLoadedModule(const wchar_t* wanted) {
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snapshot == INVALID_HANDLE_VALUE) return nullptr;
+  HMODULE found = nullptr;
+  MODULEENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Module32FirstW(snapshot, &entry)) do {
+    std::wstring name(entry.szModule);
+    std::transform(name.begin(), name.end(), name.begin(), towlower);
+    std::wstring target(wanted ? wanted : L"");
+    std::transform(target.begin(), target.end(), target.begin(), towlower);
+    if (name == target) { found = entry.hModule; break; }
+  } while (Module32NextW(snapshot, &entry));
+  CloseHandle(snapshot);
+  return found;
+}
+
+std::string Sha256File(const std::wstring& path) {
+  if (path.empty()) return {};
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return {};
+  BCRYPT_ALG_HANDLE algorithm = nullptr;
+  BCRYPT_HASH_HANDLE hash = nullptr;
+  DWORD object_bytes = 0, hash_bytes = 0, returned = 0;
+  std::vector<unsigned char> object;
+  std::vector<unsigned char> digest;
+  bool ok = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
+      BCryptGetProperty(algorithm, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&object_bytes),
+                        sizeof(object_bytes), &returned, 0) == 0 &&
+      BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hash_bytes),
+                        sizeof(hash_bytes), &returned, 0) == 0;
+  if (ok) {
+    object.resize(object_bytes);
+    digest.resize(hash_bytes);
+    ok = BCryptCreateHash(algorithm, &hash, object.data(), object_bytes, nullptr, 0, 0) == 0;
+  }
+  std::array<unsigned char, 1 << 16> buffer{};
+  while (ok) {
+    DWORD read = 0;
+    if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &read, nullptr)) { ok = false; break; }
+    if (read == 0) break;
+    ok = BCryptHashData(hash, buffer.data(), read, 0) == 0;
+  }
+  if (ok) ok = BCryptFinishHash(hash, digest.data(), hash_bytes, 0) == 0;
+  if (hash) BCryptDestroyHash(hash);
+  if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+  CloseHandle(file);
+  if (!ok) return {};
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string result(digest.size() * 2, '0');
+  for (size_t i = 0; i < digest.size(); ++i) {
+    result[i * 2] = kHex[digest[i] >> 4];
+    result[i * 2 + 1] = kHex[digest[i] & 0xf];
+  }
+  return result;
+}
+
+bool WriteTextFile(const std::filesystem::path& path, const std::string& data) {
+  HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                            FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) return false;
+  DWORD written = 0;
+  const bool saved = WriteFile(file, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) &&
+      written == data.size();
+  CloseHandle(file);
+  return saved;
+}
+
 // Formatting, module inventory and file I/O run only on the explicitly requested
 // export worker after recording has stopped. Never enumerate modules in Present.
 DWORD WINAPI ExportWorker(LPVOID pinned_module) {
   std::string message;
+  bool export_succeeded = false;
   try {
     Json root = {{"schema", 1}, {"label", kLabels[g_recorded_label]},
       {"qpc_frequency", g_frequency}, {"dropped_events", g_capture.dropped.load()},
@@ -700,7 +1183,8 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
           {"probe_attempted", g_dynamic_probe_attempted.load(std::memory_order_acquire)},
           {"probe_result", g_dynamic_probe_result.load(std::memory_order_relaxed) == UINT32_MAX
               ? Json(nullptr) : Json(g_dynamic_probe_result.load(std::memory_order_relaxed))}}},
-      {"notes", "Read-only diagnostic boundary, not proof of GPU pixels or final provider evaluation. "
+      {"notes", "Read-only diagnostic boundary. NGX D3D12 Evaluate events are exact provider-call observations, "
+                "but generated candidates are not proof of displayed pixels because Streamline pacing may drop them. "
                 "Legacy tags have no explicit frame ID. Format does not establish color encoding. "
                 "Other addon wrappers may be downstream. The optional one-shot Dynamic MFG probe "
                 "issues one extra slDLSSGGetState query on the game's GetState thread; no Streamline "
@@ -709,6 +1193,13 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
                 "and push-descriptor SRV evidence when available; descriptor-table SRV use is not "
                 "exhaustive. NVAPI is sampled only at export."}};
     root["events"] = Json::array();
+    Json trace_rows = Json::array();
+    uint64_t evaluate_begin_count = 0, evaluate_end_count = 0;
+    uint64_t generated_count = 0, source_count = 0, reset_count = 0, unknown_evaluate_count = 0;
+    uint64_t host_present_count = 0, frame_count_events = 0, options_count = 0, state_count = 0;
+    uint64_t dynamic_option_requests = 0, dynamic_transitions = 0;
+    int last_dynamic_mode = -1;
+    uint64_t fixed_count_events = 0, retry_count_events = 0, fallback_count_events = 0;
     std::unordered_map<uint64_t, uint64_t> ids;
     auto identity = [&](uint64_t value) -> Json {
       if (value == kUnknown || value == 0) return nullptr;
@@ -718,25 +1209,106 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
     {
       std::lock_guard lock(g_capture.mutex);
       for (const auto& event : g_capture.events) {
-        Json row = {{"kind", static_cast<int>(event.kind)}, {"begin_qpc", event.begin},
-          {"end_qpc", event.end}, {"thread", event.thread}, {"version", event.version},
-          {"recognized", event.recognized}};
+        Json row = {{"kind", static_cast<int>(event.kind)}, {"sequence", event.sequence},
+          {"begin_qpc", event.begin}, {"end_qpc", event.end}, {"thread", event.thread},
+          {"version", event.version}, {"recognized", event.recognized}};
+        Json trace = {{"schema", 2}, {"event", KindName(event.kind)},
+          {"sequence", event.sequence}, {"begin_qpc", event.begin}, {"end_qpc", event.end},
+          {"thread_id", event.thread}, {"recognized", event.recognized}};
+        trace["viewport"] = event.viewport == UINT32_MAX ? Json(nullptr) : Json(event.viewport);
+        trace["frame_id"] = event.frame == UINT32_MAX ? Json(nullptr) : Json(event.frame);
+        trace["result"] = event.result == UINT32_MAX ? Json(nullptr) : Json(event.result);
         row["viewport"] = event.viewport == UINT32_MAX ? Json(nullptr) : Json(event.viewport);
         row["frame"] = event.frame == UINT32_MAX ? Json(nullptr) : Json(event.frame);
         row["result"] = event.result == UINT32_MAX ? Json(nullptr) : Json(event.result);
         row["values"] = Json::array();
-        for (auto value : event.values)
+        // Schema 1 exposed exactly 32 value slots. Keep that shape stable;
+        // schema 2 carries the appended Evaluate/resource metadata separately.
+        for (size_t i = 0; i < 32; ++i) {
+          const auto value = event.values[i];
           row["values"].push_back(value == kUnknown ? Json(nullptr) : Json(value));
+        }
         row["floats"] = event.floats;
-        if (event.kind == Kind::tag) {
+        if (event.kind == Kind::options) {
+          trace["options"] = {{"mode", OptionalValue(event.values[0])},
+              {"generated_requested", OptionalValue(event.values[1])},
+              {"flags", OptionalValue(event.values[2])},
+              {"ui_recomposition", OptionalValue(event.values[16])}};
+          ++options_count;
+          if (event.values[0] != kUnknown) {
+            const int dynamic = event.values[0] == static_cast<uint32_t>(sl::DLSSGMode::eDynamic) ? 1 : 0;
+            if (dynamic != 0) ++dynamic_option_requests;
+            if (last_dynamic_mode >= 0 && dynamic != last_dynamic_mode) ++dynamic_transitions;
+            last_dynamic_mode = dynamic;
+          }
+        } else if (event.kind == Kind::state) {
+          trace["state"] = {{"status", OptionalValue(event.values[0])},
+              {"frames_actually_presented", OptionalValue(event.values[1])},
+              {"generated_max", OptionalValue(event.values[2])},
+              {"dynamic_supported", OptionalValue(event.values[4])}};
+          ++state_count;
+        } else if (event.kind == Kind::constants) {
+          trace["constants"] = {{"reset", OptionalValue(event.values[3])}};
+        } else if (event.kind == Kind::tag) {
           row["values"][4] = identity(event.values[4]);
           row["values"][13] = identity(event.values[13]);
+          trace["resource_tag"] = {{"type", OptionalValue(event.values[0])},
+              {"resource", identity(event.values[4])}, {"width", OptionalValue(event.values[5])},
+              {"height", OptionalValue(event.values[6])}, {"format", OptionalValue(event.values[7])}};
+        } else if (event.kind == Kind::frame_count) {
+          row["frame_count"] = CountEvent(event);
+          trace["frame_count"] = row["frame_count"];
+          ++frame_count_events;
+          if (event.values[2] == static_cast<uint32_t>(mfgunlock::countobserver::Origin::kFixed)) ++fixed_count_events;
+          if (event.values[2] == static_cast<uint32_t>(mfgunlock::countobserver::Origin::kRetry)) ++retry_count_events;
+          if (event.values[2] == static_cast<uint32_t>(mfgunlock::countobserver::Origin::kNativeFallback)) ++fallback_count_events;
+          row["values"][11] = identity(event.values[11]);
+          for (size_t index : {size_t{9}, size_t{10}, size_t{12}, size_t{15}})
+            row["values"][index] = nullptr;
         } else if (event.kind == Kind::output) {
           row["values"][0] = identity(event.values[0]);
+          trace["host_present"] = {{"swapchain", identity(event.values[0])},
+              {"format", OptionalValue(event.values[2])}, {"width", OptionalValue(event.values[3])},
+              {"height", OptionalValue(event.values[4])}, {"backbuffer_count", OptionalValue(event.values[5])},
+              {"classification", "host_present_boundary_only"}};
+          ++host_present_count;
+        } else if (event.kind == Kind::lifecycle) {
+          trace["event"] = mfgunlock::diagnostic::LifecycleName(
+              static_cast<mfgunlock::diagnostic::LifecycleKind>(event.values[0]));
+          trace["lifecycle"] = {{"epoch", OptionalValue(event.values[1])}, {"handle", identity(event.values[2])},
+              {"handles", OptionalValue(event.values[3])}, {"evaluates_in_flight", OptionalValue(event.values[4])},
+              {"creates_in_flight", OptionalValue(event.values[5])}, {"releases_in_flight", OptionalValue(event.values[6])},
+              {"tracking_uncertain", event.values[7] == kUnknown ? Json(nullptr) : Json(event.values[7] != 0)},
+              {"requested_quality", OptionalValue(event.values[8])},
+              {"prepared_quality", OptionalValue(event.values[9])},
+              {"mode", OptionalValue(event.values[10])}, {"cuda_modules_retired", nullptr}};
+        } else if (event.kind == Kind::evaluate) {
+          const Json evaluation = EvaluateEventJson(event, ids);
+          row["evaluate"] = evaluation;
+          trace["evaluate"] = evaluation;
+          if (event.values[0] == 0) {
+            ++evaluate_begin_count;
+            const std::string kind = evaluation.value("frame_kind", "unknown");
+            if (kind == "generated") ++generated_count;
+            else if (kind == "source") ++source_count;
+            else if (kind == "reset") ++reset_count;
+            else ++unknown_evaluate_count;
+          } else {
+            ++evaluate_end_count;
+          }
         }
-        root["events"].push_back(std::move(row));
+        if (event.kind != Kind::evaluate && event.kind != Kind::lifecycle) root["events"].push_back(std::move(row));
+        trace_rows.push_back(std::move(trace));
       }
     }
+    root["mfg_probe"] = {{"version", 1}, {"core_bridge", g_capture_had_count_bridge},
+                         {"evaluate_bridge", g_capture_had_evaluate_bridge},
+                         {"state_bridge", g_capture_had_state_bridge},
+                         {"lifecycle_bridge", g_capture_had_lifecycle_bridge},
+                         {"ngx_c_api_hooks", probe::g_hook_count},
+                         {"capacity_exhausted", probe::g_capacity_exhausted},
+                         {"coverage", "core forwarding/capability calls and exported NGX C integer APIs; not arbitrary C++ vtable traffic"},
+                         {"counts_are", "API values, not proof of display cadence"}};
     root["ui_tag_summary"] = {
         {"hudless", g_hudless_tag_count.load(std::memory_order_relaxed)},
         {"ui_color_and_alpha", g_ui_color_alpha_tag_count.load(std::memory_order_relaxed)},
@@ -797,20 +1369,78 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
       } while (Module32NextW(snapshot, &entry));
       CloseHandle(snapshot);
     }
+    const HMODULE provider_module = FindLoadedModule(L"nvngx_dlssg.dll");
+    const std::wstring provider_path = ModulePath(provider_module);
+    const std::string provider_sha256 = Sha256File(provider_path);
+    const Json core_state = DiagnosticStateJson();
+
+    Json summary = {
+        {"schema", 2}, {"label", kLabels[g_recorded_label]}, {"qpc_frequency", g_frequency},
+        {"capture_started_ms", g_capture_started_ms.load(std::memory_order_relaxed)},
+        {"capture_stopped_ms", g_capture_stopped_ms.load(std::memory_order_relaxed)},
+        {"evaluate_begin", evaluate_begin_count}, {"evaluate_end", evaluate_end_count},
+        {"generated_evaluations", generated_count}, {"source_evaluations", source_count},
+        {"reset_evaluations", reset_count}, {"unknown_evaluations", unknown_evaluate_count},
+        {"host_present_events", host_present_count}, {"streamline_options", options_count},
+        {"set_options_events", options_count}, {"streamline_states", state_count},
+        {"dynamic_option_requests", dynamic_option_requests},
+        {"dynamic_transitions", dynamic_transitions}, {"frame_count_events", frame_count_events},
+        {"fixed_override_events", fixed_count_events}, {"retry_events", retry_count_events},
+        {"native_fallback_events", fallback_count_events},
+        {"dropped_events", g_capture.dropped.load()}, {"capacity_exhausted", g_capture.full.load()},
+        {"frame_classification", "provider evaluation only; not proof of display"},
+        {"pixel_marker", "unavailable: no verified Streamline pacer presentation surface"},
+        {"resource_capture", "metadata only: resource state and pacer synchronization are not verified"},
+        {"replay", "gated: raw resources, standalone provider initialization and synchronization are incomplete"},
+        {"backend_support", {{"d3d12", "NGX Evaluate metadata/classification + metadata capture"},
+                             {"vulkan", "frame-count/parameter trace only"},
+                             {"d3d11", "Streamline trace only when observed"}}},
+        {"core_state", core_state},
+    };
+
+    Json manifest = nullptr;
+    mfgunlock::diagnostic::EvaluateEvent capture_begin{}, capture_end{};
+    if (g_evaluate_capture.Snapshot(capture_begin, capture_end)) {
+      std::unordered_map<uint64_t, uint64_t> capture_ids;
+      manifest = {
+          {"schema", 2}, {"capture", "one_shot_ngx_d3d12_evaluate_metadata"},
+          {"provider", {{"module", ModuleInfo(provider_module)},
+                         {"sha256", provider_sha256.empty() ? Json(nullptr) : Json(provider_sha256)}}},
+          {"streamline", {{"interposer", ModuleInfo(GetModuleHandleW(L"sl.interposer.dll"))},
+                           {"dlss_g", ModuleInfo(GetModuleHandleW(L"sl.dlss_g.dll"))}}},
+          {"core_state", core_state},
+          {"evaluate_begin", BridgeEvaluateJson(capture_begin, capture_ids)},
+          {"evaluate_end", BridgeEvaluateJson(capture_end, capture_ids)},
+          {"resource_contents_captured", false},
+          {"resource_capture_reason", "D3D12 resource states and Streamline asynchronous pacer ownership are not verified at this observer boundary"},
+          {"replay", {{"status", "gated"},
+                       {"missing", Json::array({"exact resource contents", "verified standalone DLSS-G initialization context", "verified resource-state/synchronization contract", "Streamline pacer context"})}}},
+      };
+    }
+    summary["evaluate_capture_count"] = manifest.is_null() ? 0 : 1;
+
     wchar_t temporary[MAX_PATH]{};
     if (GetTempPathW(MAX_PATH, temporary) == 0) throw std::runtime_error("Cannot locate TEMP");
     const auto directory = std::filesystem::path(temporary) / "MFGUnlock-Diagnostics";
     std::filesystem::create_directories(directory);
-    const auto path = directory / (std::string(kLabels[g_recorded_label]) + "-" +
-        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".json");
-    const std::string serialized = root.dump();
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot create capture file");
-    DWORD written = 0;
-    const bool saved = WriteFile(file, serialized.data(), static_cast<DWORD>(serialized.size()), &written, nullptr) &&
-                       written == serialized.size();
-    CloseHandle(file);
-    message = saved ? "Saved: " + path.string() : "Capture write failed; file may be incomplete.";
+    const std::string stem = std::string(kLabels[g_recorded_label]) + "-" +
+        std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());
+    const auto legacy_path = directory / (stem + ".json");
+    const auto bundle = directory / (stem + "-bundle");
+    std::filesystem::create_directories(bundle);
+
+    std::string trace_jsonl;
+    for (const auto& row : trace_rows) {
+      trace_jsonl += row.dump();
+      trace_jsonl.push_back('\n');
+    }
+    const bool saved = WriteTextFile(legacy_path, root.dump()) &&
+        WriteTextFile(bundle / "trace.jsonl", trace_jsonl) &&
+        WriteTextFile(bundle / "summary.json", summary.dump(2)) &&
+        (manifest.is_null() || WriteTextFile(bundle / "capture_manifest.json", manifest.dump(2)));
+    export_succeeded = saved;
+    message = saved ? "Saved: " + legacy_path.string() + "; bundle: " + bundle.string()
+                    : "Capture write failed; bundle may be incomplete.";
   } catch (const std::exception& error) {
     message = std::string("Export failed: ") + error.what();
   }
@@ -818,6 +1448,7 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
     std::lock_guard lock(g_output_mutex);
     g_output_message = std::move(message);
   }
+  if (export_succeeded) g_capture_pending_export.store(false, std::memory_order_release);
   g_saving.store(false, std::memory_order_release);
   FreeLibraryAndExitThread(static_cast<HMODULE>(pinned_module), 0);
 }
@@ -961,6 +1592,7 @@ void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain,
 }
 
 void BeginCapture() {
+  g_evaluate_capture.Cancel();
   g_recorded_label = g_label;
   g_truncated_tag_batches.store(0, std::memory_order_relaxed);
   ResetUiCandidateCapture();
@@ -968,11 +1600,21 @@ void BeginCapture() {
   g_capture_started_ms.store(now, std::memory_order_relaxed);
   g_capture_stopped_ms.store(0, std::memory_order_relaxed);
   g_capture_auto_stopped.store(false, std::memory_order_relaxed);
+  // Arm the bounded capture before publishing callbacks. Otherwise an Evaluate
+  // racing observer installation could unregister itself while capture is still idle.
   g_capture.Start(now, kMaxCaptureDurationMs);
+  g_capture_pending_export.store(true, std::memory_order_release);
+  InstallCoreObservation();
+  g_capture_had_count_bridge = g_count_bridge_connected;
+  g_capture_had_evaluate_bridge = g_evaluate_bridge_connected;
+  g_capture_had_state_bridge = g_state_bridge_connected;
+  g_capture_had_lifecycle_bridge = g_lifecycle_bridge_connected;
 }
 
 void StopCapture() {
   g_capture.Stop();
+  UninstallHotObservers();
+  if (!g_evaluate_capture.Complete()) g_evaluate_capture.Cancel();
   g_hudless_window_open.store(false, std::memory_order_release);
   g_capture_auto_stopped.store(false, std::memory_order_relaxed);
   g_capture_stopped_ms.store(GetTickCount64(), std::memory_order_relaxed);
@@ -1039,14 +1681,17 @@ void OnOverlay(reshade::api::effect_runtime*) {
       g_capture_stopped_ms.load(std::memory_order_relaxed) == 0) {
     g_capture_stopped_ms.store(now_ms, std::memory_order_relaxed);
     g_capture_auto_stopped.store(true, std::memory_order_relaxed);
+    UninstallHotObservers();
+    if (!g_evaluate_capture.Complete()) g_evaluate_capture.Cancel();
   }
+  const bool pending_export = g_capture_pending_export.load(std::memory_order_acquire);
   ImGui::Combo("Capture label (manual)", &g_label, kLabels, static_cast<int>(std::size(kLabels)));
-  ImGui::BeginDisabled(saving || active || !g_installed.load());
+  ImGui::BeginDisabled(saving || active || pending_export || !g_enabled);
   if (ImGui::Button("Start capture")) BeginCapture();
   ImGui::EndDisabled();
   ImGui::SameLine();
-  ImGui::BeginDisabled(saving || !active);
-  if (ImGui::Button("Stop & export")) {
+  ImGui::BeginDisabled(saving || !pending_export);
+  if (ImGui::Button(active ? "Stop & export" : "Export capture")) {
     StopCapture();
     LaunchExport();
   }
@@ -1058,6 +1703,28 @@ void OnOverlay(reshade::api::effect_runtime*) {
       ? 0.0 : static_cast<double>(end_ms - started_ms) / 1000.0;
   const char* capture_state = active ? "recording"
       : g_capture_auto_stopped.load(std::memory_order_relaxed) ? "auto-stopped" : "stopped";
+  ImGui::Text("MfgProbe: count=%s, Evaluate=%s, state=%s; NGX C hooks=%u%s",
+              (active ? g_count_bridge_connected : g_capture_had_count_bridge) ? "connected" : "unavailable",
+              (active ? g_evaluate_bridge_connected : g_capture_had_evaluate_bridge) ? "connected" : "unavailable",
+              g_state_bridge_connected ? "connected" : "unavailable", probe::g_hook_count,
+              probe::g_capacity_exhausted ? " (capacity reached)" : "");
+  const auto last_kind = static_cast<timeline::FrameKind>(g_last_frame_kind.load(std::memory_order_relaxed));
+  const uint32_t last_index = g_last_generated_index.load(std::memory_order_relaxed);
+  const uint32_t last_count = g_last_generated_count.load(std::memory_order_relaxed);
+  if (last_kind == timeline::FrameKind::kGenerated)
+    ImGui::Text("Last provider Evaluate: %llu, FG %u/%u (display not proven).",
+                static_cast<unsigned long long>(g_last_evaluation_id.load(std::memory_order_relaxed)),
+                last_index, last_count);
+  else
+    ImGui::Text("Last provider Evaluate: %llu, classification=%s.",
+                static_cast<unsigned long long>(g_last_evaluation_id.load(std::memory_order_relaxed)),
+                timeline::FrameKindName(last_kind));
+  ImGui::TextDisabled("Pixel generated-frame marker: unavailable; Streamline pacer presentation surface is not verified.");
+  ImGui::BeginDisabled(!active || !g_evaluate_bridge_connected || g_evaluate_capture.Armed());
+  if (ImGui::Button("Capture next provider Evaluate")) g_evaluate_capture.Arm();
+  ImGui::EndDisabled();
+  if (g_evaluate_capture.Armed()) ImGui::TextDisabled("Evaluate capture armed: waiting for the next tracked DLSS-G Evaluate.");
+  else if (g_evaluate_capture.Complete()) ImGui::TextDisabled("Evaluate metadata capture complete; Stop & export to write the bundle.");
   ImGui::Text("Capture: %s, %.1f s; dropped: %u; buffer full: %s",
               capture_state, elapsed_s, g_capture.dropped.load(),
               g_capture.full.load() ? "yes" : "no");
@@ -1084,7 +1751,8 @@ extern "C" __declspec(dllexport) constexpr const char* NAME = "MFG Diagnostics";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION =
     "Read-only Streamline/DLSS-G capture; no runtime, kernel or pacing overrides";
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
+  if (reason == DLL_PROCESS_DETACH && reserved != nullptr) return TRUE;
   if (reason == DLL_PROCESS_ATTACH) {
     if (!reshade::register_addon(module)) return FALSE;
     int enabled = 0;

@@ -37,6 +37,8 @@ void Reset() {
   g_fail_augmented = false;
   fc::g_ui_candidate_injection_enabled = true;
   fc::g_ui_candidate_active = false;
+  fc::g_ui_candidate_ready = false;
+  fc::g_ui_candidate_format = 0;
   fc::g_ui_candidate_runtime_declined = false;
   fc::g_ui_candidate_retry_frames = 0;
   fc::g_ui_candidate_consecutive_failures = 0;
@@ -72,6 +74,7 @@ fc::UiCandidateSnapshot Candidate() {
 
 int main() {
   Reset();
+  fc::g_ui_candidate_ready = true;
   fc::g_ui_candidate_format = 29;
   sl::DLSSGOptions source{};
   source.structVersion = sl::kStructVersion3;
@@ -82,6 +85,36 @@ int main() {
             forwarded.uiBufferFormat == 29 &&
             forwarded.enableUserInterfaceRecomposition == sl::Boolean::eTrue,
         "candidate format is synchronized through addon-owned UIR options");
+
+  const uint64_t revision_before_format = fc::g_options_revision.load();
+  fc::g_ui_candidate_ready = false;
+  fc::g_ui_candidate_format = 29;
+  fc::g_ui_candidate_options_synced = true;
+  fc::internal::UpdateUiCandidateFormat(29);
+  Check(fc::g_ui_candidate_ready.load() && fc::g_ui_candidate_format.load() == 29 &&
+            !fc::g_ui_candidate_options_synced.load() &&
+            fc::g_options_revision.load() == revision_before_format + 1,
+        "candidate availability schedules a fresh runtime UIR options submission");
+  const uint64_t revision_after_format = fc::g_options_revision.load();
+  fc::internal::UpdateUiCandidateFormat(29);
+  Check(fc::g_options_revision.load() == revision_after_format,
+        "unchanged candidate format does not resubmit options every frame");
+  fc::g_ui_candidate_options_synced = true;
+  fc::internal::NotifyUiCandidateUnavailable();
+  Check(!fc::g_ui_candidate_ready.load() &&
+            fc::g_ui_candidate_format.load() == 0 &&
+            !fc::g_ui_candidate_options_synced.load() &&
+            fc::g_options_revision.load() == revision_after_format,
+        "candidate loss invalidates readiness without submitting disabled options");
+  fc::internal::UpdateUiCandidateFormat(29);
+  Check(fc::g_ui_candidate_ready.load() &&
+            fc::g_options_revision.load() == revision_after_format + 1,
+        "same-format candidate reacquisition creates one new options revision");
+  const uint64_t revision_after_reacquire = fc::g_options_revision.load();
+  fc::internal::UpdateUiCandidateFormat(29);
+  Check(fc::g_options_revision.load() == revision_after_reacquire,
+        "stable reacquired candidate does not create a SetOptions storm");
+  fc::g_ui_candidate_options_synced = true;
 
   sl::Resource hudless(sl::ResourceType::eTex2d,
                        reinterpret_cast<void*>(0x56780000), 0x40);
