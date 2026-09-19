@@ -154,10 +154,13 @@ sl::Result RealInit(const sl::Preferences& preferences, uint64_t) {
 
 unsigned int g_support_calls = 0;
 unsigned int g_support_architecture = 0;
+sl::Result g_forced_support_result = sl::Result::eOk;
+bool g_force_support_result = false;
 
 sl::Result RealSupport(sl::Feature feature, const sl::AdapterInfo&) {
   ++g_support_calls;
   if (feature != sl::kFeatureDLSS_G) return sl::Result::eErrorFeatureMissing;
+  if (g_force_support_result) return g_forced_support_result;
   NV_GPU_ARCH_INFO info{};
   info.version = NV_GPU_ARCH_INFO_VER;
   if (ngx_internal::HookedGetArchInfo(g_gpu, &info) != NVAPI_OK)
@@ -455,10 +458,30 @@ int main() {
             streamline_internal::g_real_support == RealSupport,
         "modern Streamline support hook installed");
   sl::AdapterInfo adapter_info{};
+  adapter_info.deviceLUID = &g_luid;
+  adapter_info.deviceLUIDSizeInBytes = sizeof(g_luid);
   g_support_architecture = 0;
   Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
             sl::Result::eOk && g_support_architecture == architecture::kAdaArchitecture,
         "DLSS-G support query uses scoped architecture exposure");
+  g_force_support_result = true;
+  g_forced_support_result = sl::Result::eErrorNoSupportedAdapterFound;
+  Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
+            sl::Result::eOk,
+        "prepared provider relaxes cached Streamline adapter rejection");
+  LUID other_luid = g_luid;
+  ++other_luid.LowPart;
+  sl::AdapterInfo other_adapter{};
+  other_adapter.deviceLUID = &other_luid;
+  other_adapter.deviceLUIDSizeInBytes = sizeof(other_luid);
+  Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, other_adapter) ==
+            sl::Result::eErrorNoSupportedAdapterFound,
+        "Streamline rejection preserved for a different adapter LUID");
+  g_forced_support_result = sl::Result::eErrorFeatureMissing;
+  Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
+            sl::Result::eErrorFeatureMissing,
+        "Streamline non-adapter failures remain native");
+  g_force_support_result = false;
   g_support_architecture = 0;
   Check(streamline_internal::HookedIsFeatureSupported(99, adapter_info) ==
             sl::Result::eErrorFeatureMissing && g_support_architecture == 0,

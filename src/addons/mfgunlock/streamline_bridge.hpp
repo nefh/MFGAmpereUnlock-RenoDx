@@ -175,6 +175,15 @@ inline void LifecyclePreflight() {
   }
 }
 
+inline bool SupportAdapterMatchesBoundGpu(const sl::AdapterInfo& adapter) {
+  if (!adapter.deviceLUID || adapter.deviceLUIDSizeInBytes != sizeof(LUID)) return false;
+  LUID luid = {};
+  std::memcpy(&luid, adapter.deviceLUID, sizeof(luid));
+  return luid.LowPart == ngx::internal::g_luid_low.load(std::memory_order_acquire) &&
+         static_cast<uint32_t>(luid.HighPart) ==
+             ngx::internal::g_luid_high.load(std::memory_order_acquire);
+}
+
 inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapter) {
   if (!g_real_support) return sl::Result::eErrorNotInitialized;
   if (g_shutting_down.load(std::memory_order_acquire) || !g_enabled.load() ||
@@ -184,16 +193,28 @@ inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::Adapte
   LifecyclePreflight();
   const auto gpu = ngx::internal::g_bound_gpu.load(std::memory_order_acquire);
   ngx::internal::ScopedArchQuery scope(gpu);
-  const auto result = g_real_support(feature, adapter);
+  const auto native_result = g_real_support(feature, adapter);
 
   static std::atomic_uint32_t last_result{0xffffffffu};
-  const auto value = static_cast<uint32_t>(result);
-  if (last_result.exchange(value, std::memory_order_relaxed) != value) {
+  const auto native_value = static_cast<uint32_t>(native_result);
+  if (last_result.exchange(native_value, std::memory_order_relaxed) != native_value) {
     std::stringstream message;
-    message << "Streamline DLSS-G support query returned 0x" << std::hex << value;
-    Log(message.str(), result != sl::Result::eOk);
+    message << "Streamline DLSS-G support query returned 0x" << std::hex << native_value;
+    Log(message.str(), native_result != sl::Result::eOk);
   }
-  return result;
+
+  const auto provider_status = GetProviderStatus();
+  const policy::StreamlineSupportEvidence evidence{
+      g_enabled.load(std::memory_order_relaxed), gpu != nullptr,
+      SupportAdapterMatchesBoundGpu(adapter), provider_status.QualifiedCount(), native_value};
+  const auto* profile = architecture::ActiveProfile();
+  if (policy::CanRelaxStreamlineSupport(evidence, profile)) {
+    static std::atomic_bool adjusted_logged{false};
+    if (!adjusted_logged.exchange(true, std::memory_order_relaxed))
+      Log("Streamline DLSS-G adapter admission relaxed (0x6 -> eOk)");
+    return sl::Result::eOk;
+  }
+  return native_result;
 }
 
 inline void InstallSupportHook() {

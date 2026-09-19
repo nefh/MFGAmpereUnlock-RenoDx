@@ -20,6 +20,7 @@ using architecture::kAdaArchitecture;
 inline constexpr uint32_t kDlssGFeatureId = 11;
 inline constexpr uint32_t kNgxSuccess = 1;
 inline constexpr uint32_t kAdapterUnsupported = 4;
+inline constexpr uint32_t kStreamlineNoSupportedAdapter = 6;
 
 struct RequirementsEvidence {
   bool enabled;
@@ -49,6 +50,25 @@ inline bool CanExposeArchitecture(bool enabled, bool fg_requirements_scope, bool
                                    const ArchitectureProfile* profile) {
   return profile && profile->NeedsRetarget() && enabled && fg_requirements_scope &&
          same_physical_gpu && provider_ready && nvapi_result == 0;
+}
+
+struct StreamlineSupportEvidence {
+  bool enabled;
+  bool adapter_bound;
+  bool adapter_matches;
+  unsigned int prepared_providers;
+  uint32_t result;
+};
+
+inline bool CanRelaxStreamlineSupport(const StreamlineSupportEvidence& evidence,
+                                      const ArchitectureProfile* profile) {
+  // A prepared native provider plus an exact renderer-adapter LUID match is
+  // required before relaxing Streamline's cached adapter-admission verdict.
+  // Preserve all other SL errors so OS, driver, plugin and integration failures
+  // continue to fail closed.
+  return profile && profile->NeedsRetarget() && evidence.enabled && evidence.adapter_bound &&
+         evidence.adapter_matches && evidence.prepared_providers == 1 &&
+         evidence.result == kStreamlineNoSupportedAdapter;
 }
 
 // Counts are generated frames, not presentation multipliers. A nonzero

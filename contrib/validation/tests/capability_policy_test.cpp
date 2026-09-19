@@ -67,10 +67,32 @@ int main() {
                                    (mask & 8) != 0, (mask & 16) ? -1 : 0, profile) == (mask == 15),
             "NVAPI scope matrix");
     }
+    const StreamlineSupportEvidence support_base{
+        true, true, true, 1, kStreamlineNoSupportedAdapter};
+    Check(CanRelaxStreamlineSupport(support_base, profile),
+          "qualified Streamline adapter admission override");
+    for (int mask = 0; mask < 16; ++mask) {
+      auto support = support_base;
+      support.enabled = (mask & 1) != 0;
+      support.adapter_bound = (mask & 2) != 0;
+      support.adapter_matches = (mask & 4) != 0;
+      support.prepared_providers = (mask & 8) ? 1u : 0u;
+      Check(CanRelaxStreamlineSupport(support, profile) == (mask == 15),
+            "Streamline admission evidence matrix");
+    }
+    for (uint32_t result : {0u, 4u, 7u, 31u, 32u, 0xffffffffu}) {
+      auto support = support_base;
+      support.result = result;
+      Check(!CanRelaxStreamlineSupport(support, profile),
+            "preserve non-adapter Streamline failures");
+    }
   }
   for (const auto* profile : {&architecture::kAda, static_cast<const ArchitectureProfile*>(nullptr)}) {
     Check(!CanRelaxRequirements(base, profile), "native or unresolved profile leaves NGX unchanged");
     Check(!CanExposeArchitecture(true, true, true, true, 0, profile), "no architecture spoof");
+    const StreamlineSupportEvidence support{true, true, true, 1, kStreamlineNoSupportedAdapter};
+    Check(!CanRelaxStreamlineSupport(support, profile),
+          "native or unresolved profile leaves Streamline support unchanged");
   }
 
   Check(CapabilityFrameCount(1, 3) == 3, "raise lower capability");
