@@ -1,0 +1,10 @@
+{
+  "14": {
+    "reshade_ref": "v6.3.3",
+    "swapchain_resize_arg": false
+  },
+  "18": {
+    "reshade_ref": "v6.7.0",
+    "swapchain_resize_arg": true
+  }
+}

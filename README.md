@@ -292,6 +292,19 @@ Remove-Item Env:CL
 
 Output: `build.vs/Release/renodx-mfgunlock.addon64`
 
+For an exact ReShade API compatibility build, use `tools/build_mfgunlock.ps1`.
+The API number is a build parameter and multiple variants can be built in one run:
+
+```powershell
+.\tools\build_mfgunlock.ps1 -ReShadeApi 14
+.\tools\build_mfgunlock.ps1 -ReShadeApi 14,18
+```
+
+API-specific binaries are written to `dist/mfgunlock/reshade-api<version>/`.
+The build script uses the exact ReShade release and matching ImGui submodule from
+`tools/reshade-api-targets.json`; API 14 currently maps to ReShade `v6.3.3` and
+API 18 to `v6.7.0`.
+
 Prebuilt binaries are attached to [Releases](../../releases).
 
 For development, the separate `mfgdiagnostics` addon records Streamline/NGX

@@ -27,7 +27,7 @@
 #include <sl.h>
 #include <sl_dlss_g.h>
 
-#include <include/reshade.hpp>
+#include "./reshade_compat.hpp"
 
 #include "./architecture.hpp"
 #include "./ngx_hook.hpp"

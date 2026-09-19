@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include <include/reshade.hpp>
+#include "./reshade_compat.hpp"
 
 #include "./ptx_retarget.hpp"
 

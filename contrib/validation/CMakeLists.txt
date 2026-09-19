@@ -30,6 +30,8 @@ if(NOT WIN32)
   endforeach()
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/quality_guard.hpp"
                  "${mock_dir}/quality_guard.hpp" COPYONLY)
+  configure_file("${REPO_ROOT}/src/addons/mfgunlock/reshade_compat.hpp"
+                 "${mock_dir}/reshade_compat.hpp" COPYONLY)
   add_executable(host_wrappers_test "${TEST_ROOT}/host_wrappers_test.cpp")
   target_include_directories(host_wrappers_test PRIVATE "${mock_dir}")
   add_test(NAME host_wrappers_test COMMAND host_wrappers_test)

@@ -50,7 +50,7 @@
 #include <sstream>
 #include <vector>
 
-#include <include/reshade.hpp>
+#include "./reshade_compat.hpp"
 #include "./provider.hpp"
 
 namespace mfgunlock::midpoint {

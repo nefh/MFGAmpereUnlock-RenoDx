@@ -27,7 +27,7 @@
 #include <tuple>
 #include <vector>
 
-#include <include/reshade.hpp>
+#include "./reshade_compat.hpp"
 
 namespace mfgunlock::hook {
 

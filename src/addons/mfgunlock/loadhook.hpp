@@ -17,7 +17,7 @@
 #include <cstring>
 #include <string>
 
-#include <include/reshade.hpp>
+#include "./reshade_compat.hpp"
 
 #include "./ngx_hook.hpp"
 

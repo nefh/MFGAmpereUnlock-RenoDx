@@ -23,8 +23,8 @@
 #include <utility>
 #include <vector>
 
-#include <deps/imgui/imgui.h>
-#include <include/reshade.hpp>
+#include "./imgui_compat.hpp"
+#include "./reshade_compat.hpp"
 
 #include "./blackwell_temporal.hpp"
 #include "./diagnostic_bridge.hpp"
@@ -1675,9 +1675,12 @@ void OnInitCommandQueue(reshade::api::command_queue* /*queue*/) {
 }
 
 bool IsHdrColorSpace(reshade::api::color_space color_space) {
-  return color_space == reshade::api::color_space::scrgb ||
-         color_space == reshade::api::color_space::hdr10_pq ||
-         color_space == reshade::api::color_space::hdr10_hlg;
+  // ReShade API 14 uses the legacy names extended_srgb_linear / hdr10_st2084,
+  // while newer APIs expose scrgb / hdr10_pq. The ABI values are stable:
+  // 2 = scRGB, 3 = HDR10 PQ/ST2084, 4 = HDR10 HLG. Compare the underlying
+  // value so one source tree compiles against both naming schemes.
+  const uint32_t value = static_cast<uint32_t>(color_space);
+  return value == 2u || value == 3u || value == 4u;
 }
 
 void ObserveUiOutput(reshade::api::swapchain* swapchain) {
@@ -1690,7 +1693,7 @@ void ObserveUiOutput(reshade::api::swapchain* swapchain) {
   mfgunlock::framecount::NotifyHdrState(IsHdrColorSpace(color_space));
 }
 
-void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+void HandleInitSwapchain(reshade::api::swapchain* swapchain) {
   if (swapchain == nullptr) return;
   auto* device = swapchain->get_device();
   if (device == nullptr || swapchain->get_back_buffer_count() == 0) return;
@@ -1718,7 +1721,7 @@ void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
   mfgunlock::framecount::NotifyHdrState(IsHdrColorSpace(color_space));
 }
 
-void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+void HandleDestroySwapchain(reshade::api::swapchain* swapchain) {
   if (swapchain == nullptr) return;
   MarkSwapchainBuffers(swapchain, false);
   reshade::api::swapchain* expected = swapchain;
@@ -1734,6 +1737,36 @@ void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
   mfgunlock::framecount::NotifyOutputUnknown();
 }
 
+#ifndef MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG
+#if RESHADE_API_VERSION == 14
+#define MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG 0
+#elif RESHADE_API_VERSION >= 18
+#define MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG 1
+#else
+#error "Unsupported ReShade swapchain callback ABI"
+#endif
+#endif
+
+#if MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG == 0
+void OnInitSwapchain(reshade::api::swapchain* swapchain) {
+  HandleInitSwapchain(swapchain);
+}
+
+void OnDestroySwapchain(reshade::api::swapchain* swapchain) {
+  HandleDestroySwapchain(swapchain);
+}
+#elif MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG == 1
+void OnInitSwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  HandleInitSwapchain(swapchain);
+}
+
+void OnDestroySwapchain(reshade::api::swapchain* swapchain, bool /*resize*/) {
+  HandleDestroySwapchain(swapchain);
+}
+#else
+#error "Unsupported ReShade swapchain callback ABI"
+#endif
+
 void OnPresentUiOutput(reshade::api::command_queue* /*queue*/,
                        reshade::api::swapchain* swapchain,
                        const reshade::api::rect* /*source_rect*/,
@@ -1742,7 +1775,7 @@ void OnPresentUiOutput(reshade::api::command_queue* /*queue*/,
                        const reshade::api::rect* /*dirty_rects*/) {
   if (swapchain == nullptr) return;
   if (g_primary_swapchain.load(std::memory_order_acquire) == nullptr)
-    OnInitSwapchain(swapchain, false);
+    HandleInitSwapchain(swapchain);
   if (g_primary_swapchain.load(std::memory_order_acquire) != swapchain) return;
 
   auto* device = swapchain->get_device();
