@@ -39,6 +39,8 @@ int main() {
     Check(ConfiguredMode(value) == expected,
           "configured Warp mode is independent of UI visibility");
   }
+  Check(mfgunlock::validatedwarp::ModeLabel(Mode::kBlackwellBaseline, 89) ==
+            "Blackwell baseline sm_89", "Ada diagnostic label");
   Check(mfgunlock::validatedwarp::ModeLabel(Mode::kBlackwellBaseline, 86) ==
             "Blackwell baseline sm_86", "Ampere diagnostic label");
   Check(mfgunlock::validatedwarp::ModeLabel(Mode::kValidatedWarp, 75) ==

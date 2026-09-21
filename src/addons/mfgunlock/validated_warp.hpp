@@ -2,11 +2,9 @@
  * Validated Warp Blend provider patch.
  * SPDX-License-Identifier: MIT
  *
- * Ports the Validated Warp Blend path from MFGAdaUnlock to the validated
- * Ampere and Turing backport targets. The patch is admitted only for the exact
- * 310.9.1 provider metadata and exact Kernel_BlendCandidatesFused PTX identity.
- * The Blackwell PTX target is rebuilt for sm_86 or sm_75 only after the
- * corresponding offline ptxas qualification has passed.
+ * Cross-generation Validated Warp Blend path for the exact 310.9.1 provider.
+ * The same qualified Blackwell PTX is rebuilt for native Ada sm_89 or the
+ * Ampere/Turing sm_86/sm_75 backends; provider retargeting remains separate.
  */
 
 #pragma once
@@ -87,32 +85,10 @@ constexpr uint32_t kBlackwellArch = 120;
 constexpr uint64_t kUncompressedFlags = 0x41;
 constexpr size_t kMaxFatbinSize = 4u * 1024u * 1024u;
 
-struct ProviderProfile {
-  uint32_t timestamp;
-  uint32_t image_size;
-  const char* version;
-};
-
-// Exact PE metadata for the validated 310.9.1 provider. PTX identity is
-// validated independently below, so metadata alone can never authorize a patch.
-constexpr ProviderProfile kProviderProfiles[] = {
-    {0x6A986031u, 7565312u, "310.9.1"},
-};
-
-struct PtxProfile {
-  uint32_t arch;
-  size_t declared_raw_size;  // zero when normalized identity is the authoritative guard
-  size_t normalized_size;
-  uint64_t raw_fnv1a64;
-  size_t descriptor_references;
-  const char* entry_name;
-  const char* parameter_signature;
-};
-
-constexpr PtxProfile kPtxProfile = {
-    kBlackwellArch, 39639u, 39638u, 0x7a6f5f41105c6d85ull, 8u,
-    "Kernel_BlendCandidatesFused",
-    ".param .align 8 .b8 Kernel_BlendCandidatesFused_param_0[240]"};
+using ProviderProfile = profiles::ProviderProfile;
+using PtxProfile = profiles::PtxProfile;
+inline constexpr auto& kProviderProfiles = profiles::kProfiles;
+inline constexpr auto& kPtxProfile = profiles::kWarpPtx;
 
 inline uint16_t ReadU16(const uint8_t* bytes) {
   uint16_t value = 0;
@@ -388,7 +364,7 @@ inline bool BuildRetargetedFatbin(const uint8_t* fatbin, size_t fatbin_size,
                                    const PtxProfile& profile, RewritePtxCallback rewrite,
                                    std::vector<uint8_t>& rebuilt,
                                    std::string& why, uint32_t target_sm = kAmpereArch) {
-  if (target_sm != 75 && target_sm != kAmpereArch) {
+  if (target_sm != 75 && target_sm != kAmpereArch && target_sm != kAdaArch) {
     why = "unsupported quality PTX target";
     return false;
   }

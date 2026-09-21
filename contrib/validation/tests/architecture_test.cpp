@@ -29,19 +29,20 @@ int main() {
     Check(!arch::ResolveAuto(0x1002, 0xffffffff, 0), "detection cannot replace explicit selection");
     Check(arch::ActiveProfile() == profile, "explicit profile unchanged");
     Check(profile->exposed_arch == 0x190, "DLSS-G capability architecture");
-    Check(arch::NeedsBridge() == (mode != Architecture::kAda), "native Ada skips backport");
+    Check(arch::NeedsBridge() == (mode != Architecture::kAda), "native Ada skips provider retarget bridge");
   }
-  Check(arch::kAda.native_arch == 0x190 && arch::kAda.target_sm == 89, "Ada target");
-  Check(arch::kAmpere.native_arch == 0x170 && arch::kAmpere.target_sm == 86, "Ampere target");
-  Check(arch::kTuring.native_arch == 0x160 && arch::kTuring.target_sm == 75, "Turing target");
-  Check(!arch::SupportsDynamicMfg(Architecture::kAda), "Ada uses native Dynamic path");
-  Check(arch::SupportsDynamicMfg(Architecture::kAmpere), "Ampere Dynamic backport");
-  Check(arch::SupportsDynamicMfg(Architecture::kTuring), "Turing Dynamic backport");
-  Check(!arch::SupportsDynamicMfg(Architecture::kUnknown), "unknown Dynamic profile rejected");
-  Check(!arch::SupportsQualityBackport(Architecture::kAda), "Ada uses native quality path");
-  Check(arch::SupportsQualityBackport(Architecture::kAmpere), "Ampere quality backport");
-  Check(arch::SupportsQualityBackport(Architecture::kTuring), "Turing quality backport");
-  Check(!arch::SupportsQualityBackport(Architecture::kUnknown), "unknown quality profile rejected");
+  Check(arch::kAda.native_arch == 0x190 && arch::kAda.target_sm == 89 &&
+            arch::kAda.provider_backend == ProviderBackend::kNativeSm89 &&
+            !arch::kAda.RequiresProviderRetarget(),
+        "Ada native provider backend");
+  Check(arch::kAmpere.native_arch == 0x170 && arch::kAmpere.target_sm == 86 &&
+            arch::kAmpere.provider_backend == ProviderBackend::kRetargetSm86 &&
+            arch::kAmpere.RequiresProviderRetarget(),
+        "Ampere provider backend");
+  Check(arch::kTuring.native_arch == 0x160 && arch::kTuring.target_sm == 75 &&
+            arch::kTuring.provider_backend == ProviderBackend::kRetargetSm75 &&
+            arch::kTuring.RequiresProviderRetarget(),
+        "Turing provider backend");
   Check(arch::Parse("aMpErE") == Architecture::kAmpere, "case-insensitive name");
   Check(arch::Parse(" \tTURING\r\n") == Architecture::kTuring, "trim name");
   Check(arch::Parse("auto") == Architecture::kAuto, "auto name");

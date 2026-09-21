@@ -22,13 +22,24 @@ enum class Architecture {
   kUnknown,
 };
 
+enum class ProviderBackend {
+  kUnknown,
+  kNativeSm89,
+  kRetargetSm86,
+  kRetargetSm75,
+};
+
 struct ArchitectureProfile {
   Architecture architecture;
+  ProviderBackend provider_backend;
   uint32_t native_arch;
   uint32_t exposed_arch;
   uint32_t target_sm;
 
-  constexpr bool NeedsRetarget() const { return target_sm != 89; }
+  constexpr bool RequiresProviderRetarget() const {
+    return provider_backend == ProviderBackend::kRetargetSm86 ||
+           provider_backend == ProviderBackend::kRetargetSm75;
+  }
 };
 
 namespace architecture {
@@ -39,9 +50,12 @@ inline constexpr uint32_t kAmpereArchitecture = 0x170;
 inline constexpr uint32_t kAdaArchitecture = 0x190;
 inline constexpr Architecture kDefault = Architecture::kAuto;
 
-inline constexpr ArchitectureProfile kAda{Architecture::kAda, kAdaArchitecture, kAdaArchitecture, 89};
-inline constexpr ArchitectureProfile kAmpere{Architecture::kAmpere, kAmpereArchitecture, kAdaArchitecture, 86};
-inline constexpr ArchitectureProfile kTuring{Architecture::kTuring, kTuringArchitecture, kAdaArchitecture, 75};
+inline constexpr ArchitectureProfile kAda{Architecture::kAda, ProviderBackend::kNativeSm89,
+                                           kAdaArchitecture, kAdaArchitecture, 89};
+inline constexpr ArchitectureProfile kAmpere{Architecture::kAmpere, ProviderBackend::kRetargetSm86,
+                                              kAmpereArchitecture, kAdaArchitecture, 86};
+inline constexpr ArchitectureProfile kTuring{Architecture::kTuring, ProviderBackend::kRetargetSm75,
+                                              kTuringArchitecture, kAdaArchitecture, 75};
 
 inline constexpr const ArchitectureProfile* GetProfile(Architecture value) {
   switch (value) {
@@ -60,14 +74,6 @@ inline constexpr const char* Name(Architecture value) {
     case Architecture::kTuring: return "Turing";
     default: return "Unknown";
   }
-}
-
-inline constexpr bool SupportsDynamicMfg(Architecture value) {
-  return value == Architecture::kAmpere || value == Architecture::kTuring;
-}
-
-inline constexpr bool SupportsQualityBackport(Architecture value) {
-  return value == Architecture::kAmpere || value == Architecture::kTuring;
 }
 
 inline bool EqualsInsensitive(std::string_view a, std::string_view b) {
@@ -132,7 +138,7 @@ inline bool ResolveAuto(uint32_t vendor, uint32_t native_arch, uint32_t implemen
 
 inline bool NeedsBridge() {
   const auto* profile = ActiveProfile();
-  return profile ? profile->NeedsRetarget() : NeedsDetection();
+  return profile ? profile->RequiresProviderRetarget() : NeedsDetection();
 }
 
 }  // namespace architecture

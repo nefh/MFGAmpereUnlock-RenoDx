@@ -8,7 +8,7 @@ include(CTest)
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
-foreach(test architecture_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test)
+foreach(test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test)
   add_executable(${test} "${TEST_ROOT}/${test}.cpp")
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
@@ -24,8 +24,8 @@ if(NOT WIN32)
     get_filename_component(name "${header}" NAME)
     configure_file("${header}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
-  foreach(name architecture.hpp streamline_bridge.hpp ngx_bridge.hpp capability_policy.hpp
-               framecount.hpp ui_candidate.hpp count_observer.hpp diagnostic_bridge.hpp quality_config.hpp)
+  foreach(name architecture.hpp provider_profile.hpp feature_capabilities.hpp streamline_bridge.hpp ngx_bridge.hpp capability_policy.hpp
+               framecount.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp quality_config.hpp)
     configure_file("${REPO_ROOT}/src/addons/mfgunlock/${name}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/quality_guard.hpp"
@@ -85,6 +85,10 @@ target_compile_definitions(temporal_runtime_test PRIVATE MFG_TEST_RUNTIME_MIDPOI
 target_include_directories(temporal_runtime_test PRIVATE "${TEST_ROOT}/provider_mocks")
 add_test(NAME temporal_runtime_test COMMAND temporal_runtime_test)
 
+add_executable(endpoint_backend_test "${TEST_ROOT}/endpoint_backend_test.cpp")
+target_include_directories(endpoint_backend_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME endpoint_backend_test COMMAND endpoint_backend_test)
+
 add_executable(inspect_provider "${CMAKE_CURRENT_SOURCE_DIR}/tools/inspect_provider.cpp")
 
 add_executable(lifecycle_test "${TEST_ROOT}/lifecycle_test.cpp")
@@ -102,6 +106,12 @@ add_test(NAME mfg_probe_test COMMAND mfg_probe_test)
 
 add_executable(diagnostics_timeline_test "${TEST_ROOT}/diagnostics_timeline_test.cpp")
 add_test(NAME diagnostics_timeline_test COMMAND diagnostics_timeline_test)
+
+add_executable(diagnostic_bridge_test "${TEST_ROOT}/diagnostic_bridge_test.cpp")
+add_test(NAME diagnostic_bridge_test COMMAND diagnostic_bridge_test)
+
+add_executable(integration_contract_test "${TEST_ROOT}/integration_contract_test.cpp")
+add_test(NAME integration_contract_test COMMAND integration_contract_test)
 
 add_executable(diagnostics_trace_test "${TEST_ROOT}/diagnostics_trace_test.cpp")
 target_include_directories(diagnostics_trace_test PRIVATE "${TEST_ROOT}/diagnostics_mocks")
@@ -141,3 +151,13 @@ if(MFG_NATIVE_STACK_TESTS)
     set_tests_properties(small_stack_${kib} PROPERTIES TIMEOUT 25)
   endforeach()
 endif()
+
+add_executable(export_provider_profile "${CMAKE_CURRENT_SOURCE_DIR}/tools/export_provider_profile.cpp")
+add_executable(provider_profile_test "${TEST_ROOT}/provider_profile_test.cpp")
+add_test(NAME provider_profile_test COMMAND provider_profile_test)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME provider_qualification_test
+  COMMAND "${Python3_EXECUTABLE}" "${REPO_ROOT}/tools/qualify_provider.py" --self-test
+          --check-registry "$<TARGET_FILE:export_provider_profile>")
+get_property(mfg_tests DIRECTORY PROPERTY TESTS)
+set_tests_properties(${mfg_tests} PROPERTIES TIMEOUT 60)

@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
         rejected += result == ptx::Result::kRejected;
 
         bool temporal_compatible = false;
-        if (accepted || !target_profile->NeedsRetarget()) {
+        if (accepted || !target_profile->RequiresProviderRetarget()) {
           const auto* prepared = accepted ? plan.replacement.data() : candidate;
           const size_t replacement_bytes =
               16 + static_cast<size_t>(fatbin::ReadU64(prepared + 8));
@@ -176,7 +176,7 @@ int main(int argc, char** argv) {
       }
     }
 
-    const bool candidate = (!target_profile->NeedsRetarget() || retargeted > 0) &&
+    const bool candidate = (!target_profile->RequiresProviderRetarget() || retargeted > 0) &&
                            rejected == 0 && temporal_matches == 1;
     std::cout << "\n  ],\n"
               << "  \"retargetable\":" << retargeted << ",\n"

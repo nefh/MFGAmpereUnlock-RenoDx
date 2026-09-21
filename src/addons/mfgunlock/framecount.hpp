@@ -26,13 +26,17 @@
 
 #include <sl.h>
 #include <sl_dlss_g.h>
+#include <sl_pcl.h>
 
 #include "./reshade_compat.hpp"
 
 #include "./architecture.hpp"
+#include "./provider_profile.hpp"
+#include "./feature_capabilities.hpp"
 #include "./ngx_hook.hpp"
 #include "./count_observer.hpp"
 #include "./diagnostic_bridge.hpp"
+#include "./integration_contract.hpp"
 #include <optional>
 #include "./quality_guard.hpp"
 #include "./ui_candidate.hpp"
@@ -77,6 +81,29 @@ inline std::atomic_bool g_state_seen{false};
 inline std::atomic<unsigned int> g_dlssg_status{0};
 inline std::atomic_bool g_failure_status_logged{false};
 
+// Last game request, actual forwarded request, and the last request accepted by
+// Streamline. UINT32_MAX means no trustworthy observation is available.
+inline std::atomic<uint32_t> g_last_requested_mode{diagnostic::kUnknown32};
+inline std::atomic<uint32_t> g_last_requested_generated{diagnostic::kUnknown32};
+inline std::atomic<uint32_t> g_last_forwarded_mode{diagnostic::kUnknown32};
+inline std::atomic<uint32_t> g_last_forwarded_generated{diagnostic::kUnknown32};
+inline std::atomic<uint32_t> g_last_accepted_mode{diagnostic::kUnknown32};
+inline std::atomic<uint32_t> g_last_accepted_generated{diagnostic::kUnknown32};
+inline std::atomic_bool g_effective_max_seen{false};
+inline std::atomic<unsigned int> g_effective_max_generated{0};
+
+// Turing diagnostic v2: bounded call tracing for the first active DLSS-G setup.
+// This is observational only; results and caller-owned structures are unchanged.
+inline std::atomic_uint32_t g_turing_diag_set_options_calls{0};
+inline std::atomic_uint32_t g_turing_diag_get_state_calls{0};
+inline constexpr uint32_t kTuringDiagCallTraceLimit = 16;
+
+inline void TuringDiagLog(const std::string& message) {
+  const DWORD last_error = GetLastError();
+  reshade::log::message(reshade::log::level::info, message.c_str());
+  SetLastError(last_error);
+}
+
 // Zero means no Streamline plugin is active or its structural ceiling is not
 // known yet. Direct NGX intentionally leaves this at zero.
 inline std::atomic_bool g_streamline_plugin_seen{false};
@@ -106,6 +133,8 @@ inline bool (*g_dynamic_stack_ready)() = nullptr;
 inline std::atomic_bool g_ui_composition_enabled{true};
 inline std::atomic_bool g_hdr_state_seen{false};
 inline std::atomic_bool g_hdr_active{false};
+inline std::atomic_bool g_output_color_space_seen{false};
+inline std::atomic<uint32_t> g_output_color_space{diagnostic::kUnknown32};
 inline std::atomic_bool g_ui_composition_applied{false};
 inline std::atomic_bool g_ui_composition_fell_back{false};
 inline std::atomic<unsigned int> g_ui_composition_result{0};
@@ -195,6 +224,7 @@ using SetTagFn = sl::Result (*)(const sl::ViewportHandle&, const sl::ResourceTag
                                sl::CommandBuffer*);
 using SetTagForFrameFn = PFun_slSetTagForFrame*;
 using SetConstantsFn = PFun_slSetConstants*;
+using PclSetMarkerFn = PFun_slPCLSetMarker*;
 
 inline SetOptionsFn g_real_set_options = nullptr;
 inline GetStateFn g_real_get_state = nullptr;
@@ -203,12 +233,20 @@ inline hook::AddressHook g_get_state_entry;
 
 inline SetOptionsFn RealSetOptions() {
   const auto entry = g_set_options_entry.Original<SetOptionsFn>();
-  return entry ? entry : g_real_set_options;
+  if (entry) {
+    if (!hook::IsCurrent(g_set_options_entry.identity)) return nullptr;
+    return entry;
+  }
+  return g_real_set_options;
 }
 
 inline GetStateFn RealGetState() {
   const auto entry = g_get_state_entry.Original<GetStateFn>();
-  return entry ? entry : g_real_get_state;
+  if (entry) {
+    if (!hook::IsCurrent(g_get_state_entry.identity)) return nullptr;
+    return entry;
+  }
+  return g_real_get_state;
 }
 inline std::atomic_bool g_entry_shutting_down{false};
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
@@ -216,13 +254,14 @@ inline InitFn g_real_init = nullptr;
 inline SetTagFn g_real_set_tag = nullptr;
 inline SetTagForFrameFn g_real_set_tag_for_frame = nullptr;
 inline SetConstantsFn g_real_set_constants = nullptr;
+inline PclSetMarkerFn g_real_pcl_set_marker = nullptr;
 inline std::vector<hook::HookItem> g_ui_hooks;
 inline std::atomic_bool g_ui_hooks_installed{false};
 
 inline bool KnownOptionsAbi(const sl::DLSSGOptions& options) {
   return options.structType == sl::DLSSGOptions::s_structType &&
          options.structVersion >= sl::kStructVersion1 &&
-         options.structVersion <= sl::kStructVersion5;
+         options.structVersion <= profiles::kDlssg31091.options_version;
 }
 
 inline bool SetFixedOverrideState(FixedOverrideStatus status, unsigned int requested,
@@ -238,7 +277,7 @@ inline bool SetFixedOverrideState(FixedOverrideStatus status, unsigned int reque
 
 inline bool DynamicStackReady() {
   const auto* profile = architecture::ActiveProfile();
-  return profile && architecture::SupportsDynamicMfg(profile->architecture) &&
+  return profile && features::BackendSupports(profile, features::Feature::kDynamicMfg) &&
          g_dynamic_d3d12.load(std::memory_order_relaxed) &&
          g_streamline_plugin_seen.load(std::memory_order_acquire) &&
          g_streamline_max_generated.load(std::memory_order_acquire) != 0 &&
@@ -247,7 +286,7 @@ inline bool DynamicStackReady() {
 
 inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result) {
   if (result != sl::Result::eOk || !DynamicStackReady() ||
-      state.structVersion < sl::kStructVersion4) {
+      state.structVersion < profiles::kDlssg31091.state_version) {
     return false;
   }
   if (state.bIsDynamicMFGSupported != sl::Boolean::eTrue &&
@@ -528,7 +567,69 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
                                  bool ui_fallback = false) {
   const auto real = RealSetOptions();
   if (!real) return sl::Result::eErrorNotInitialized;
+  const uint32_t diag_call =
+      g_turing_diag_set_options_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  const bool diag_trace = diagnostic::g_verbose.load(std::memory_order_relaxed) &&
+                          diag_call <= kTuringDiagCallTraceLimit;
+  if (diag_trace) {
+    std::stringstream message;
+    message << "mfgunlock: TuringDiagV2 SetOptions#" << diag_call
+            << " BEGIN thread=" << GetCurrentThreadId()
+            << " viewport=" << static_cast<uint32_t>(viewport)
+            << " origin=" << static_cast<uint32_t>(origin)
+            << " abi=" << options.structVersion;
+    if (KnownOptionsAbi(options)) {
+      message << " mode=" << static_cast<uint32_t>(options.mode)
+              << " generated=" << options.numFramesToGenerate
+              << " flags=0x" << std::hex << static_cast<uint32_t>(options.flags) << std::dec;
+      if (options.structVersion >= sl::kStructVersion5)
+        message << " dynamicTargetFPS=" << options.dynamicTargetFrameRate;
+    } else {
+      message << " unknown-options-abi";
+    }
+    TuringDiagLog(message.str());
+  }
+  if (KnownOptionsAbi(options)) {
+    g_last_forwarded_mode.store(static_cast<uint32_t>(options.mode),
+                                std::memory_order_relaxed);
+    g_last_forwarded_generated.store(
+        options.mode == sl::DLSSGMode::eOff ? 0u : options.numFramesToGenerate,
+        std::memory_order_relaxed);
+  } else {
+    g_last_forwarded_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+    g_last_forwarded_generated.store(diagnostic::kUnknown32,
+                                     std::memory_order_relaxed);
+  }
+  if (KnownOptionsAbi(options)) {
+    integration::ObserveSetOptions(
+        static_cast<uint32_t>(viewport), static_cast<uint32_t>(options.flags),
+        options.dynamicResWidth, options.dynamicResHeight,
+        options.mvecDepthWidth, options.mvecDepthHeight,
+        options.colorWidth, options.colorHeight, options.numBackBuffers,
+        options.structVersion >= sl::kStructVersion3,
+        options.structVersion >= sl::kStructVersion3
+            ? static_cast<uint32_t>(options.queueParallelismMode)
+            : integration::kUnknown32,
+        GetCurrentThreadId());
+  }
   const auto result = real(viewport, options);
+  if (result == sl::Result::eOk && KnownOptionsAbi(options)) {
+    g_last_accepted_mode.store(static_cast<uint32_t>(options.mode),
+                               std::memory_order_relaxed);
+    g_last_accepted_generated.store(
+        options.mode == sl::DLSSGMode::eOff ? 0u : options.numFramesToGenerate,
+        std::memory_order_relaxed);
+  } else {
+    g_last_accepted_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+    g_last_accepted_generated.store(diagnostic::kUnknown32,
+                                    std::memory_order_relaxed);
+  }
+  if (diag_trace) {
+    std::stringstream message;
+    message << "mfgunlock: TuringDiagV2 SetOptions#" << diag_call
+            << " END result=0x" << std::hex << static_cast<uint32_t>(result);
+    TuringDiagLog(message.str());
+  }
   const auto observer = g_mode_observer.load(std::memory_order_acquire);
   if (KnownOptionsAbi(options) && observer) {
     const DWORD last_error = GetLastError();
@@ -714,6 +815,17 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
                                   bool automatic = false) {
   if (RealSetOptions() == nullptr) return sl::Result::eErrorNotInitialized;
   const bool known = KnownOptionsAbi(options);
+  if (known) {
+    g_last_requested_mode.store(static_cast<uint32_t>(options.mode),
+                                std::memory_order_relaxed);
+    g_last_requested_generated.store(
+        options.mode == sl::DLSSGMode::eOff ? 0u : options.numFramesToGenerate,
+        std::memory_order_relaxed);
+  } else {
+    g_last_requested_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+    g_last_requested_generated.store(diagnostic::kUnknown32,
+                                     std::memory_order_relaxed);
+  }
   const countobserver::Scope scope(caller,
       known ? options.numFramesToGenerate : countobserver::kUnknown);
   if (countobserver::g_callback.load(std::memory_order_relaxed)) {
@@ -760,7 +872,7 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
   if (dynamic_requested && DynamicStackReady() &&
       g_dynamic_support_seen.load(std::memory_order_acquire) &&
       g_dynamic_supported.load(std::memory_order_relaxed)) {
-    const bool backend_ready = !profile->NeedsRetarget() ||
+    const bool backend_ready = !profile->RequiresProviderRetarget() ||
         (g_multi_frame_ready != nullptr && g_multi_frame_ready());
     if (backend_ready) {
       sl::DLSSGOptions dynamic_options{};
@@ -826,7 +938,7 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
 
   const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
   // Backported providers need temporal correction before a native 3x/4x request.
-  if (profile->NeedsRetarget() && g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
+  if (profile->RequiresProviderRetarget() && g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
       options.numFramesToGenerate > 1) {
     bool ready = g_multi_frame_ready();
     if (ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
@@ -865,7 +977,8 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
   // Fixed multi-frame compatibility can use the legacy software-pacing path.
   // Dynamic MFG returns above and leaves pacing to the current NVIDIA runtime.
   if (desired > 1) {
-    unsigned int ceiling = g_streamline_max_generated.load(std::memory_order_acquire);
+    unsigned int ceiling = (std::min)(g_streamline_max_generated.load(std::memory_order_acquire),
+                                      profiles::kDlssg31091.validated_generated_ceiling);
     if (ceiling != 0 && desired > ceiling) {
       if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
         std::stringstream message;
@@ -881,7 +994,8 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
     if (g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr && !automatic) {
       g_ensure_pacing();
     }
-    ceiling = g_streamline_max_generated.load(std::memory_order_acquire);
+    ceiling = (std::min)(g_streamline_max_generated.load(std::memory_order_acquire),
+                         profiles::kDlssg31091.validated_generated_ceiling);
     if (ceiling != 0 && desired > ceiling) {
       if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
         std::stringstream message;
@@ -1368,10 +1482,56 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
   return forward(forwarded, count);
 }
 
+inline bool ContractResourceRole(sl::BufferType type, integration::ResourceRole& role) {
+  if (type == sl::kBufferTypeBackbuffer) role = integration::ResourceRole::kBackbuffer;
+  else if (type == sl::kBufferTypeDepth) role = integration::ResourceRole::kDepth;
+  else if (type == sl::kBufferTypeMotionVectors) role = integration::ResourceRole::kMotionVectors;
+  else if (type == sl::kBufferTypeHUDLessColor) role = integration::ResourceRole::kHudLess;
+  else if (type == sl::kBufferTypeUIColorAndAlpha) role = integration::ResourceRole::kUiColorAndAlpha;
+  else if (type == sl::kBufferTypeUIAlpha) role = integration::ResourceRole::kUiAlpha;
+  else if (type == sl::kBufferTypeBidirectionalDistortionField)
+    role = integration::ResourceRole::kBidirectionalDistortionField;
+  else return false;
+  return true;
+}
+
+inline void ObserveContractTags(const sl::ViewportHandle& viewport,
+                                const sl::ResourceTag* tags, uint32_t count) {
+  if (tags == nullptr) return;
+  for (uint32_t index = 0; index < count; ++index) {
+    integration::ResourceRole role{};
+    if (!ContractResourceRole(tags[index].type, role)) continue;
+    const sl::Resource* resource = tags[index].resource;
+    const bool present = resource != nullptr && resource->native != nullptr;
+    const bool extent_known = tags[index].extent.width != 0 && tags[index].extent.height != 0;
+    integration::ObserveTag(
+        static_cast<uint32_t>(viewport), role, present, true,
+        static_cast<uint32_t>(tags[index].lifecycle), extent_known,
+        tags[index].extent.left, tags[index].extent.top,
+        tags[index].extent.width, tags[index].extent.height,
+        present && resource->state != UINT32_MAX,
+        present ? resource->state : 0,
+        present && resource->nativeFormat != 0,
+        present ? resource->nativeFormat : 0,
+        present ? reinterpret_cast<uint64_t>(resource->native) : 0);
+  }
+}
+
+inline sl::Result HookedPclSetMarker(sl::PCLMarker marker, const sl::FrameToken& frame) {
+  if (g_real_pcl_set_marker == nullptr) return sl::Result::eErrorNotInitialized;
+  if (marker == sl::PCLMarker::ePresentStart)
+    integration::ObservePresentMarker(true, static_cast<uint32_t>(frame));
+  else if (marker == sl::PCLMarker::ePresentEnd)
+    integration::ObservePresentMarker(false, static_cast<uint32_t>(frame));
+  // Observation only: never synthesize or suppress application markers.
+  return g_real_pcl_set_marker(marker, frame);
+}
+
 inline sl::Result HookedSetTag(const sl::ViewportHandle& viewport,
                                const sl::ResourceTag* tags, uint32_t count,
                                sl::CommandBuffer* command_buffer) {
   if (g_real_set_tag == nullptr) return sl::Result::eErrorNotInitialized;
+  ObserveContractTags(viewport, tags, count);
   return FilterUiTags(
       viewport, tags, count, command_buffer,
       [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count) {
@@ -1384,6 +1544,7 @@ inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame,
                                        const sl::ResourceTag* tags, uint32_t count,
                                        sl::CommandBuffer* command_buffer) {
   if (g_real_set_tag_for_frame == nullptr) return sl::Result::eErrorNotInitialized;
+  ObserveContractTags(viewport, tags, count);
   return FilterUiTags(
       viewport, tags, count, command_buffer,
       [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count) {
@@ -1396,6 +1557,7 @@ inline sl::Result HookedSetConstants(const sl::Constants& values,
                                      const sl::FrameToken& frame,
                                      const sl::ViewportHandle& viewport) {
   if (g_real_set_constants == nullptr) return sl::Result::eErrorNotInitialized;
+  integration::ObserveConstants(static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport));
   ApplyLiveOptions(viewport);
   if (!g_enabled.load(std::memory_order_relaxed) ||
       !g_ui_composition_enabled.load(std::memory_order_relaxed)) {
@@ -1439,7 +1601,52 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   if (!g_enabled.load() || !architecture::ActiveProfile())
     return RealGetState()(viewport, state, options);
 
+  const uint32_t diag_call =
+      g_turing_diag_get_state_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  const bool diag_trace = diagnostic::g_verbose.load(std::memory_order_relaxed) &&
+                          diag_call <= kTuringDiagCallTraceLimit;
+  if (diag_trace) {
+    std::stringstream message;
+    message << "mfgunlock: TuringDiagV2 GetState#" << diag_call
+            << " BEGIN thread=" << GetCurrentThreadId()
+            << " viewport=" << static_cast<uint32_t>(viewport)
+            << " requested-abi=" << state.structVersion;
+    TuringDiagLog(message.str());
+  }
   const sl::Result result = RealGetState()(viewport, state, options);
+  if (result == sl::Result::eOk &&
+      state.structType == sl::DLSSGState::s_structType &&
+      state.structVersion >= sl::kStructVersion1 &&
+      state.structVersion <= sl::kStructVersion4) {
+    const bool extended_contract = state.structVersion >= sl::kStructVersion4;
+    integration::ObserveState(
+        static_cast<uint32_t>(viewport), static_cast<uint32_t>(state.status),
+        extended_contract && (state.bIsVsyncSupportAvailable == sl::Boolean::eTrue ||
+                              state.bIsVsyncSupportAvailable == sl::Boolean::eFalse),
+        extended_contract && state.bIsVsyncSupportAvailable == sl::Boolean::eTrue,
+        extended_contract, extended_contract
+            ? reinterpret_cast<uint64_t>(state.inputsProcessingCompletionFence) : 0,
+        extended_contract ? state.lastPresentInputsProcessingCompletionFenceValue : 0);
+  }
+  if (diag_trace) {
+    std::stringstream message;
+    message << "mfgunlock: TuringDiagV2 GetState#" << diag_call
+            << " NATIVE-END result=0x" << std::hex << static_cast<uint32_t>(result)
+            << std::dec << " abi=" << state.structVersion;
+    if (result == sl::Result::eOk &&
+        state.structType == sl::DLSSGState::s_structType &&
+        state.structVersion >= sl::kStructVersion1 &&
+        state.structVersion <= sl::kStructVersion4) {
+      message << " status=0x" << std::hex << static_cast<uint32_t>(state.status) << std::dec
+              << " presented=" << state.numFramesActuallyPresented;
+      if (state.structVersion >= sl::kStructVersion2)
+        message << " maxGenerated=" << state.numFramesToGenerateMax;
+      if (state.structVersion >= sl::kStructVersion4)
+        message << " dynamicSupported="
+                << (state.bIsDynamicMFGSupported == sl::Boolean::eTrue ? "yes" : "no");
+    }
+    TuringDiagLog(message.str());
+  }
   struct StateObservation {
     const sl::DLSSGState& state;
     countobserver::Event event;
@@ -1480,10 +1687,18 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
       // into addon-owned storage so no field beyond the caller's allocation is
       // ever read or written. The original call/result above remains native.
       sl::DLSSGState extended{};
-      extended.next = state.next;
+      extended.next = nullptr;  // Do not invoke caller-owned extension chains a second time.
       extended.structVersion = sl::kStructVersion4;
       const sl::Result probe = RealGetState()(viewport, extended, options);
       ObserveDynamicSupport(extended, probe);
+      // GetState consumes the presented-frame counter. Account for frames
+      // consumed by our one-time probe in the same caller-visible result.
+      if (probe == sl::Result::eOk) {
+        const uint64_t presented = uint64_t{state.numFramesActuallyPresented} +
+                                   extended.numFramesActuallyPresented;
+        state.numFramesActuallyPresented = static_cast<uint32_t>(
+            (std::min)(presented, uint64_t{UINT32_MAX}));
+      }
     }
 
     const unsigned int status = static_cast<unsigned int>(state.status);
@@ -1501,13 +1716,25 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   g_runtime_max_generated.store(reported, std::memory_order_relaxed);
   if (g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
     if (state.numFramesToGenerateMax > 1) state.numFramesToGenerateMax = 1;
+    g_effective_max_generated.store(state.numFramesToGenerateMax,
+                                    std::memory_order_relaxed);
+    g_effective_max_seen.store(true, std::memory_order_release);
     return result;
   }
 
-  const unsigned int wanted = g_streamline_max_generated.load(std::memory_order_relaxed);
-  if (wanted == 0 || reported == wanted) return result;
+  const unsigned int wanted = (std::min)(g_streamline_max_generated.load(std::memory_order_relaxed),
+                                        profiles::kDlssg31091.validated_generated_ceiling);
+  if (wanted == 0 || reported == wanted) {
+    g_effective_max_generated.store(state.numFramesToGenerateMax,
+                                    std::memory_order_relaxed);
+    g_effective_max_seen.store(true, std::memory_order_release);
+    return result;
+  }
 
   state.numFramesToGenerateMax = wanted;
+  g_effective_max_generated.store(state.numFramesToGenerateMax,
+                                  std::memory_order_relaxed);
+  g_effective_max_seen.store(true, std::memory_order_release);
   if (!g_capacity_advertised.exchange(true, std::memory_order_relaxed)) {
     std::stringstream s;
     s << "mfgunlock: slDLSSGGetState reported a maximum of " << reported
@@ -1573,6 +1800,10 @@ inline void TryInstallUiHooks(HMODULE interposer) {
     hooks.push_back({"slSetConstants", reinterpret_cast<void**>(&g_real_set_constants),
                      reinterpret_cast<void*>(&HookedSetConstants)});
   }
+  if (GetProcAddress(interposer, "slPCLSetMarker") != nullptr) {
+    hooks.push_back({"slPCLSetMarker", reinterpret_cast<void**>(&g_real_pcl_set_marker),
+                     reinterpret_cast<void*>(&HookedPclSetMarker)});
+  }
   if (hooks.empty()) return;
   if (!hook::Install(interposer, hooks, "Streamline UI Composition guard")) return;
 
@@ -1630,9 +1861,12 @@ inline UiDebugSnapshot ReadUiDebugSnapshot() {
   return snapshot;
 }
 
-inline void NotifyHdrState(bool hdr) {
+inline void NotifyHdrState(bool hdr, uint32_t color_space = diagnostic::kUnknown32) {
   const bool previous = g_hdr_active.exchange(hdr, std::memory_order_relaxed);
   const bool seen = g_hdr_state_seen.exchange(true, std::memory_order_acq_rel);
+  g_output_color_space_seen.store(color_space != diagnostic::kUnknown32,
+                                  std::memory_order_release);
+  g_output_color_space.store(color_space, std::memory_order_relaxed);
   if (!seen || previous != hdr) {
     internal::ForgetUiOutputs();
     internal::RequestAllUiResets();
@@ -1644,6 +1878,8 @@ inline void NotifyHdrState(bool hdr) {
 inline void NotifyOutputUnknown() {
   g_hdr_state_seen.store(false, std::memory_order_release);
   g_hdr_active.store(false, std::memory_order_relaxed);
+  g_output_color_space_seen.store(false, std::memory_order_release);
+  g_output_color_space.store(diagnostic::kUnknown32, std::memory_order_relaxed);
   g_ui_composition_applied.store(false, std::memory_order_relaxed);
   internal::NotifyUiCandidateUnavailable();
   internal::ForgetUiOutputs();
@@ -1752,6 +1988,36 @@ inline void NotifyDynamicModeChanged() {
   g_dynamic_result.store(0, std::memory_order_relaxed);
   g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
   NotifyLiveOptionsChanged();
+}
+
+inline void NotifyDlssgPluginUnloaded(HMODULE module) {
+  if (!module) return;
+  internal::InvalidateLiveOptions();
+  if (internal::g_set_options_entry.identity.module == module) {
+    hook::UninstallAddress(internal::g_set_options_entry);
+    internal::g_real_set_options = nullptr;
+  }
+  if (internal::g_get_state_entry.identity.module == module) {
+    hook::UninstallAddress(internal::g_get_state_entry);
+    internal::g_real_get_state = nullptr;
+  }
+  g_streamline_plugin_seen.store(false, std::memory_order_release);
+  g_streamline_max_generated.store(0, std::memory_order_release);
+  g_capacity_advertised.store(false, std::memory_order_relaxed);
+  g_runtime_max_generated.store(0, std::memory_order_relaxed);
+  g_effective_max_generated.store(0, std::memory_order_relaxed);
+  g_effective_max_seen.store(false, std::memory_order_release);
+  g_last_forwarded_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+  g_last_forwarded_generated.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+  g_last_accepted_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+  g_last_accepted_generated.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+  g_dynamic_support_seen.store(false, std::memory_order_release);
+  g_dynamic_supported.store(false, std::memory_order_release);
+  g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
+  g_dynamic_applied.store(false, std::memory_order_relaxed);
+  g_dynamic_fell_back.store(false, std::memory_order_relaxed);
+  g_dynamic_runtime_declined.store(false, std::memory_order_release);
+  g_dynamic_result.store(0, std::memory_order_relaxed);
 }
 
 // Install before the host caches DLSS-G function pointers.

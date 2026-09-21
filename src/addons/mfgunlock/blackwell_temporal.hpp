@@ -1,9 +1,9 @@
 /*
- * Full Blackwell temporal framework retarget for Ampere and Turing.
+ * Full Blackwell temporal framework for Ada, Ampere and Turing.
  * SPDX-License-Identifier: MIT
  *
  * The exact DLSS-G 310.9.1 Blackwell motion-vector, inpaint and inpaint-
- * decision PTX programs are rebuilt as sm_86 or sm_75 fatbins. Intermediate Scatter
+ * decision PTX programs are rebuilt as sm_89, sm_86 or sm_75 fatbins. Intermediate Scatter
  * Retention is an optional rewrite of the motion-vector program inside this
  * complete temporal backend; it is never applied as a standalone redirect.
  */
@@ -90,32 +90,11 @@ struct Result {
 
 namespace internal {
 
-constexpr validatedwarp::internal::PtxProfile kMotionVectorProfile = {
-    validatedwarp::internal::kBlackwellArch,
-    0u,
-    90731u,
-    0xb1a2811b29625d41ull,
-    8u,
-    "Kernel_EstimateIntermMvecsScatter",
-    "ld.param.f32 %f2, [Kernel_EstimateIntermMvecsScatter_param_0+120];"};
+inline constexpr auto& kMotionVectorProfile = profiles::kMotionVectorPtx;
 
-constexpr validatedwarp::internal::PtxProfile kInpaintProfile = {
-    validatedwarp::internal::kBlackwellArch,
-    0u,
-    26439u,
-    0x546151924160b69bull,
-    8u,
-    "Kernel_Prev2CurrUnpackPull",
-    ".entry Kernel_Prev2CurrUnpackPull("};
+inline constexpr auto& kInpaintProfile = profiles::kInpaintPtx;
 
-constexpr validatedwarp::internal::PtxProfile kInpaintDecisionProfile = {
-    validatedwarp::internal::kBlackwellArch,
-    0u,
-    23116u,
-    0x9b47635b91b2436bull,
-    8u,
-    "Kernel_OutputPull",
-    ".entry Kernel_OutputPull("};
+inline constexpr auto& kInpaintDecisionProfile = profiles::kInpaintDecisionPtx;
 
 struct KernelSpec {
   KernelRole role;
@@ -125,12 +104,12 @@ struct KernelSpec {
 };
 
 constexpr std::array<KernelSpec, 3> kKernelSpecs = {{
-    {KernelRole::kMotionVector, &kMotionVectorProfile, 39968u,
-     0x9642092def23b3dfull},
-    {KernelRole::kInpaint, &kInpaintProfile, 17568u,
-     0x1ba6454ab039f9ddull},
-    {KernelRole::kInpaintDecision, &kInpaintDecisionProfile, 15136u,
-     0xc4a5eb4a8694f835ull},
+    {KernelRole::kMotionVector, &kMotionVectorProfile, profiles::kQualityKernels[0].ada_cubin_bytes,
+     profiles::kQualityKernels[0].ada_cubin_hash},
+    {KernelRole::kInpaint, &kInpaintProfile, profiles::kQualityKernels[1].ada_cubin_bytes,
+     profiles::kQualityKernels[1].ada_cubin_hash},
+    {KernelRole::kInpaintDecision, &kInpaintDecisionProfile, profiles::kQualityKernels[2].ada_cubin_bytes,
+     profiles::kQualityKernels[2].ada_cubin_hash},
 }};
 
 constexpr char kMotionDivisorLoad[] =
@@ -345,7 +324,7 @@ inline bool Prepare(HMODULE module, bool enable_intermediate_scatter,
                     uint32_t target_sm = 86) {
   plan = {};
   result = {};
-  if (target_sm != 75 && target_sm != 86) {
+  if (target_sm != 75 && target_sm != 86 && target_sm != 89) {
     result.detail = "unsupported temporal target";
     return false;
   }

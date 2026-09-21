@@ -104,6 +104,16 @@ int main() {
   Check(turing_plan.target_sm == 75 && !turing_plan.ready,
         "SM75 target is retained without false readiness");
 
+  temporal::Plan ada_plan;
+  temporal::Result ada_result;
+  std::string ada_version;
+  Check(!temporal::Prepare(nullptr, false, BoundaryArtifactMode::kOff,
+                           ada_plan, ada_result, ada_version, 89),
+        "SM89 target proceeds to exact provider qualification");
+  Check(ada_plan.target_sm == 89 && !ada_plan.ready &&
+            ada_result.detail != "unsupported temporal target",
+        "native SM89 target is accepted without false readiness");
+
   Check(internal::kKernelSpecs.size() == 3, "three complete temporal roles");
   Check(internal::kMotionVectorProfile.normalized_size == 90731u,
         "motion-vector PTX size");

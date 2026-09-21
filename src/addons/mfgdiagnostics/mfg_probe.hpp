@@ -147,4 +147,44 @@ inline void Install(HMODULE module) {
   for (const char* name : kExports)
     if (GetProcAddress(module, name)) g_capacity_exhausted = true;
 }
+
+
+template <size_t I>
+bool UninstallSlot() {
+  auto& slot = g_slots[I];
+  if (!slot.module) return true;
+  std::vector<mfgunlock::hook::HookItem> hooks;
+  if (slot.targets[0]) hooks.emplace_back(
+      kExports[0], reinterpret_cast<void**>(&slot.set_unsigned),
+      reinterpret_cast<void*>(&Set<I, unsigned int>));
+  if (slot.targets[1]) hooks.emplace_back(
+      kExports[1], reinterpret_cast<void**>(&slot.set_signed),
+      reinterpret_cast<void*>(&Set<I, int>));
+  if (slot.targets[2]) hooks.emplace_back(
+      kExports[2], reinterpret_cast<void**>(&slot.get_unsigned),
+      reinterpret_cast<void*>(&Get<I, unsigned int>));
+  if (slot.targets[3]) hooks.emplace_back(
+      kExports[3], reinterpret_cast<void**>(&slot.get_signed),
+      reinterpret_cast<void*>(&Get<I, int>));
+  if (!hooks.empty() && !mfgunlock::hook::TryUninstall(hooks)) return false;
+
+  HMODULE retained = slot.module;
+  slot = {};
+  if (g_hook_count >= hooks.size()) g_hook_count -= static_cast<unsigned int>(hooks.size());
+  else g_hook_count = 0;
+  FreeLibrary(retained);
+  return true;
+}
+
+inline bool Uninstall() {
+  using Uninstaller = bool (*)();
+  static constexpr Uninstaller kUninstallers[] = {
+      UninstallSlot<0>, UninstallSlot<1>, UninstallSlot<2>, UninstallSlot<3>,
+      UninstallSlot<4>, UninstallSlot<5>, UninstallSlot<6>, UninstallSlot<7>};
+  bool ok = true;
+  for (const auto uninstall : kUninstallers)
+    if (!uninstall()) ok = false;
+  if (ok) g_capacity_exhausted = false;
+  return ok;
+}
 }  // namespace mfgdiagnostics::probe

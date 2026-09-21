@@ -1,4 +1,5 @@
 # Build output
+/dist/
 build/
 build.vs/
 build.validation/
@@ -21,6 +22,10 @@ nvngx_*
 sl.*.dll
 _nvngx*
 
+# Local source dependencies
+/external/RenoDX/
+/external/reshade-api/
+
 # Editor / OS
 .vs/
 .vscode/
@@ -30,3 +35,7 @@ Thumbs.db
 desktop.ini
 __pycache__/
 *.pyc
+
+# Local validation output
+validation-logs/
+/validation-logs/

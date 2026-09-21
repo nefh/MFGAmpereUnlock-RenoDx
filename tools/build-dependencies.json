@@ -1,0 +1,15 @@
+{
+  "renodx": {
+    "url": "https://github.com/clshortfuse/renodx.git",
+    "ref": "cd32113a98608e63027d40910cfe296a14dfe228"
+  },
+  "nvapi": {
+    "url": "https://github.com/NVIDIA/nvapi.git",
+    "ref": "87dca62"
+  },
+  "shader_tools": [
+    "dxc",
+    "slang",
+    "glslang"
+  ]
+}

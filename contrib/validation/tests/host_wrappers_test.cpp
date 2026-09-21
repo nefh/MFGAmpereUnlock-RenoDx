@@ -90,6 +90,9 @@ NVSDK_NGX_Result RealVulkanRequirements(void*, void*,
 unsigned int g_creates = 0;
 unsigned int g_evaluates = 0;
 unsigned int g_releases = 0;
+unsigned int g_create_architecture = 0;
+unsigned int g_evaluate_architecture = 0;
+unsigned int g_release_architecture = 0;
 NVSDK_NGX_Result g_create_result = NVSDK_NGX_Result_Success;
 NVSDK_NGX_Result g_evaluate_result = NVSDK_NGX_Result_Success;
 NVSDK_NGX_Result g_release_result = NVSDK_NGX_Result_Success;
@@ -103,6 +106,10 @@ void ObserveEvaluateEvent(const mfgunlock::diagnostic::EvaluateEvent* event) noe
 NVSDK_NGX_Result RealCreate(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
                             NVSDK_NGX_Parameter*, NVSDK_NGX_Handle** output) {
   ++g_creates;
+  NV_GPU_ARCH_INFO info{};
+  info.version = NV_GPU_ARCH_INFO_VER;
+  if (ngx_internal::HookedGetArchInfo(g_gpu, &info) == NVAPI_OK)
+    g_create_architecture = info.architecture;
   if (output) *output = g_return_handle ? &g_handle : nullptr;
   return g_create_result;
 }
@@ -110,11 +117,19 @@ NVSDK_NGX_Result RealCreate(ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
 NVSDK_NGX_Result RealEvaluate(ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
                               const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback) {
   ++g_evaluates;
+  NV_GPU_ARCH_INFO info{};
+  info.version = NV_GPU_ARCH_INFO_VER;
+  if (ngx_internal::HookedGetArchInfo(g_gpu, &info) == NVAPI_OK)
+    g_evaluate_architecture = info.architecture;
   return g_evaluate_result;
 }
 
 NVSDK_NGX_Result RealRelease(NVSDK_NGX_Handle*) {
   ++g_releases;
+  NV_GPU_ARCH_INFO info{};
+  info.version = NV_GPU_ARCH_INFO_VER;
+  if (ngx_internal::HookedGetArchInfo(g_gpu, &info) == NVAPI_OK)
+    g_release_architecture = info.architecture;
   return g_release_result;
 }
 
@@ -157,6 +172,31 @@ unsigned int g_support_architecture = 0;
 sl::Result g_forced_support_result = sl::Result::eOk;
 bool g_force_support_result = false;
 
+sl::Result g_feature_requirements_result = sl::Result::eOk;
+unsigned int g_feature_requirements_calls = 0;
+sl::Result RealFeatureRequirements(sl::Feature feature, sl::FeatureRequirements&) {
+  ++g_feature_requirements_calls;
+  return feature == sl::kFeatureDLSS_G ? g_feature_requirements_result
+                                       : sl::Result::eErrorFeatureMissing;
+}
+
+bool g_feature_loaded_value = true;
+sl::Result g_feature_loaded_result = sl::Result::eOk;
+unsigned int g_feature_loaded_calls = 0;
+sl::Result RealFeatureLoaded(sl::Feature feature, bool& loaded) {
+  ++g_feature_loaded_calls;
+  loaded = g_feature_loaded_value;
+  return feature == sl::kFeatureDLSS_G ? g_feature_loaded_result
+                                       : sl::Result::eErrorFeatureMissing;
+}
+
+sl::Result g_set_device_result = sl::Result::eOk;
+unsigned int g_set_device_calls = 0;
+sl::Result RealSetD3DDevice(void*) {
+  ++g_set_device_calls;
+  return g_set_device_result;
+}
+
 sl::Result RealSupport(sl::Feature feature, const sl::AdapterInfo&) {
   ++g_support_calls;
   if (feature != sl::kFeatureDLSS_G) return sl::Result::eErrorFeatureMissing;
@@ -184,23 +224,40 @@ bool RealLegacyInit(const streamline_internal::LegacyPreferences&, int applicati
 bool g_plugin_result = true;
 unsigned int g_loads = 0;
 unsigned int g_startups = 0;
+unsigned int g_load_architecture = 0;
+unsigned int g_startup_architecture = 0;
 const char* g_plugin_json = "{\"supportedAdapters\":0}";
 unsigned int g_plugin_bound_calls = 0;
 HMODULE g_bound_plugin = nullptr;
+unsigned int g_plugin_unloaded_calls = 0;
+HMODULE g_unloaded_plugin = nullptr;
 
 void ObservePlugin(HMODULE module) {
   ++g_plugin_bound_calls;
   g_bound_plugin = module;
 }
 
+void ObservePluginUnload(HMODULE module) {
+  ++g_plugin_unloaded_calls;
+  g_unloaded_plugin = module;
+}
+
 bool RealLoad(sl::param::IParameters*, const char*, const char** output) {
   ++g_loads;
+  NV_GPU_ARCH_INFO info{};
+  info.version = NV_GPU_ARCH_INFO_VER;
+  if (ngx_internal::HookedGetArchInfo(g_gpu, &info) == NVAPI_OK)
+    g_load_architecture = info.architecture;
   if (output) *output = g_plugin_json;
   return g_plugin_result;
 }
 
 bool RealStartup(const char*, void*) {
   ++g_startups;
+  NV_GPU_ARCH_INFO info{};
+  info.version = NV_GPU_ARCH_INFO_VER;
+  if (ngx_internal::HookedGetArchInfo(g_gpu, &info) == NVAPI_OK)
+    g_startup_architecture = info.architecture;
   return g_plugin_result;
 }
 
@@ -373,6 +430,8 @@ int main() {
   Check(output_handle == &g_handle && ngx_internal::IsTracked(runtime, &g_handle) &&
             mfgunlock::ngx::g_status.feature_created.load(),
         "successful FG Create tracks handle");
+  Check(g_create_architecture == architecture::kAmpereArchitecture,
+        "Ampere NGX Create keeps native execution architecture");
 
   NVSDK_NGX_Handle unrelated{};
   mfgunlock::ngx::g_status.feature_active = false;
@@ -394,6 +453,8 @@ int main() {
   ngx_internal::Evaluate<0>(nullptr, &g_handle, &evaluate_parameters, nullptr);
   mfgunlock::diagnostic::g_evaluate_callback.store(nullptr, std::memory_order_release);
   Check(mfgunlock::ngx::g_status.feature_active.load(), "tracked FG Evaluate marked active");
+  Check(g_evaluate_architecture == architecture::kAmpereArchitecture,
+        "Ampere NGX Evaluate keeps native execution architecture");
   Check(g_evaluate_observed.size() == 2 &&
             g_evaluate_observed[0].phase == mfgunlock::diagnostic::EvaluatePhase::kBegin &&
             g_evaluate_observed[1].phase == mfgunlock::diagnostic::EvaluatePhase::kEnd,
@@ -422,14 +483,64 @@ int main() {
   g_release_result = NVSDK_NGX_Result_Success;
   ngx_internal::Release<0>(&g_handle);
   Check(!ngx_internal::IsTracked(runtime, &g_handle), "successful Release removes handle");
+  Check(g_release_architecture == architecture::kAmpereArchitecture,
+        "Ampere NGX Release keeps native execution architecture");
+
+  architecture::Configure(Architecture::kTuring);
+  g_architecture = architecture::kTuringArchitecture;
+  output_handle = nullptr;
+  g_create_architecture = 0;
+  g_evaluate_architecture = 0;
+  g_release_architecture = 0;
+  g_create_result = NVSDK_NGX_Result_Success;
+  g_evaluate_result = NVSDK_NGX_Result_Success;
+  g_release_result = NVSDK_NGX_Result_Success;
+  ngx_internal::Create<0>(nullptr, NVSDK_NGX_Feature_FrameGeneration, nullptr, &output_handle);
+  Check(output_handle == &g_handle && g_create_architecture == architecture::kTuringArchitecture,
+        "Turing NGX Create keeps native execution architecture");
+  ngx_internal::Evaluate<0>(nullptr, &g_handle, nullptr, nullptr);
+  Check(g_evaluate_architecture == architecture::kTuringArchitecture,
+        "Turing NGX Evaluate keeps native execution architecture");
+  ngx_internal::Release<0>(&g_handle);
+  Check(g_release_architecture == architecture::kTuringArchitecture,
+        "Turing NGX Release keeps native execution architecture");
+  architecture::Configure(Architecture::kAmpere);
+  g_architecture = architecture::kAmpereArchitecture;
 
   sl::Preferences preferences{};
   preferences.flags = static_cast<sl::PreferenceFlags>(0x69);
+  const sl::Feature unrelated_features[] = {99};
+  preferences.featuresToLoad = unrelated_features;
+  preferences.numFeaturesToLoad = 1;
+  g_original_preferences = &preferences;
+  streamline_internal::g_lifecycle_state = streamline_internal::LifecycleState::kNotSeen;
+  Check(mfgunlock::streamline::OnInit(preferences, sl::kSDKVersion, RealInit) == g_sl_result &&
+            streamline_internal::g_feature_requested.load() == 0 &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kNotSeen,
+        "modern slInit distinguishes feature not requested from unknown");
+
+  preferences.featuresToLoad = nullptr;
+  preferences.numFeaturesToLoad = 1;
+  streamline_internal::g_lifecycle_state = streamline_internal::LifecycleState::kNotSeen;
+  Check(mfgunlock::streamline::OnInit(preferences, sl::kSDKVersion, RealInit) == g_sl_result &&
+            streamline_internal::g_feature_requested.load() == -1 &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kUnknown,
+        "malformed feature list remains UNKNOWN");
+
+  const sl::Feature requested_features[] = {99, sl::kFeatureDLSS_G};
+  preferences.featuresToLoad = requested_features;
+  preferences.numFeaturesToLoad = 2;
   g_original_preferences = &preferences;
   const auto original_flags = preferences.flags;
   Check(mfgunlock::streamline::OnInit(preferences, sl::kSDKVersion, RealInit) == g_sl_result,
         "modern slInit result preserved");
   Check(preferences.flags == original_flags, "modern slInit preferences untouched");
+  Check(streamline_internal::g_feature_requested.load() == 1 &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kRequested,
+        "modern slInit observes DLSS-G in featuresToLoad");
 
   const auto interposer = Module(0x5151);
   mock::modules[L"sl.interposer.dll"] = interposer;
@@ -450,6 +561,9 @@ int main() {
   SetVersion(interposer, 2, 12);
   mock::exports[{interposer, "slGetFeatureFunction"}] = Proc(Unrelated);
   mock::exports[{interposer, "slIsFeatureSupported"}] = Proc(RealSupport);
+  mock::exports[{interposer, "slGetFeatureRequirements"}] = Proc(RealFeatureRequirements);
+  mock::exports[{interposer, "slIsFeatureLoaded"}] = Proc(RealFeatureLoaded);
+  mock::exports[{interposer, "slSetD3DDevice"}] = Proc(RealSetD3DDevice);
   Check(streamline_internal::GetInterposerAbi(interposer) == streamline_internal::InterposerAbi::kModern &&
             mfgunlock::streamline::CanHookInit(interposer),
         "modern Streamline ABI admitted separately");
@@ -457,6 +571,25 @@ int main() {
   Check(streamline_internal::g_support_hooked.load() &&
             streamline_internal::g_real_support == RealSupport,
         "modern Streamline support hook installed");
+  streamline_internal::InstallDiagnosticHooks();
+  Check(streamline_internal::g_diagnostic_hooked.load() &&
+            streamline_internal::g_real_requirements == RealFeatureRequirements &&
+            streamline_internal::g_real_loaded == RealFeatureLoaded &&
+            streamline_internal::g_real_set_d3d_device == RealSetD3DDevice,
+        "modern Streamline lifecycle diagnostic hooks installed");
+  sl::FeatureRequirements feature_requirements{};
+  Check(streamline_internal::HookedGetFeatureRequirements(
+            sl::kFeatureDLSS_G, feature_requirements) == sl::Result::eOk &&
+            g_feature_requirements_calls == 1,
+        "DLSS-G feature requirements result preserved");
+  bool feature_loaded = false;
+  Check(streamline_internal::HookedIsFeatureLoaded(sl::kFeatureDLSS_G, feature_loaded) ==
+            sl::Result::eOk && feature_loaded && g_feature_loaded_calls == 1,
+        "DLSS-G loaded state observed without modification");
+  Check(streamline_internal::HookedSetD3DDevice(reinterpret_cast<void*>(0x1234)) ==
+            sl::Result::eOk && g_set_device_calls == 1 &&
+            streamline_internal::g_set_device_completed.load(),
+        "slSetD3DDevice result preserved and phase recorded");
   sl::AdapterInfo adapter_info{};
   adapter_info.deviceLUID = &g_luid;
   adapter_info.deviceLUIDSizeInBytes = sizeof(g_luid);
@@ -491,6 +624,7 @@ int main() {
   mock::paths[plugin_module] = L"X:\\fixture\\sl.dlss_g.dll";
   SetVersion(plugin_module, 2, 12);
   mfgunlock::streamline::g_on_dlssg_plugin_bound = ObservePlugin;
+  mfgunlock::streamline::g_on_dlssg_plugin_unloaded = ObservePluginUnload;
   Check(streamline_internal::BindPlugin(plugin_module, Proc(RealGateway)) == Proc(RealGateway),
         "plugin binding preserves native gateway pointer");
   Check(g_plugin_bound_calls == 1 && g_bound_plugin == plugin_module,
@@ -505,12 +639,107 @@ int main() {
   Check(gateway("slOnPluginStartup") == RealGateway("slOnPluginStartup") &&
             plugin.startup_hook.installed.load(),
         "plugin startup hook installed through native gateway");
+  auto load = reinterpret_cast<streamline_internal::LoadFn>(
+      plugin.load_hook.replacement.load(std::memory_order_acquire));
+  const char* plugin_json = nullptr;
+  g_load_architecture = 0;
+  Check(load && load(nullptr, "{}", &plugin_json) &&
+            g_load_architecture == architecture::kAdaArchitecture &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kLoaded,
+        "retargeted plugin load advances lifecycle under scoped architecture exposure");
+  auto startup = reinterpret_cast<streamline_internal::StartupFn>(
+      plugin.startup_hook.replacement.load(std::memory_order_acquire));
+  g_plugin_result = false;
+  g_startup_architecture = 0;
+  Check(startup && !startup("{}", reinterpret_cast<void*>(0x1234)) &&
+            g_startup_architecture == architecture::kAdaArchitecture &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kStartupFailed,
+        "plugin startup failure is observed without masking");
+  g_plugin_result = true;
+  g_startup_architecture = 0;
+  Check(startup && startup("{}", reinterpret_cast<void*>(0x1234)) &&
+            g_startup_architecture == architecture::kAdaArchitecture &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kStartupSucceeded,
+        "plugin startup callback advances lifecycle under diagnostic wrapper");
+
+  mock::module_current[plugin.gateway_hook.identity.module] = false;
+  streamline_internal::RefreshPluginLifetimes();
+  Check(!plugin.gateway_hook.installed.load() && !plugin.load_hook.installed.load() &&
+            !plugin.startup_hook.installed.load() && g_plugin_unloaded_calls == 1 &&
+            g_unloaded_plugin == plugin_module &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kUnloaded,
+        "plugin disappearance clears lifecycle hooks and publishes unload");
 
   mfgunlock::streamline::Shutdown();
   Check(!plugin.gateway_hook.installed.load() && !plugin.load_hook.installed.load() &&
             !plugin.startup_hook.installed.load(),
         "plugin lifecycle hooks detached");
   Check(ngx_internal::g_bound_gpu.load() == nullptr, "NGX adapter binding cleared");
+
+  architecture::Configure(Architecture::kAda);
+  g_architecture = architecture::kAdaArchitecture;
+  g_arch_calls = 0;
+  g_support_architecture = 0;
+  g_force_support_result = false;
+  g_plugin_result = true;
+  g_load_architecture = 0;
+  g_startup_architecture = 0;
+  g_provider_maintenance_calls = 0;
+  mock::module_current[reinterpret_cast<HMODULE>(Proc(RealGateway))] = true;
+  ngx_internal::g_bound_gpu = g_gpu;
+  mfgunlock::ngx::g_prepare_loaded_providers = PrepareProviders;
+  mfgunlock::streamline::Initialize(Module(0x7171));
+  Check(streamline_internal::LifecycleEnabled() && !architecture::NeedsBridge(),
+        "native Ada observes lifecycle without entering the retarget bridge");
+
+  sl::Preferences ada_preferences{};
+  const sl::Feature ada_features[] = {sl::kFeatureDLSS_G};
+  ada_preferences.featuresToLoad = ada_features;
+  ada_preferences.numFeaturesToLoad = 1;
+  g_original_preferences = &ada_preferences;
+  const auto maintenance_before_ada_init = g_provider_maintenance_calls;
+  Check(mfgunlock::streamline::OnInit(ada_preferences, sl::kSDKVersion, RealInit) == g_sl_result &&
+            g_provider_maintenance_calls == maintenance_before_ada_init,
+        "Ada slInit observes features without retarget preflight");
+
+  streamline_internal::InstallSupportHook();
+  Check(streamline_internal::g_support_hooked.load(),
+        "Ada installs the modern support observer without a retarget bridge");
+  g_support_architecture = 0;
+  Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
+            sl::Result::eOk && g_support_architecture == architecture::kAdaArchitecture,
+        "Ada support query remains native while being observed");
+
+  const auto ada_plugin = Module(0x8181);
+  mock::paths[ada_plugin] = L"X:\\fixture\\sl.dlss_g.dll";
+  SetVersion(ada_plugin, 2, 14);
+  mfgunlock::streamline::g_on_dlssg_plugin_bound = ObservePlugin;
+  Check(streamline_internal::BindPlugin(ada_plugin, Proc(RealGateway)) == Proc(RealGateway),
+        "Ada binds the native DLSS-G lifecycle gateway");
+  auto& ada_runtime = streamline_internal::g_plugins[0];
+  auto ada_gateway = reinterpret_cast<streamline_internal::GatewayFn>(
+      ada_runtime.gateway_hook.replacement.load(std::memory_order_acquire));
+  Check(ada_gateway && ada_gateway("slOnPluginLoad") == RealGateway("slOnPluginLoad") &&
+            ada_gateway("slOnPluginStartup") == RealGateway("slOnPluginStartup"),
+        "Ada lifecycle callbacks are observed through the native gateway");
+  auto ada_load = reinterpret_cast<streamline_internal::LoadFn>(
+      ada_runtime.load_hook.replacement.load(std::memory_order_acquire));
+  auto ada_startup = reinterpret_cast<streamline_internal::StartupFn>(
+      ada_runtime.startup_hook.replacement.load(std::memory_order_acquire));
+  const auto maintenance_before_ada_lifecycle = g_provider_maintenance_calls;
+  Check(ada_load && ada_load(nullptr, "{}", &plugin_json) &&
+            ada_startup && ada_startup("{}", reinterpret_cast<void*>(0x2222)) &&
+            g_load_architecture == architecture::kAdaArchitecture &&
+            g_startup_architecture == architecture::kAdaArchitecture &&
+            g_provider_maintenance_calls == maintenance_before_ada_lifecycle &&
+            streamline_internal::g_lifecycle_state.load() ==
+                streamline_internal::LifecycleState::kStartupSucceeded,
+        "Ada plugin lifecycle stays native and reaches STARTUP_SUCCEEDED");
+  mfgunlock::streamline::Shutdown();
 
   std::cout << "host wrappers: " << g_checks
             << " checks PASS (mock APIs; no ABI/Detours/GPU test)\n";

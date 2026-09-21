@@ -8,10 +8,13 @@ constexpr uint32_t kStructVersion4 = 4;
 constexpr uint32_t kStructVersion5 = 5;
 enum class Boolean : uint32_t { eFalse = 0, eTrue = 1 };
 using BufferType = uint32_t;
+constexpr BufferType kBufferTypeDepth = 0;
+constexpr BufferType kBufferTypeMotionVectors = 1;
 constexpr BufferType kBufferTypeHUDLessColor = 2;
 constexpr BufferType kBufferTypeUIColorAndAlpha = 23;
 constexpr BufferType kBufferTypeBackbuffer = 53;
 constexpr BufferType kBufferTypeUIAlpha = 69;
+constexpr BufferType kBufferTypeBidirectionalDistortionField = 70;
 enum class ResourceLifecycle : uint32_t {
   eOnlyValidNow,
   eValidUntilPresent,
@@ -68,7 +71,7 @@ struct Constants {
   Boolean reset = Boolean::eFalse;
   float minRelativeLinearDepthObjectSeparation = 40.0f;
 };
-enum class DLSSGMode : uint32_t { eOff, eOn, eDynamic };
+enum class DLSSGMode : uint32_t { eOff, eOn, eAuto, eDynamic };
 struct DLSSGOptions {
   static constexpr uint32_t s_structType = 0x646c7367;
   void* next = nullptr;
@@ -103,6 +106,10 @@ struct DLSSGState {
   uint32_t status = 0;
   uint32_t numFramesActuallyPresented = 0;
   uint32_t numFramesToGenerateMax = 1;
+  Boolean bReserved4 = Boolean::eFalse;
+  Boolean bIsVsyncSupportAvailable = Boolean::eFalse;
+  void* inputsProcessingCompletionFence = nullptr;
+  uint64_t lastPresentInputsProcessingCompletionFenceValue = 0;
   Boolean bIsDynamicMFGSupported = Boolean::eFalse;
 };
 }  // namespace sl

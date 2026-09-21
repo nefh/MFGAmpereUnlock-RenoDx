@@ -97,6 +97,8 @@ void Reset() {
   fc::g_ui_composition_enabled = false;
   fc::g_hdr_state_seen = false;
   fc::g_hdr_active = false;
+  fc::g_output_color_space_seen = false;
+  fc::g_output_color_space = dg::kUnknown32;
   fc::g_ui_candidate_injection_enabled = true;
   fc::g_ui_candidate_ready = false;
   fc::g_ui_candidate_format = 0;
@@ -375,6 +377,24 @@ void PacingAndCeiling() {
   Check(g_counts.back() == 1 && fc::g_fixed_override_status == fc::FixedOverrideStatus::kBlockedStructuralCeiling,
         "automatic requests obey structural ceiling without silent clamp");
 }
+void HdrTelemetry() {
+  Reset();
+  fc::NotifyHdrState(true, 3);
+  Check(fc::g_hdr_state_seen.load() && fc::g_hdr_active.load() &&
+            fc::g_output_color_space_seen.load() && fc::g_output_color_space.load() == 3,
+        "HDR10/PQ observation preserves the raw swapchain color-space value");
+  fc::NotifyHdrState(true, 2);
+  Check(fc::g_hdr_active.load() && fc::g_output_color_space.load() == 2,
+        "scRGB/FP16 observation stays distinct from HDR10/PQ");
+  fc::NotifyHdrState(false, 0);
+  Check(!fc::g_hdr_active.load() && fc::g_output_color_space.load() == 0,
+        "SDR observation remains a known non-HDR color space");
+  fc::NotifyOutputUnknown();
+  Check(!fc::g_hdr_state_seen.load() && !fc::g_output_color_space_seen.load() &&
+            fc::g_output_color_space.load() == dg::kUnknown32,
+        "swapchain destruction/unknown output clears color-space evidence");
+}
+
 void LiveUiOptions() {
   Reset();
   sl::DLSSGOptions native{};
@@ -507,6 +527,7 @@ int main() {
     LiveGuards();
     FeatureLifecycle();
     PacingAndCeiling();
+    HdrTelemetry();
     LiveUiOptions();
     UiCandidateRecovery();
     RestoreOwnership();

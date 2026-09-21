@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: MIT
 #pragma once
+#include "./observer_scope.hpp"
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <shared_mutex>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -40,8 +43,30 @@ struct Event {
 using Callback = void (*)(const Event*) noexcept;
 using Register = bool (*)(uint32_t, Callback);
 inline std::atomic<Callback> g_callback{nullptr};
+inline std::shared_mutex g_callback_mutex;
+
+inline bool SetCallback(Callback callback) noexcept {
+  // A callback may disconnect itself after a bounded capture ends. It already
+  // executes under the shared guard, so clearing the atomic slot is sufficient;
+  // a later unload-side unregister takes the exclusive guard and drains it.
+  if (observers::g_callback_depth != 0) {
+    if (callback != nullptr) return false;
+    g_callback.store(nullptr, std::memory_order_release);
+    return true;
+  }
+  std::unique_lock lock(g_callback_mutex);
+  g_callback.store(callback, std::memory_order_release);
+  return true;
+}
+
 inline void Emit(const Event& event) noexcept {
-  if (const auto callback = g_callback.load(std::memory_order_acquire)) callback(&event);
+  if (observers::g_callback_depth != 0) return;  // Diagnostic re-entry must not recurse into the shared mutex.
+  std::shared_lock lock(g_callback_mutex);
+  const auto callback = g_callback.load(std::memory_order_acquire);
+  if (!callback) return;
+  ++observers::g_callback_depth;
+  callback(&event);
+  --observers::g_callback_depth;
 }
 
 // Must inline so the return address belongs to the observed API entry.

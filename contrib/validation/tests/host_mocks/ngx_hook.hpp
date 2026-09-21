@@ -59,7 +59,9 @@ inline bool CaptureModule(HMODULE module, ModuleIdentity& identity) {
 }
 
 inline bool IsCurrent(const ModuleIdentity& identity) {
-  return identity.module != nullptr;
+  if (identity.module == nullptr) return false;
+  const auto current = mock::module_current.find(identity.module);
+  return current == mock::module_current.end() || current->second;
 }
 
 struct AddressHook {

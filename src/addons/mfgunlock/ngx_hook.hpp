@@ -157,20 +157,28 @@ inline bool Install(HMODULE module, const std::vector<HookItem>& hooks,
 }
 
 // Explicit teardown only. Process termination leaves cleanup to the OS.
-inline void Uninstall(const std::vector<HookItem>& hooks) {
+// The checked form is used by owners which also hold a module reference: the
+// reference may be released only after every detour has been detached.
+inline bool TryUninstall(const std::vector<HookItem>& hooks) {
   std::vector<HANDLE> threads;
-  if (!internal::OpenOtherThreads(threads)) return;
+  if (!internal::OpenOtherThreads(threads)) return false;
   if (DetourTransactionBegin() != NO_ERROR) {
     internal::CloseThreads(threads);
-    return;
+    return false;
   }
   bool ok = internal::EnlistThreads(threads);
   for (const auto& [name, real, replacement] : hooks) {
+    (void)name;
     if (ok && *real != nullptr && DetourDetach(real, replacement) != NO_ERROR) ok = false;
   }
-  if (ok) DetourTransactionCommit();
+  if (ok) ok = DetourTransactionCommit() == NO_ERROR;
   else DetourTransactionAbort();
   internal::CloseThreads(threads);
+  return ok;
+}
+
+inline void Uninstall(const std::vector<HookItem>& hooks) {
+  (void)TryUninstall(hooks);
 }
 
 // Hook native entries so callers keep the original function address.

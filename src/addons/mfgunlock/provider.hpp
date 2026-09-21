@@ -20,6 +20,7 @@
 #include "./reshade_compat.hpp"
 
 #include "./ptx_retarget.hpp"
+#include "./endpoint_backend.hpp"
 
 namespace mfgunlock::provider {
 
@@ -55,6 +56,7 @@ struct Provider {
   std::string path;
   std::string failure;
   Architecture architecture = Architecture::kUnknown;
+  profiles::Qualification qualification = profiles::Qualification::kUnknown;
 };
 
 struct Rejection {
@@ -67,6 +69,7 @@ inline SRWLOCK g_lock = SRWLOCK_INIT;
 inline std::vector<Provider> g_providers;
 inline std::vector<Rejection> g_rejected;
 inline std::atomic_bool g_registry_failed{false};
+inline std::atomic_bool g_comparison_restore_failed{false};
 
 inline bool IsReadable(const void* pointer, size_t bytes, HMODULE allocation) {
   uintptr_t at = reinterpret_cast<uintptr_t>(pointer);
@@ -90,6 +93,16 @@ inline bool IsReadable(const void* pointer, size_t bytes, HMODULE allocation) {
     const auto next = base + memory.RegionSize;
     if (next <= at) return false;
     at = std::min(next, end);
+  }
+  return true;
+}
+
+inline bool EndpointSelectorsApplied(const Provider& provider) {
+  if (provider.architecture != Architecture::kTuring) return true;
+  const auto* base = reinterpret_cast<const unsigned char*>(provider.module);
+  for (const auto& site : endpoint::kSelectors) {
+    if (!IsReadable(base + site.rva, 2, provider.module) ||
+        base[site.rva] != 0x90 || base[site.rva + 1] != 0x90) return false;
   }
   return true;
 }
@@ -264,6 +277,42 @@ inline bool IsDlssgProvider(HMODULE module) {
          internal::IsDlssgImage(image, module);
 }
 
+// Native Ada is not retargeted, but unknown images must not receive addon patches.
+// Descriptor redirection keeps these original containers intact, so this remains
+// valid after a native quality plan has been published.
+inline bool QualifiedNativeInventory(HMODULE module) {
+  internal::Image image;
+  internal::ImageIdentity identity;
+  if (!internal::ReadIdentity(module, identity) || !internal::InspectImage(module, image) ||
+      !internal::IsDlssgImage(image, module)) return false;
+  const auto* profile = profiles::Find(identity.timestamp, identity.image_bytes);
+  if (!profile) return false;
+  for (const auto& region : profile->retarget_payloads) {
+    if (region.rva > image.bytes || region.bytes > image.bytes - region.rva ||
+        !internal::IsReadable(image.base + region.rva, region.bytes, module)) return false;
+  }
+  return profiles::MatchesRegions({image.base, image.bytes}, profile->retarget_payloads);
+}
+
+inline bool FindQualifiedMfgGates(HMODULE module, std::vector<unsigned char*>& output) {
+  output.clear();
+  internal::ImageIdentity identity;
+  if (!internal::ReadIdentity(module, identity)) return false;
+  const auto* profile = profiles::Find(identity.timestamp, identity.image_bytes);
+  if (!profile) return false;
+  auto* base = reinterpret_cast<unsigned char*>(module);
+  for (const auto& gate : profile->mfg_gates) {
+    const auto& region = gate.code;
+    if (region.rva > identity.image_bytes || region.bytes > identity.image_bytes - region.rva ||
+        gate.immediate_rva < region.rva || gate.immediate_rva - region.rva >= region.bytes ||
+        !internal::IsReadable(base + region.rva, region.bytes, module) ||
+        profiles::Fingerprint({base + region.rva, region.bytes}) != region.hash ||
+        base[gate.immediate_rva] != 0xb0) return false;
+  }
+  for (const auto& gate : profile->mfg_gates) output.push_back(base + gate.immediate_rva);
+  return !output.empty();
+}
+
 struct ProviderStatus {
   unsigned ready = 0;
   unsigned blocked = 0;
@@ -285,11 +334,13 @@ inline ProviderStatus GetProviderStatus() {
     // an unfinished transaction is a real failure, not an expired rejection.
     const auto* profile = architecture::ActiveProfile();
     bool valid = profile && provider.architecture == profile->architecture &&
-                 provider.ready && !provider.patches.empty() &&
+                 provider.ready && provider.qualification == profiles::Qualification::kPatchable &&
+                 !provider.patches.empty() &&
                  internal::IsCurrent(provider.module, provider.identity);
     if (valid) {
       const auto& gate = provider.patches.back();
-      valid = internal::IsReadable(gate.address, 1, provider.module) && *gate.address == gate.after;
+      valid = internal::IsReadable(gate.address, 1, provider.module) && *gate.address == gate.after &&
+              internal::EndpointSelectorsApplied(provider);
     }
     if (valid) {
       ++result.ready;
@@ -313,9 +364,10 @@ inline unsigned int PreparedProviderCount() {
 
 // Called through the project's existing provider discovery/maintenance path.
 // No CUDA, NVAPI, module enumeration, downloads or compilation here.
-inline bool PrepareProviderImpl(HMODULE module) {
+inline bool PrepareProviderImpl(HMODULE module,
+    std::span<const profiles::ProviderProfile> known_profiles = profiles::kProfiles) {
   const auto* profile = architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile || !profile->NeedsRetarget() ||
+  if (!g_enabled.load() || !profile || !profile->RequiresProviderRetarget() ||
       internal::g_registry_failed.load() || module == nullptr) return false;
   if (!internal::IsImageMapping(module)) return false;
   if (!TryAcquireSRWLockExclusive(&internal::g_lock)) return false;
@@ -325,10 +377,12 @@ inline bool PrepareProviderImpl(HMODULE module) {
   for (const auto& provider : internal::g_providers) {
     if (provider.module != module) continue;
     return provider.architecture == profile->architecture &&
-           provider.ready && !provider.patches.empty() &&
+           provider.ready && provider.qualification == profiles::Qualification::kPatchable &&
+                 !provider.patches.empty() &&
            internal::IsCurrent(module, provider.identity) &&
            internal::IsReadable(provider.patches.back().address, 1, module) &&
-           *provider.patches.back().address == provider.patches.back().after;
+           *provider.patches.back().address == provider.patches.back().after &&
+           internal::EndpointSelectorsApplied(provider);
   }
 
   internal::Image image;
@@ -391,6 +445,31 @@ inline bool PrepareProviderImpl(HMODULE module) {
   }
   if (!executable_gate) return reject("architecture export is not in code");
 
+  const auto* qualified = profiles::Find(identity.timestamp, identity.image_bytes, known_profiles);
+  if (!qualified || !profiles::AllowsTarget(*qualified, profile->target_sm))
+    return reject("unknown provider profile; observation only");
+  for (const auto& region : qualified->retarget_payloads) {
+    if (region.rva > image.bytes || region.bytes > image.bytes - region.rva ||
+        !internal::IsReadable(image.base + region.rva, region.bytes, module))
+      return reject("unreadable provider profile payload");
+  }
+  if (!profiles::MatchesRegions({image.base, image.bytes}, qualified->retarget_payloads))
+    return reject("provider inventory fingerprint mismatch; no writes");
+
+  const bool turing_endpoint = profile->architecture == Architecture::kTuring;
+  if (turing_endpoint) {
+    for (const auto& region : endpoint::kCode) {
+      if (region.rva > image.bytes || region.bytes > image.bytes - region.rva ||
+          !internal::IsReadable(image.base + region.rva, region.bytes, module))
+        return reject("unreadable Turing endpoint code");
+    }
+    if (image.bytes != endpoint::kImageBytes ||
+        !internal::IsReadable(image.base + 0x64abe8, 8, module) ||
+        !internal::IsReadable(image.base + 0x64b028, 8, module) ||
+        !endpoint::QualifiedCode({image.base, image.bytes}, identity.timestamp))
+      return reject("unknown Turing endpoint layout; PTX network selection not qualified");
+  }
+
   struct Block {
     unsigned char* address;
     std::vector<unsigned char> before;
@@ -433,6 +512,24 @@ inline bool PrepareProviderImpl(HMODULE module) {
     }
   }
   if (blocks.empty()) return reject("no supported sm_89 fatbins");
+  if (blocks.size() != qualified->retarget_payloads.size())
+    return reject("provider inventory count mismatch; no writes");
+  for (const auto& block : blocks) {
+    const auto rva = static_cast<uint32_t>(block.address - image.base);
+    const auto found = std::find_if(qualified->retarget_payloads.begin(),
+        qualified->retarget_payloads.end(), [rva](const auto& entry) { return entry.rva == rva; });
+    if (found == qualified->retarget_payloads.end() || found->bytes != block.before.size())
+      return reject("unqualified provider payload; no writes");
+  }
+  if (turing_endpoint) {
+    for (const auto& payload : endpoint::kPayloads) {
+      const auto found = std::find_if(blocks.begin(), blocks.end(), [&](const Block& block) {
+        return block.address == image.base + payload.rva;
+      });
+      if (found == blocks.end() || !endpoint::PreparedPayload(found->before, found->after, payload))
+        return reject("Turing endpoint requires all 39 exact SM75 network payloads");
+    }
+  }
   internal::Provider candidate{module, {}, false, 0, 0, identity, path, {}, profile->architecture};
   for (const auto& block : blocks) {
     if (std::memcmp(block.address, block.before.data(), block.before.size()) != 0) {
@@ -446,11 +543,20 @@ inline bool PrepareProviderImpl(HMODULE module) {
       }
     }
   }
+  if (turing_endpoint) {
+    // Select existing *_89_PTX classes, not the SM86-only cubins chosen by
+    // the native SM<89 branch. Publish only with the qualified SM75 payloads.
+    for (const auto& site : endpoint::kSelectors) {
+      for (size_t i = 0; i < site.before.size(); ++i)
+        candidate.patches.push_back({image.base + site.rva + i, site.before[i], 0x90});
+    }
+  }
   candidate.patches.push_back({gate + 1, 0x90, static_cast<unsigned char>(profile->native_arch)});
   // Reserve all rollback storage before the first write. Keep the mapped image
   // alive while rollback pointers into it are stored. This process-lifetime
   // provider reference does not retain the addon and keeps unload restoration
   // deterministic without racing a provider unmap.
+  internal::g_providers.reserve(internal::g_providers.size() + 1);
   HMODULE held = nullptr;
   if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
         reinterpret_cast<LPCWSTR>(module), &held) || held != module) return reject("cannot retain provider");
@@ -466,6 +572,7 @@ inline bool PrepareProviderImpl(HMODULE module) {
   for (const auto& block : blocks) {
     if (std::memcmp(block.address, block.after.data(), block.after.size()) != 0) ok = false;
   }
+  if (ok) ok = internal::EndpointSelectorsApplied(saved);
   if (ok) ok = internal::WriteByte(saved.patches.back(), false);
   if (!ok) {
     const bool restored = internal::Undo(saved);
@@ -476,6 +583,7 @@ inline bool PrepareProviderImpl(HMODULE module) {
   }
   saved.fatbins = static_cast<unsigned>(blocks.size());
   saved.hidden_cubins = static_cast<unsigned>(hidden_cubins);
+  saved.qualification = profiles::Classify(true, true, true);
   saved.ready = true;
   std::erase_if(internal::g_rejected, [module](const auto& entry) { return entry.module == module; });
   std::stringstream message;
@@ -483,6 +591,9 @@ inline bool PrepareProviderImpl(HMODULE module) {
           << blocks.size() << " fatbins, "
           << hidden_cubins << " cubins hidden";
   Log(message.str());
+  Log(std::string("ProviderProfile ") + qualified->id + " " + profiles::QualificationName(saved.qualification) + " (mapped exact inventory; target preparation committed)");
+  if (turing_endpoint)
+    Log("TuringEndpointFixV4: DL1/DL2 PTX backend selected; 39 SM75 network payloads qualified");
   return true;
 }
 
@@ -497,9 +608,10 @@ inline bool PrepareProvider(HMODULE module) {
   }
 }
 
-// Reuse the upstream's comparison scanner, but keep comparison writes all-or-none.
-// On success the caller records the sites in the upstream gate restoration list.
-inline bool ApplyMfgComparisons(std::span<unsigned char* const> sites) {
+// Exact-qualified comparison sites share one checked transaction on all targets.
+// Undo ownership is published before success; failed restore remains retryable.
+inline bool ApplyMfgComparisons(std::span<unsigned char* const> sites,
+                                std::vector<internal::BytePatch>& ownership) {
   const auto* profile = architecture::ActiveProfile();
   if (!g_enabled.load() || !profile) return false;
   std::vector<internal::BytePatch> changes;
@@ -508,6 +620,7 @@ inline bool ApplyMfgComparisons(std::span<unsigned char* const> sites) {
     if (*site != 0xB0) return false;
     changes.push_back({site, 0xB0, static_cast<unsigned char>(profile->native_arch)});
   }
+  ownership.reserve(ownership.size() + changes.size());
   size_t attempted = 0;
   for (auto& patch : changes) {
     ++attempted;
@@ -517,20 +630,52 @@ inline bool ApplyMfgComparisons(std::span<unsigned char* const> sites) {
       auto& undo = changes[--attempted];
       if (undo.original_protection != 0 && !internal::WriteByte(undo, true)) restored = false;
     }
-    Log(restored ? "MFG gate update rolled back" : "MFG gate rollback failed", true);
+    if (!restored) {
+      for (const auto& change : changes)
+        if (change.original_protection != 0) ownership.push_back(change);
+      internal::g_comparison_restore_failed.store(true, std::memory_order_release);
+      internal::g_registry_failed.store(true, std::memory_order_release);
+    }
+    Log(restored ? "MFG gate update rolled back" : "MFG gate rollback failed; undo metadata retained", true);
     return false;
   }
+  ownership.insert(ownership.end(), changes.begin(), changes.end());
   return true;
+}
+
+inline bool RestoreMfgComparisons(std::vector<internal::BytePatch>& ownership) {
+  bool complete = true;
+  for (auto it = ownership.rbegin(); it != ownership.rend(); ++it) {
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(it->address, &memory, sizeof(memory)) &&
+        internal::IsReadable(it->address, 1, static_cast<HMODULE>(memory.AllocationBase)) &&
+        internal::WriteByte(*it, true)) {
+      it->address = nullptr;
+    } else {
+      complete = false;
+    }
+  }
+  std::erase_if(ownership, [](const auto& patch) { return patch.address == nullptr; });
+  internal::g_comparison_restore_failed.store(!complete, std::memory_order_release);
+  if (!complete) internal::g_registry_failed.store(true, std::memory_order_release);
+  return complete;
 }
 
 inline void Restore() {
   AcquireSRWLockExclusive(&internal::g_lock);
+  bool complete = true;
   for (auto it = internal::g_providers.rbegin(); it != internal::g_providers.rend(); ++it) {
-    if (!internal::Undo(*it)) Log("provider restore failed", true);
+    if (internal::Undo(*it)) {
+      it->patches.clear();
+    } else {
+      complete = false;
+      it->failure = "provider restore failed; rollback metadata retained";
+      Log(it->failure, true);
+    }
   }
-  internal::g_providers.clear();
-  internal::g_rejected.clear();
-  internal::g_registry_failed.store(false);
+  std::erase_if(internal::g_providers, [](const auto& entry) { return entry.patches.empty(); });
+  if (complete) internal::g_rejected.clear();
+  internal::g_registry_failed.store(!complete || internal::g_comparison_restore_failed.load());
   ReleaseSRWLockExclusive(&internal::g_lock);
 }
 }  // namespace mfgunlock::provider

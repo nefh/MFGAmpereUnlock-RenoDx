@@ -64,7 +64,7 @@ inline bool ReadRegister(std::string_view& text, std::string_view prefix,
 inline bool LowerPackedHalf(std::string& text, uint32_t target_sm,
                             size_t expected_count, std::string& why) {
   why.clear();
-  if (target_sm == 86) return true;
+  if (target_sm == 86 || target_sm == 89) return true;
   const auto reject = [&](const char* reason) { why = reason; return false; };
   if (target_sm != 75) return reject("unsupported PTX compatibility target");
   if (text.find(kPackedHalfMarker) != text.npos || text.find("%mfg_h") != text.npos)
@@ -156,7 +156,7 @@ inline bool SameRegister(std::string_view left, std::string_view right) {
 inline bool LowerTuringMma16816(std::string& text, uint32_t target_sm,
                                 size_t expected_count, std::string& why) {
   why.clear();
-  if (target_sm == 86) return true;
+  if (target_sm == 86 || target_sm == 89) return true;
   const auto reject = [&](const char* reason) { why = reason; return false; };
   if (target_sm != 75) return reject("unsupported PTX compatibility target");
   if (expected_count == 0)
@@ -275,7 +275,7 @@ inline bool HasTuringHalfMinMax(std::string_view text) {
 inline bool LowerTuringHalfMinMax(std::string& text, uint32_t target_sm,
                                   HalfMinMaxCounts expected, std::string& why) {
   why.clear();
-  if (target_sm == 86) return true;
+  if (target_sm == 86 || target_sm == 89) return true;
   const auto reject = [&](const char* reason) { why = reason; return false; };
   if (target_sm != 75) return reject("unsupported PTX compatibility target");
   if (text.find("%h") != text.npos) return reject("half min/max temporary register collision");

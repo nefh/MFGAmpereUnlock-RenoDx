@@ -120,6 +120,8 @@ def lz4_decompress(data: bytes, expected: int) -> bytes:
         literals = extended(token >> 4)
         if cursor + literals > len(data):
             raise ValueError("truncated LZ4 literal run")
+        if literals > expected - len(output):
+            raise ValueError("LZ4 literal output exceeds declared size")
         output.extend(data[cursor:cursor + literals])
         cursor += literals
         if cursor == len(data):
@@ -131,6 +133,8 @@ def lz4_decompress(data: bytes, expected: int) -> bytes:
         count = extended(token & 15) + 4
         if distance == 0 or distance > len(output):
             raise ValueError("invalid LZ4 back-reference")
+        if count > expected - len(output):
+            raise ValueError("LZ4 match output exceeds declared size")
         for _ in range(count):
             output.append(output[-distance])
         if len(output) > expected:

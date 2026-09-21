@@ -16,6 +16,8 @@ unsigned int g_calls = 0;
 unsigned int g_pacing_calls = 0;
 unsigned int g_state_calls = 0;
 unsigned int g_native_max = 5;
+unsigned int g_presented_per_query = 0;
+bool g_probe_extension_seen = false;
 bool g_backend_ready = false;
 bool g_software_pacing = false;
 bool g_dynamic_supported = false;
@@ -53,6 +55,8 @@ sl::Result SetOptions(const sl::ViewportHandle&, const sl::DLSSGOptions& options
 }
 sl::Result GetState(const sl::ViewportHandle&, sl::DLSSGState& state, const sl::DLSSGOptions*) {
   ++g_state_calls;
+  state.numFramesActuallyPresented = g_presented_per_query;
+  if (g_state_calls > 1 && state.next != nullptr) g_probe_extension_seen = true;
   state.numFramesToGenerateMax = g_native_max;
   if (state.structVersion >= sl::kStructVersion4) {
     state.bIsDynamicMFGSupported = g_dynamic_supported
@@ -88,6 +92,16 @@ void Reset(Architecture mode) {
   fc::g_ceiling_blocked_for = 0;
   fc::g_unknown_ceiling_logged = false;
   fc::g_unknown_fixed_abi_logged = false;
+  fc::g_last_requested_mode = mfgunlock::diagnostic::kUnknown32;
+  fc::g_last_requested_generated = mfgunlock::diagnostic::kUnknown32;
+  fc::g_last_forwarded_mode = mfgunlock::diagnostic::kUnknown32;
+  fc::g_last_forwarded_generated = mfgunlock::diagnostic::kUnknown32;
+  fc::g_last_accepted_mode = mfgunlock::diagnostic::kUnknown32;
+  fc::g_last_accepted_generated = mfgunlock::diagnostic::kUnknown32;
+  fc::g_effective_max_seen = false;
+  fc::g_effective_max_generated = 0;
+  fc::g_state_seen = false;
+  fc::g_runtime_max_generated = 0;
   fc::internal::g_real_set_options = SetOptions;
   fc::internal::g_real_get_state = GetState;
   fc::g_multi_frame_ready = [] { return g_backend_ready; };
@@ -108,6 +122,8 @@ void Reset(Architecture mode) {
   g_received_counts.clear();
   g_set_results.clear();
   g_state_calls = 0;
+  g_presented_per_query = 0;
+  g_probe_extension_seen = false;
   g_pacing_calls = 0;
   g_backend_ready = false;
   g_software_pacing = false;
@@ -125,6 +141,48 @@ int main() {
   sl::DLSSGOptions options{};
   options.numFramesToGenerate = 3;
   sl::DLSSGState state{};
+
+  for (uint32_t version = 1; version <= 5; ++version) {
+    sl::DLSSGOptions input{};
+    input.structVersion = version;
+    input.next = &options;
+    input.mode = sl::DLSSGMode::eAuto;
+    input.numFramesToGenerate = 4;
+    input.flags = static_cast<decltype(input.flags)>(0x1f);
+    input.dynamicResWidth = 1280;
+    input.dynamicResHeight = 720;
+    input.numBackBuffers = 3;
+    input.mvecDepthWidth = 640;
+    input.mvecDepthHeight = 360;
+    input.colorWidth = 2560;
+    input.colorHeight = 1440;
+    input.colorBufferFormat = 24;
+    input.mvecBufferFormat = 34;
+    input.depthBufferFormat = 40;
+    input.hudLessBufferFormat = 10;
+    input.uiBufferFormat = 28;
+    input.onErrorCallback = reinterpret_cast<decltype(input.onErrorCallback)>(uintptr_t{0x1234});
+    input.bReserved15 = static_cast<decltype(input.bReserved15)>(1);
+    input.queueParallelismMode = static_cast<decltype(input.queueParallelismMode)>(1);
+    input.enableUserInterfaceRecomposition = sl::Boolean::eTrue;
+    input.dynamicTargetFrameRate = 144.0f;
+    sl::DLSSGOptions copy{};
+    Check(fc::internal::CopyOptions(input, copy) && copy.structVersion == version &&
+              copy.next == input.next && copy.mode == input.mode && copy.numFramesToGenerate == 4 &&
+              static_cast<uint32_t>(copy.flags) == 0x1f &&
+              copy.dynamicResWidth == 1280 && copy.dynamicResHeight == 720 && copy.numBackBuffers == 3 &&
+              copy.mvecDepthWidth == 640 && copy.mvecDepthHeight == 360 &&
+              copy.colorWidth == 2560 && copy.colorHeight == 1440 &&
+              copy.colorBufferFormat == 24 && copy.mvecBufferFormat == 34 &&
+              copy.depthBufferFormat == 40 && copy.hudLessBufferFormat == 10 && copy.uiBufferFormat == 28 &&
+              copy.onErrorCallback == input.onErrorCallback &&
+              (version < 2 || copy.bReserved15 == input.bReserved15) &&
+              (version < 3 || copy.queueParallelismMode == input.queueParallelismMode) &&
+              (version < 4 || copy.enableUserInterfaceRecomposition == sl::Boolean::eTrue) &&
+              (version < 5 || copy.dynamicTargetFrameRate == 144.0f),
+          "all public Options v1-v5 fields/flags preserved within known ABI");
+  }
+
 
   for (auto mode : {Architecture::kAmpere, Architecture::kTuring}) {
     Reset(mode);
@@ -195,6 +253,21 @@ int main() {
             fc::g_fixed_override_status.load() == fc::FixedOverrideStatus::kApplied &&
             fc::g_last_effective_generated.load() == 5,
         "6x override is allowed at a 6x Streamline structural ceiling");
+
+  for (unsigned int multiplier = 2; multiplier <= 6; ++multiplier) {
+    Reset(Architecture::kAmpere);
+    g_backend_ready = true;
+    g_software_pacing = true;
+    fc::g_streamline_max_generated = 5;
+    fc::g_force_multiplier = multiplier;
+    options = sl::DLSSGOptions{};
+    options.mode = sl::DLSSGMode::eOn;
+    options.numFramesToGenerate = 1;
+    fc::internal::HookedSetOptions(viewport, options);
+    Check(g_calls == 1 && g_received == multiplier - 1 &&
+              fc::g_last_accepted_generated.load() == multiplier - 1,
+          "fixed multiplier maps total frames to generated frames 2x through 6x");
+  }
 
   Reset(Architecture::kAmpere);
   g_backend_ready = true;
@@ -315,6 +388,21 @@ int main() {
   Reset(Architecture::kTuring);
   g_backend_ready = true;
   fc::g_dynamic_d3d12 = true;
+  g_dynamic_supported = true;
+  state.structVersion = sl::kStructVersion4;
+  fc::internal::HookedGetState(viewport, state, nullptr);
+  fc::g_dynamic_mfg_enabled = true;
+  fc::g_dynamic_target_fps = 0;
+  options.mode = sl::DLSSGMode::eOn;
+  options.numFramesToGenerate = 1;
+  fc::internal::HookedSetOptions(viewport, options);
+  Check(g_received_mode == sl::DLSSGMode::eDynamic &&
+            g_received_dynamic_target == 0.0f && fc::g_dynamic_applied.load(),
+        "Dynamic target zero is forwarded as active-display refresh semantics");
+
+  Reset(Architecture::kTuring);
+  g_backend_ready = true;
+  fc::g_dynamic_d3d12 = true;
   g_dynamic_supported = false;
   state.structVersion = sl::kStructVersion4;
   fc::internal::HookedGetState(viewport, state, nullptr);
@@ -383,14 +471,44 @@ int main() {
   Reset(Architecture::kAda);
   g_backend_ready = true;
   fc::g_dynamic_d3d12 = true;
-  fc::g_dynamic_support_seen = true;
-  fc::g_dynamic_supported = true;
+  g_dynamic_supported = true;
+  state.structVersion = sl::kStructVersion4;
+  fc::internal::HookedGetState(viewport, state, nullptr);
+  Check(fc::g_dynamic_support_seen.load() && fc::g_dynamic_supported.load(),
+        "Ada observes Dynamic capability on the validated native stack");
   fc::g_dynamic_mfg_enabled = true;
   options.mode = sl::DLSSGMode::eOn;
   options.numFramesToGenerate = 1;
   fc::internal::HookedSetOptions(viewport, options);
-  Check(g_received_mode == sl::DLSSGMode::eOn && !fc::g_dynamic_applied.load(),
-        "addon Dynamic policy does not replace the native Ada path");
+  Check(g_received_mode == sl::DLSSGMode::eDynamic && fc::g_dynamic_applied.load() &&
+            g_pacing_calls == 0,
+        "Ada Dynamic uses NativeSm89 readiness and keeps NVIDIA pacing");
+
+  Reset(Architecture::kAda);
+  g_backend_ready = true;
+  fc::g_dynamic_d3d12 = true;
+  g_dynamic_supported = false;
+  state.structVersion = sl::kStructVersion4;
+  fc::internal::HookedGetState(viewport, state, nullptr);
+  fc::g_dynamic_mfg_enabled = true;
+  options.mode = sl::DLSSGMode::eOn;
+  options.numFramesToGenerate = 1;
+  fc::internal::HookedSetOptions(viewport, options);
+  Check(fc::g_dynamic_support_seen.load() && !fc::g_dynamic_supported.load() &&
+            g_received_mode == sl::DLSSGMode::eOn && !fc::g_dynamic_applied.load(),
+        "Ada keeps native fixed mode when runtime reports Dynamic unsupported");
+
+  Reset(Architecture::kAda);
+  g_backend_ready = true;
+  fc::g_dynamic_d3d12 = true;
+  fc::g_dynamic_support_seen = true;
+  fc::g_dynamic_supported = true;
+  fc::g_dynamic_mfg_enabled = true;
+  options.mode = sl::DLSSGMode::eOff;
+  options.numFramesToGenerate = 1;
+  fc::internal::HookedSetOptions(viewport, options);
+  Check(g_received_mode == sl::DLSSGMode::eOff && !fc::g_dynamic_applied.load(),
+        "Ada eOff is never reactivated by Dynamic policy");
 
   Reset(Architecture::kAmpere);
   fc::g_dynamic_d3d12 = true;
@@ -410,10 +528,15 @@ int main() {
   fc::g_dynamic_d3d12 = true;
   g_dynamic_supported = true;
   state.structVersion = sl::kStructVersion2;
+  g_presented_per_query = 7;
+  state.next = &options;
   fc::internal::HookedGetState(viewport, state, nullptr);
   Check(g_state_calls == 2 && fc::g_dynamic_support_seen.load() &&
             fc::g_dynamic_supported.load(),
         "old caller state gets one addon-owned v4 capability probe");
+  Check(state.numFramesActuallyPresented == 14 && !g_probe_extension_seen && state.next == &options,
+        "extended probe preserves consumed presentation counts without replaying caller extensions");
+  state.next = nullptr;
 
   Reset(Architecture::kAmpere);
   g_backend_ready = true;
@@ -424,6 +547,40 @@ int main() {
   fc::internal::HookedGetState(viewport, state, nullptr);
   Check(g_state_calls == 1 && !fc::g_dynamic_support_seen.load(),
         "unvalidated runtime never probes or trusts Dynamic v4 state");
+
+  Reset(Architecture::kAda);
+  g_backend_ready = true;
+  g_software_pacing = true;
+  options = sl::DLSSGOptions{};
+  options.mode = sl::DLSSGMode::eAuto;
+  options.numFramesToGenerate = 2;
+  fc::internal::HookedSetOptions(viewport, options);
+  Check(g_received_mode == sl::DLSSGMode::eAuto && g_received == 2,
+        "game-owned Auto remains a distinct native mode");
+  Check(fc::g_last_requested_mode.load() == static_cast<uint32_t>(sl::DLSSGMode::eAuto) &&
+            fc::g_last_forwarded_mode.load() == static_cast<uint32_t>(sl::DLSSGMode::eAuto) &&
+            fc::g_last_accepted_mode.load() == static_cast<uint32_t>(sl::DLSSGMode::eAuto),
+        "Auto request forwarding and acceptance are observed without aliasing");
+  fc::g_force_multiplier = 4;
+  fc::internal::HookedSetOptions(viewport, options);
+  Check(g_received_mode == sl::DLSSGMode::eAuto && g_received == 3,
+        "fixed count override preserves Auto mode");
+
+  Reset(Architecture::kAda);
+  g_backend_ready = true;
+  fc::g_dynamic_d3d12 = true;
+  fc::g_dynamic_mfg_enabled = true;
+  fc::g_dynamic_support_seen = true;
+  fc::g_dynamic_supported = true;
+  options = sl::DLSSGOptions{};
+  options.structVersion = sl::kStructVersion5;
+  options.mode = sl::DLSSGMode::eAuto;
+  options.numFramesToGenerate = 2;
+  fc::internal::HookedSetOptions(viewport, options);
+  Check(fc::g_last_requested_mode.load() == static_cast<uint32_t>(sl::DLSSGMode::eAuto) &&
+            fc::g_last_forwarded_mode.load() == static_cast<uint32_t>(sl::DLSSGMode::eDynamic) &&
+            fc::g_last_accepted_mode.load() == static_cast<uint32_t>(sl::DLSSGMode::eDynamic),
+        "explicit addon Dynamic override is distinguishable from the game's Auto request");
 
   options.numFramesToGenerate = 3;
   options.mode = sl::DLSSGMode::eOn;
@@ -562,6 +719,37 @@ int main() {
   Check(state.numFramesToGenerateMax == 5 && !g_events[2].value_known && !g_events[3].value_known,
         "unknown state ABI is returned unchanged and count is not guessed");
   countobserver::g_callback = nullptr;
+
+  Reset(Architecture::kAda);
+  const auto plugin_module = reinterpret_cast<HMODULE>(0x7777);
+  fc::internal::g_set_options_entry.identity.module = plugin_module;
+  fc::internal::g_set_options_entry.installed = true;
+  fc::internal::g_set_options_entry.trampoline = reinterpret_cast<void*>(&SetOptions);
+  fc::internal::g_get_state_entry.identity.module = plugin_module;
+  fc::internal::g_get_state_entry.installed = true;
+  fc::internal::g_get_state_entry.trampoline = reinterpret_cast<void*>(&GetState);
+  fc::g_streamline_plugin_seen = true;
+  fc::g_streamline_max_generated = 5;
+  fc::g_runtime_max_generated = 5;
+  fc::g_dynamic_support_seen = true;
+  fc::g_dynamic_supported = true;
+  fc::g_dynamic_applied = true;
+  mock::module_current[plugin_module] = false;
+  Check(fc::internal::RealSetOptions() == nullptr && fc::internal::RealGetState() == nullptr,
+        "stale plugin entries are never called after the image disappears");
+  fc::NotifyDlssgPluginUnloaded(plugin_module);
+  Check(!fc::internal::g_set_options_entry.installed.load() &&
+            !fc::internal::g_get_state_entry.installed.load() &&
+            fc::internal::g_real_set_options == nullptr &&
+            fc::internal::g_real_get_state == nullptr,
+        "plugin unload clears SetOptions/GetState entry pointers");
+  Check(!fc::g_streamline_plugin_seen.load() && fc::g_streamline_max_generated.load() == 0 &&
+            fc::g_runtime_max_generated.load() == 0 && !fc::g_effective_max_seen.load() &&
+            fc::g_last_forwarded_mode.load() == mfgunlock::diagnostic::kUnknown32 &&
+            fc::g_last_accepted_mode.load() == mfgunlock::diagnostic::kUnknown32 &&
+            !fc::g_dynamic_support_seen.load() && !fc::g_dynamic_supported.load() &&
+            !fc::g_dynamic_applied.load(),
+        "plugin unload clears structural, accepted-mode and Dynamic runtime observations");
 
   std::printf("PASS frame-count profiles: %u checks\n", g_checks);
 }

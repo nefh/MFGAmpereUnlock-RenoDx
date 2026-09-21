@@ -1,0 +1,691 @@
+{
+    "schema": 1,
+    "profiles": [
+        {
+            "id": "dlssg-310.9.1-ff6e90eb",
+            "version": "310.9.1",
+            "sha256": "ff6e90eb78b827927dff5b4ecc6b1c870c2e9bca29ed9f48c7d348cc9e170b82",
+            "timestamp": 1788370993,
+            "image_size": 7565312,
+            "retarget_payloads": [
+                {
+                    "rva": 1628704,
+                    "bytes": 6976,
+                    "fnv1a64": "9a5ccecff5711c58"
+                },
+                {
+                    "rva": 1842272,
+                    "bytes": 912,
+                    "fnv1a64": "a2041775a503e275"
+                },
+                {
+                    "rva": 1843184,
+                    "bytes": 4192,
+                    "fnv1a64": "25f6a15340923219"
+                },
+                {
+                    "rva": 1847376,
+                    "bytes": 5384,
+                    "fnv1a64": "7afa56ef76b1c2b8"
+                },
+                {
+                    "rva": 1852768,
+                    "bytes": 5240,
+                    "fnv1a64": "6dd8d8de9ca1686a"
+                },
+                {
+                    "rva": 1858016,
+                    "bytes": 5352,
+                    "fnv1a64": "418873d01511db28"
+                },
+                {
+                    "rva": 1863376,
+                    "bytes": 4840,
+                    "fnv1a64": "49c31a6cf881beb1"
+                },
+                {
+                    "rva": 1868224,
+                    "bytes": 2112,
+                    "fnv1a64": "b29a172c987a1c2e"
+                },
+                {
+                    "rva": 1870336,
+                    "bytes": 5752,
+                    "fnv1a64": "7fc73cb00f793d90"
+                },
+                {
+                    "rva": 1876096,
+                    "bytes": 5096,
+                    "fnv1a64": "f938f6de09283cad"
+                },
+                {
+                    "rva": 1881200,
+                    "bytes": 4192,
+                    "fnv1a64": "1aadc6a153008187"
+                },
+                {
+                    "rva": 1885392,
+                    "bytes": 4896,
+                    "fnv1a64": "5420451670bda034"
+                },
+                {
+                    "rva": 1890288,
+                    "bytes": 5264,
+                    "fnv1a64": "547ac75cc61d056d"
+                },
+                {
+                    "rva": 1895552,
+                    "bytes": 6224,
+                    "fnv1a64": "3cbd50ac2f7ca420"
+                },
+                {
+                    "rva": 1901776,
+                    "bytes": 11328,
+                    "fnv1a64": "67df19f6aa49216d"
+                },
+                {
+                    "rva": 2076928,
+                    "bytes": 6088,
+                    "fnv1a64": "52abdf3a72b5c181"
+                },
+                {
+                    "rva": 3263552,
+                    "bytes": 11168,
+                    "fnv1a64": "711ca0c3059dfaa2"
+                },
+                {
+                    "rva": 5030384,
+                    "bytes": 2296,
+                    "fnv1a64": "b06cd5341bae068b"
+                },
+                {
+                    "rva": 5909696,
+                    "bytes": 2144,
+                    "fnv1a64": "1c7ca69db01861c5"
+                },
+                {
+                    "rva": 5993344,
+                    "bytes": 4840,
+                    "fnv1a64": "c8ac8dbec2d8e3e5"
+                },
+                {
+                    "rva": 6248832,
+                    "bytes": 3912,
+                    "fnv1a64": "cc9ae2145c85206e"
+                },
+                {
+                    "rva": 6461440,
+                    "bytes": 16512,
+                    "fnv1a64": "89dff841138dd3dd"
+                },
+                {
+                    "rva": 6477952,
+                    "bytes": 2032,
+                    "fnv1a64": "8af8415b3be2cc40"
+                },
+                {
+                    "rva": 6479984,
+                    "bytes": 4952,
+                    "fnv1a64": "f2fc168928ff7dfe"
+                },
+                {
+                    "rva": 6484944,
+                    "bytes": 19424,
+                    "fnv1a64": "7b6afc4d91f6879b"
+                },
+                {
+                    "rva": 6504368,
+                    "bytes": 11416,
+                    "fnv1a64": "ba6ef97dc502a19b"
+                },
+                {
+                    "rva": 6515792,
+                    "bytes": 14752,
+                    "fnv1a64": "2932ac7c94f98908"
+                },
+                {
+                    "rva": 6530544,
+                    "bytes": 11328,
+                    "fnv1a64": "45729dedf9d45653"
+                },
+                {
+                    "rva": 6541872,
+                    "bytes": 2296,
+                    "fnv1a64": "df1b73e889c7763a"
+                },
+                {
+                    "rva": 6544176,
+                    "bytes": 2152,
+                    "fnv1a64": "892bea3bfdadeddc"
+                },
+                {
+                    "rva": 6546336,
+                    "bytes": 11320,
+                    "fnv1a64": "3d3618626a6a30c5"
+                },
+                {
+                    "rva": 6557664,
+                    "bytes": 2296,
+                    "fnv1a64": "a3e4c48e80b6c528"
+                },
+                {
+                    "rva": 6559968,
+                    "bytes": 2152,
+                    "fnv1a64": "a2d819163bbec287"
+                },
+                {
+                    "rva": 6562128,
+                    "bytes": 7368,
+                    "fnv1a64": "57bf86232bee81b8"
+                },
+                {
+                    "rva": 6569504,
+                    "bytes": 8440,
+                    "fnv1a64": "7cce7cd21fa9505f"
+                },
+                {
+                    "rva": 6577952,
+                    "bytes": 8496,
+                    "fnv1a64": "ea336fd5cb215384"
+                },
+                {
+                    "rva": 6586448,
+                    "bytes": 2296,
+                    "fnv1a64": "7716bb3b62a34dfa"
+                },
+                {
+                    "rva": 6588752,
+                    "bytes": 2152,
+                    "fnv1a64": "007737b4f3949e04"
+                },
+                {
+                    "rva": 6590912,
+                    "bytes": 5992,
+                    "fnv1a64": "ab6ea93220507c00"
+                },
+                {
+                    "rva": 6772528,
+                    "bytes": 44040,
+                    "fnv1a64": "501273ace681e6d2"
+                },
+                {
+                    "rva": 6816576,
+                    "bytes": 4528,
+                    "fnv1a64": "18f4763d82179366"
+                },
+                {
+                    "rva": 6821120,
+                    "bytes": 10832,
+                    "fnv1a64": "f3411d6daf617358"
+                },
+                {
+                    "rva": 6831968,
+                    "bytes": 13288,
+                    "fnv1a64": "04f2e97b5e1e1ee7"
+                },
+                {
+                    "rva": 6845264,
+                    "bytes": 6208,
+                    "fnv1a64": "039519ea4990e44e"
+                },
+                {
+                    "rva": 6851488,
+                    "bytes": 6144,
+                    "fnv1a64": "7270b921236a0399"
+                },
+                {
+                    "rva": 6857648,
+                    "bytes": 54240,
+                    "fnv1a64": "5befd5ae54f8cafd"
+                },
+                {
+                    "rva": 6911904,
+                    "bytes": 98704,
+                    "fnv1a64": "e2eb54ee22f59ba3"
+                },
+                {
+                    "rva": 7010624,
+                    "bytes": 13256,
+                    "fnv1a64": "78d8b4bf73f3170d"
+                },
+                {
+                    "rva": 7023888,
+                    "bytes": 11744,
+                    "fnv1a64": "b2b2efe90d6756e9"
+                },
+                {
+                    "rva": 7035648,
+                    "bytes": 4744,
+                    "fnv1a64": "649703527caff4bb"
+                },
+                {
+                    "rva": 7040400,
+                    "bytes": 12792,
+                    "fnv1a64": "532d9eeba8f77b7d"
+                },
+                {
+                    "rva": 7053200,
+                    "bytes": 6640,
+                    "fnv1a64": "fa3a939e8c79ef31"
+                },
+                {
+                    "rva": 7059856,
+                    "bytes": 14592,
+                    "fnv1a64": "9c65bc7fd50ee90c"
+                },
+                {
+                    "rva": 7074464,
+                    "bytes": 9208,
+                    "fnv1a64": "bc0544183ccc4fab"
+                },
+                {
+                    "rva": 7083680,
+                    "bytes": 7704,
+                    "fnv1a64": "24e723b48910d992"
+                },
+                {
+                    "rva": 7091392,
+                    "bytes": 4032,
+                    "fnv1a64": "c57c34553572354e"
+                },
+                {
+                    "rva": 7095440,
+                    "bytes": 38624,
+                    "fnv1a64": "a8f4b2257ea835cb"
+                },
+                {
+                    "rva": 7134080,
+                    "bytes": 15280,
+                    "fnv1a64": "3c76029f9b227b91"
+                },
+                {
+                    "rva": 7149376,
+                    "bytes": 56624,
+                    "fnv1a64": "1d646eae171cc82a"
+                },
+                {
+                    "rva": 7206016,
+                    "bytes": 26040,
+                    "fnv1a64": "5cc81aa36be3aeca"
+                },
+                {
+                    "rva": 7232064,
+                    "bytes": 34072,
+                    "fnv1a64": "5b0d1edf93fa5ee5"
+                },
+                {
+                    "rva": 7266144,
+                    "bytes": 15280,
+                    "fnv1a64": "487a639b74bd0fb1"
+                },
+                {
+                    "rva": 7281440,
+                    "bytes": 57936,
+                    "fnv1a64": "fa77cfacbfc78cbd"
+                },
+                {
+                    "rva": 7339392,
+                    "bytes": 26168,
+                    "fnv1a64": "f4d6c6c18d7ddfc1"
+                },
+                {
+                    "rva": 7365568,
+                    "bytes": 6752,
+                    "fnv1a64": "f4a914ade37fa944"
+                },
+                {
+                    "rva": 7372336,
+                    "bytes": 6736,
+                    "fnv1a64": "e6ab677464438120"
+                },
+                {
+                    "rva": 7379088,
+                    "bytes": 7800,
+                    "fnv1a64": "75e2c0f97e7d9816"
+                },
+                {
+                    "rva": 7386896,
+                    "bytes": 10008,
+                    "fnv1a64": "cbf0796eece7a43e"
+                },
+                {
+                    "rva": 7396912,
+                    "bytes": 7440,
+                    "fnv1a64": "71b18e81fcab7610"
+                },
+                {
+                    "rva": 7404368,
+                    "bytes": 4568,
+                    "fnv1a64": "08fc6e9cff9f3bef"
+                }
+            ],
+            "endpoint_code": [
+                {
+                    "rva": 317936,
+                    "bytes": 897,
+                    "fnv1a64": "87f956430958b6ad"
+                },
+                {
+                    "rva": 287760,
+                    "bytes": 5344,
+                    "fnv1a64": "1673fa7bd3d78b8e"
+                },
+                {
+                    "rva": 309040,
+                    "bytes": 7967,
+                    "fnv1a64": "6110aa99dd5aee70"
+                },
+                {
+                    "rva": 381408,
+                    "bytes": 3098,
+                    "fnv1a64": "e4486da426b72aaf"
+                },
+                {
+                    "rva": 393632,
+                    "bytes": 4550,
+                    "fnv1a64": "95d22d6fb2bd5dd7"
+                }
+            ],
+            "endpoint_payloads": [
+                {
+                    "rva": 6461440,
+                    "bytes": 16512,
+                    "fnv1a64": "89dff841138dd3dd"
+                },
+                {
+                    "rva": 6477952,
+                    "bytes": 2032,
+                    "fnv1a64": "8af8415b3be2cc40"
+                },
+                {
+                    "rva": 6479984,
+                    "bytes": 4952,
+                    "fnv1a64": "f2fc168928ff7dfe"
+                },
+                {
+                    "rva": 3263552,
+                    "bytes": 11168,
+                    "fnv1a64": "711ca0c3059dfaa2"
+                },
+                {
+                    "rva": 6504368,
+                    "bytes": 11416,
+                    "fnv1a64": "ba6ef97dc502a19b"
+                },
+                {
+                    "rva": 6515792,
+                    "bytes": 14752,
+                    "fnv1a64": "2932ac7c94f98908"
+                },
+                {
+                    "rva": 6530544,
+                    "bytes": 11328,
+                    "fnv1a64": "45729dedf9d45653"
+                },
+                {
+                    "rva": 6484944,
+                    "bytes": 19424,
+                    "fnv1a64": "7b6afc4d91f6879b"
+                },
+                {
+                    "rva": 6541872,
+                    "bytes": 2296,
+                    "fnv1a64": "df1b73e889c7763a"
+                },
+                {
+                    "rva": 6544176,
+                    "bytes": 2152,
+                    "fnv1a64": "892bea3bfdadeddc"
+                },
+                {
+                    "rva": 6546336,
+                    "bytes": 11320,
+                    "fnv1a64": "3d3618626a6a30c5"
+                },
+                {
+                    "rva": 1901776,
+                    "bytes": 11328,
+                    "fnv1a64": "67df19f6aa49216d"
+                },
+                {
+                    "rva": 6557664,
+                    "bytes": 2296,
+                    "fnv1a64": "a3e4c48e80b6c528"
+                },
+                {
+                    "rva": 6559968,
+                    "bytes": 2152,
+                    "fnv1a64": "a2d819163bbec287"
+                },
+                {
+                    "rva": 6562128,
+                    "bytes": 7368,
+                    "fnv1a64": "57bf86232bee81b8"
+                },
+                {
+                    "rva": 6569504,
+                    "bytes": 8440,
+                    "fnv1a64": "7cce7cd21fa9505f"
+                },
+                {
+                    "rva": 6577952,
+                    "bytes": 8496,
+                    "fnv1a64": "ea336fd5cb215384"
+                },
+                {
+                    "rva": 6586448,
+                    "bytes": 2296,
+                    "fnv1a64": "7716bb3b62a34dfa"
+                },
+                {
+                    "rva": 6588752,
+                    "bytes": 2152,
+                    "fnv1a64": "007737b4f3949e04"
+                },
+                {
+                    "rva": 2076928,
+                    "bytes": 6088,
+                    "fnv1a64": "52abdf3a72b5c181"
+                },
+                {
+                    "rva": 6590912,
+                    "bytes": 5992,
+                    "fnv1a64": "ab6ea93220507c00"
+                },
+                {
+                    "rva": 5030384,
+                    "bytes": 2296,
+                    "fnv1a64": "b06cd5341bae068b"
+                },
+                {
+                    "rva": 5909696,
+                    "bytes": 2144,
+                    "fnv1a64": "1c7ca69db01861c5"
+                },
+                {
+                    "rva": 5993344,
+                    "bytes": 4840,
+                    "fnv1a64": "c8ac8dbec2d8e3e5"
+                },
+                {
+                    "rva": 6248832,
+                    "bytes": 3912,
+                    "fnv1a64": "cc9ae2145c85206e"
+                },
+                {
+                    "rva": 1842272,
+                    "bytes": 912,
+                    "fnv1a64": "a2041775a503e275"
+                },
+                {
+                    "rva": 1843184,
+                    "bytes": 4192,
+                    "fnv1a64": "25f6a15340923219"
+                },
+                {
+                    "rva": 1847376,
+                    "bytes": 5384,
+                    "fnv1a64": "7afa56ef76b1c2b8"
+                },
+                {
+                    "rva": 1852768,
+                    "bytes": 5240,
+                    "fnv1a64": "6dd8d8de9ca1686a"
+                },
+                {
+                    "rva": 1858016,
+                    "bytes": 5352,
+                    "fnv1a64": "418873d01511db28"
+                },
+                {
+                    "rva": 1863376,
+                    "bytes": 4840,
+                    "fnv1a64": "49c31a6cf881beb1"
+                },
+                {
+                    "rva": 1628704,
+                    "bytes": 6976,
+                    "fnv1a64": "9a5ccecff5711c58"
+                },
+                {
+                    "rva": 1868224,
+                    "bytes": 2112,
+                    "fnv1a64": "b29a172c987a1c2e"
+                },
+                {
+                    "rva": 1870336,
+                    "bytes": 5752,
+                    "fnv1a64": "7fc73cb00f793d90"
+                },
+                {
+                    "rva": 1876096,
+                    "bytes": 5096,
+                    "fnv1a64": "f938f6de09283cad"
+                },
+                {
+                    "rva": 1881200,
+                    "bytes": 4192,
+                    "fnv1a64": "1aadc6a153008187"
+                },
+                {
+                    "rva": 1885392,
+                    "bytes": 4896,
+                    "fnv1a64": "5420451670bda034"
+                },
+                {
+                    "rva": 1890288,
+                    "bytes": 5264,
+                    "fnv1a64": "547ac75cc61d056d"
+                },
+                {
+                    "rva": 1895552,
+                    "bytes": 6224,
+                    "fnv1a64": "3cbd50ac2f7ca420"
+                }
+            ],
+            "selectors": [
+                {
+                    "rva": 318032,
+                    "before": [
+                        126,
+                        35
+                    ]
+                },
+                {
+                    "rva": 318353,
+                    "before": [
+                        126,
+                        32
+                    ]
+                }
+            ],
+            "endpoint_vtables": [
+                {
+                    "rva": 6597608,
+                    "target_rva": 381408
+                },
+                {
+                    "rva": 6598696,
+                    "target_rva": 393632
+                }
+            ],
+            "mfg_gates": [
+                {
+                    "rva": 92246,
+                    "bytes": 32,
+                    "fnv1a64": "2431eb0eabc7bedd",
+                    "immediate_rva": 92260
+                },
+                {
+                    "rva": 220739,
+                    "bytes": 32,
+                    "fnv1a64": "3f8842504aa70f09",
+                    "immediate_rva": 220752
+                }
+            ],
+            "kernels": [
+                {
+                    "role": "motion-vector",
+                    "entry": "Kernel_EstimateIntermMvecsScatter",
+                    "signature": "ld.param.f32 %f2, [Kernel_EstimateIntermMvecsScatter_param_0+120];",
+                    "arch": 120,
+                    "normalized_size": 90731,
+                    "declared_raw_size": 0,
+                    "fnv1a64": "b1a2811b29625d41",
+                    "descriptor_references": 8,
+                    "ada_cubin_bytes": 39968,
+                    "ada_cubin_fnv1a64": "9642092def23b3df"
+                },
+                {
+                    "role": "inpaint",
+                    "entry": "Kernel_Prev2CurrUnpackPull",
+                    "signature": ".entry Kernel_Prev2CurrUnpackPull(",
+                    "arch": 120,
+                    "normalized_size": 26439,
+                    "declared_raw_size": 0,
+                    "fnv1a64": "546151924160b69b",
+                    "descriptor_references": 8,
+                    "ada_cubin_bytes": 17568,
+                    "ada_cubin_fnv1a64": "1ba6454ab039f9dd"
+                },
+                {
+                    "role": "inpaint-decision",
+                    "entry": "Kernel_OutputPull",
+                    "signature": ".entry Kernel_OutputPull(",
+                    "arch": 120,
+                    "normalized_size": 23116,
+                    "declared_raw_size": 0,
+                    "fnv1a64": "9b47635b91b2436b",
+                    "descriptor_references": 8,
+                    "ada_cubin_bytes": 15136,
+                    "ada_cubin_fnv1a64": "c4a5eb4a8694f835"
+                },
+                {
+                    "role": "warp",
+                    "entry": "Kernel_BlendCandidatesFused",
+                    "signature": ".param .align 8 .b8 Kernel_BlendCandidatesFused_param_0[240]",
+                    "arch": 120,
+                    "normalized_size": 39638,
+                    "declared_raw_size": 39639,
+                    "fnv1a64": "7a6f5f41105c6d85",
+                    "descriptor_references": 8,
+                    "ada_cubin_bytes": 0,
+                    "ada_cubin_fnv1a64": "0000000000000000"
+                }
+            ],
+            "backend_sms": [
+                89,
+                86,
+                75
+            ],
+            "dynamic_streamline_version": [
+                2,
+                14,
+                1
+            ],
+            "options_version": 5,
+            "state_version": 4,
+            "validated_generated_ceiling": 5
+        }
+    ]
+}

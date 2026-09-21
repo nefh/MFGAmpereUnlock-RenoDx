@@ -30,6 +30,7 @@
 #include "./ngx_hook.hpp"
 #include "./count_observer.hpp"
 #include "./diagnostic_bridge.hpp"
+#include "./integration_contract.hpp"
 
 namespace mfgunlock::ngx {
 
@@ -147,7 +148,7 @@ static_assert(std::is_same_v<decltype(&HookedGetArchInfo), decltype(&NvAPI_GPU_G
 
 inline void EnsureArchitectureHook() {
   const auto* profile = architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile || !profile->NeedsRetarget()) return;
+  if (!g_enabled.load() || !profile || !profile->RequiresProviderRetarget()) return;
   auto& api = GetNvapi();
   if (!api.ready || g_arch_hook.installed.load() || g_arch_installing.test_and_set()) return;
   struct Guard {
@@ -315,6 +316,19 @@ struct FgLifecycle {
 };
 inline std::mutex g_lifecycle_lock;
 inline FgLifecycle g_lifecycle;
+
+// Bounded Turing diagnostic v2 tracing. BEGIN without a matching END identifies
+// a vendor call that did not return without flooding the per-frame log.
+inline std::atomic_uint32_t g_turing_diag_create_calls{0};
+inline std::atomic_uint32_t g_turing_diag_evaluate_calls{0};
+inline std::atomic_uint32_t g_turing_diag_release_calls{0};
+inline constexpr uint32_t kTuringDiagNgxTraceLimit = 8;
+
+inline void TuringDiagLog(const std::string& message, bool warning = false) {
+  const DWORD last_error = GetLastError();
+  Log(message, warning);
+  SetLastError(last_error);
+}
 
 inline FgLifecycle LifecycleSnapshot() {
   std::lock_guard lock(g_lifecycle_lock);
@@ -522,8 +536,29 @@ inline void SnapshotEvaluate(const NVSDK_NGX_Parameter* parameters,
       {"DLSSG.OutputReal", diagnostic::ResourceKey::kOutputReal},
       {"DLSSG.OutputDisableInterpolation", diagnostic::ResourceKey::kOutputDisableInterpolation},
   };
-  for (size_t i = 0; i < std::size(kResources); ++i)
+  for (size_t i = 0; i < std::size(kResources); ++i) {
     SnapshotResource(parameters, kResources[i].name, kResources[i].key, event.resources[i]);
+    const auto& resource = event.resources[i];
+    integration::ResourceRole role{};
+    switch (kResources[i].key) {
+      case diagnostic::ResourceKey::kBackbuffer: role = integration::ResourceRole::kBackbuffer; break;
+      case diagnostic::ResourceKey::kDepth: role = integration::ResourceRole::kDepth; break;
+      case diagnostic::ResourceKey::kMotionVectors: role = integration::ResourceRole::kMotionVectors; break;
+      case diagnostic::ResourceKey::kHudLess: role = integration::ResourceRole::kHudLess; break;
+      case diagnostic::ResourceKey::kUi: role = integration::ResourceRole::kUiColorAndAlpha; break;
+      case diagnostic::ResourceKey::kUiAlpha: role = integration::ResourceRole::kUiAlpha; break;
+      case diagnostic::ResourceKey::kBidirectionalDistortionField:
+        role = integration::ResourceRole::kBidirectionalDistortionField; break;
+      case diagnostic::ResourceKey::kOutputInterpolated:
+        role = integration::ResourceRole::kOutputInterpolated; break;
+      case diagnostic::ResourceKey::kOutputReal: role = integration::ResourceRole::kOutputReal; break;
+      case diagnostic::ResourceKey::kOutputDisableInterpolation:
+        role = integration::ResourceRole::kOutputDisableInterpolation; break;
+      default: continue;
+    }
+    integration::ObserveNgxResource(role, resource.known != 0, resource.object,
+                                    resource.width, resource.height, resource.format);
+  }
 }
 
 inline NVSDK_NGX_Result FinalizeRequirements(NVSDK_NGX_Result result,
@@ -665,14 +700,41 @@ NVSDK_NGX_Result NVSDK_CONV Create(ID3D12GraphicsCommandList* commands, NVSDK_NG
   const bool fg = static_cast<uint32_t>(feature) ==
       static_cast<uint32_t>(NVSDK_NGX_Feature_FrameGeneration);
   if (!fg) return real(commands, feature, parameters, handle);
+  const uint32_t diag_call =
+      g_turing_diag_create_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  const bool diag_trace = diagnostic::g_verbose.load(std::memory_order_relaxed) &&
+                          diag_call <= kTuringDiagNgxTraceLimit;
+  if (diag_trace) {
+    std::stringstream message;
+    message << "TuringDiagV2 NGX CreateFeature#" << diag_call
+            << " BEGIN thread=" << GetCurrentThreadId()
+            << " commands=" << commands << " parameters=" << parameters;
+    TuringDiagLog(message.str());
+  }
   const auto before_create = g_before_fg_create.load(std::memory_order_acquire);
   if (before_create && !before_create()) {
     if (handle) *handle = nullptr;
+    if (diag_trace) {
+      std::stringstream message;
+      message << "TuringDiagV2 NGX CreateFeature#" << diag_call
+              << " END result=0x" << std::hex
+              << static_cast<uint32_t>(NVSDK_NGX_Result_FAIL_FeatureNotSupported)
+              << " source=addon-preflight";
+      TuringDiagLog(message.str(), true);
+    }
     return NVSDK_NGX_Result_FAIL_FeatureNotSupported;
   }
   g_create_seen.store(true, std::memory_order_release);
   FgCall call(slot, FgCallKind::kCreate);
   const NVSDK_NGX_Result result = real(commands, feature, parameters, handle);
+  if (diag_trace) {
+    std::stringstream message;
+    message << "TuringDiagV2 NGX CreateFeature#" << diag_call
+            << " END result=0x" << std::hex << static_cast<uint32_t>(result);
+    if (result == NVSDK_NGX_Result_Success && handle)
+      message << " handle=" << *handle;
+    TuringDiagLog(message.str(), result != NVSDK_NGX_Result_Success);
+  }
   call.Finish(result, result == NVSDK_NGX_Result_Success && handle ? *handle : nullptr);
   return result;
 }
@@ -689,6 +751,18 @@ NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandList* commands,
     return real(commands, handle, parameters, callback);
   FgCall call(slot, FgCallKind::kEvaluate, handle);
   const bool fg = call.tracked;
+  const uint32_t diag_call = fg
+      ? g_turing_diag_evaluate_calls.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+  const bool diag_trace = fg && diagnostic::g_verbose.load(std::memory_order_relaxed) &&
+                          diag_call <= kTuringDiagNgxTraceLimit;
+  if (diag_trace) {
+    std::stringstream message;
+    message << "TuringDiagV2 NGX EvaluateFeature#" << diag_call
+            << " BEGIN thread=" << GetCurrentThreadId()
+            << " commands=" << commands << " handle=" << handle
+            << " parameters=" << parameters;
+    TuringDiagLog(message.str());
+  }
   const auto observer = diagnostic::g_evaluate_callback.load(std::memory_order_acquire);
   diagnostic::EvaluateEvent observed;
   if (fg && observer) {
@@ -707,6 +781,12 @@ NVSDK_NGX_Result NVSDK_CONV Evaluate(ID3D12GraphicsCommandList* commands,
     observer(&observed);
   }
   const NVSDK_NGX_Result result = real(commands, handle, parameters, callback);
+  if (diag_trace) {
+    std::stringstream message;
+    message << "TuringDiagV2 NGX EvaluateFeature#" << diag_call
+            << " END result=0x" << std::hex << static_cast<uint32_t>(result);
+    TuringDiagLog(message.str(), result != NVSDK_NGX_Result_Success);
+  }
   if (fg && observer) {
     struct LastError {
       DWORD value = GetLastError();
@@ -733,7 +813,24 @@ NVSDK_NGX_Result NVSDK_CONV Release(NVSDK_NGX_Handle* handle) {
   if (!real) return NVSDK_NGX_Result_FAIL_InvalidParameter;
   if (g_shutting_down.load(std::memory_order_acquire)) return real(handle);
   FgCall call(slot, FgCallKind::kRelease, handle);
+  const bool fg = call.tracked;
+  const uint32_t diag_call = fg
+      ? g_turing_diag_release_calls.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
+  const bool diag_trace = fg && diagnostic::g_verbose.load(std::memory_order_relaxed) &&
+                          diag_call <= kTuringDiagNgxTraceLimit;
+  if (diag_trace) {
+    std::stringstream message;
+    message << "TuringDiagV2 NGX ReleaseFeature#" << diag_call
+            << " BEGIN thread=" << GetCurrentThreadId() << " handle=" << handle;
+    TuringDiagLog(message.str());
+  }
   const NVSDK_NGX_Result result = real(handle);
+  if (diag_trace) {
+    std::stringstream message;
+    message << "TuringDiagV2 NGX ReleaseFeature#" << diag_call
+            << " END result=0x" << std::hex << static_cast<uint32_t>(result);
+    TuringDiagLog(message.str(), result != NVSDK_NGX_Result_Success);
+  }
   call.Finish(result);
   return result;
 }
@@ -768,7 +865,7 @@ inline void ApplyCapabilities(NVSDK_NGX_Parameter* parameters, unsigned int limi
   const auto maximum_result = parameters->Get("DLSSG.MultiFrameCountMax", &maximum);
   ObserveCapabilityCount(parameters, maximum, maximum_result, countobserver::Operation::kRead, backend, caller);
   const auto* profile = architecture::ActiveProfile();
-  const bool ready = g_enabled.load() && profile && profile->NeedsRetarget() && limit != 0;
+  const bool ready = g_enabled.load() && profile && profile->RequiresProviderRetarget() && limit != 0;
 
   if (ready && available_result == NVSDK_NGX_Result_Success && available == 0) {
     int needs_driver = 0;

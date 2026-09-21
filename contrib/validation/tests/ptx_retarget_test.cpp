@@ -88,7 +88,7 @@ void PackedHalfTests() {
   }
   output = fixture;
   Check(ptx::LowerPackedHalf(output, 86, 1, why) && output == fixture);
-  Check(!ptx::LowerPackedHalf(output, 89, 1, why) && output == fixture);
+  Check(ptx::LowerPackedHalf(output, 89, 1, why) && output == fixture);
   output = "ret;\n";
   Check(ptx::LowerPackedHalf(output, 75, 0, why) && output == "ret;\n");
   for (const auto& replacement : {
@@ -141,6 +141,8 @@ void TuringHalfMinMaxTests() {
 
   auto unchanged = fixture;
   Check(ptx::LowerTuringHalfMinMax(unchanged, 86, counts, why) && unchanged == fixture);
+  unchanged = fixture;
+  Check(ptx::LowerTuringHalfMinMax(unchanged, 89, counts, why) && unchanged == fixture);
   unchanged = fixture;
   Check(!ptx::LowerTuringHalfMinMax(unchanged, 75, {2, 1, 1, 1}, why) &&
         unchanged == fixture);
@@ -199,6 +201,8 @@ void TuringMmaTests() {
       output.npos);
   auto unchanged = fixture;
   Check(ptx::LowerTuringMma16816(unchanged, 86, 1, why) && unchanged == fixture);
+  unchanged = fixture;
+  Check(ptx::LowerTuringMma16816(unchanged, 89, 1, why) && unchanged == fixture);
   unchanged = fixture;
   Check(!ptx::LowerTuringMma16816(unchanged, 75, 2, why) && unchanged == fixture);
 

@@ -320,7 +320,7 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
     return Result::kRejected;
   };
 
-  if (!profile.NeedsRetarget()) {
+  if (!profile.RequiresProviderRetarget()) {
     plan = {};
     return Result::kUnchanged;
   }

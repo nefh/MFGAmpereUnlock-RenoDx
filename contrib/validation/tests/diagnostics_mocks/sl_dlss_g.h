@@ -39,7 +39,7 @@ struct ResourceTag {
   ResourceLifecycle lifecycle = ResourceLifecycle::eValidUntilPresent;
   Extent extent{};
 };
-enum class DLSSGMode : uint32_t { eOff = 0, eOn = 1, eDynamic = 2 };
+enum class DLSSGMode : uint32_t { eOff = 0, eOn = 1, eAuto = 2, eDynamic = 3 };
 struct DLSSGOptions {
   static constexpr uint32_t s_structType = 0x646c7367;
   void* next = nullptr;

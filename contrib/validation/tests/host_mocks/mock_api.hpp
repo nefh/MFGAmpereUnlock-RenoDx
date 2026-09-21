@@ -93,6 +93,7 @@ inline std::map<HMODULE, std::wstring> paths;
 inline std::map<std::pair<HMODULE, std::string>, FARPROC> exports;
 inline std::map<HMODULE, std::vector<unsigned char>> resources;
 inline std::map<const void*, HMODULE> allocation;
+inline std::map<HMODULE, bool> module_current;
 inline bool pin_ok = true;
 inline bool install_ok = true;
 inline unsigned int installs = 0;
@@ -379,8 +380,8 @@ struct Preferences {
   uint32_t structType = s_structType;
   uint32_t structVersion = kStructVersion1;
   PreferenceFlags flags{};
-  const Feature* features = nullptr;
-  size_t numFeatures = 0;
+  const Feature* featuresToLoad = nullptr;
+  uint32_t numFeaturesToLoad = 0;
 };
 constexpr uint64_t kSDKVersion = (2ull << 48) | (12ull << 32) | 0xfedc;
 }  // namespace sl

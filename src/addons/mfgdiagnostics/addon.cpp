@@ -12,7 +12,7 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 #include <deps/imgui/imgui.h>
-#include <include/reshade.hpp>
+#include "../mfgunlock/reshade_compat.hpp"
 #include "../mfgunlock/ngx_hook.hpp"
 #include "../mfgunlock/diagnostic_bridge.hpp"
 #include "./nvapi_observer.hpp"
@@ -43,6 +43,7 @@ mfgunlock::countobserver::Register g_register_count = nullptr;
 mfgunlock::diagnostic::RegisterEvaluate g_register_evaluate = nullptr;
 mfgunlock::diagnostic::RegisterLifecycle g_register_lifecycle = nullptr;
 mfgunlock::diagnostic::QueryState g_query_state = nullptr;
+HMODULE g_core_module = nullptr;
 timeline::OneShotCapture g_evaluate_capture;
 std::atomic<uint64_t> g_last_evaluation_id{0};
 std::atomic<uint32_t> g_last_frame_kind{static_cast<uint32_t>(timeline::FrameKind::kUnknown)};
@@ -493,12 +494,10 @@ void ObserveLifecycle(const mfgunlock::diagnostic::LifecycleEvent* source) noexc
 }
 
 void InstallCoreObservation() {
-  HMODULE own = nullptr;
-  // Explicit opt-in observers may outlive a UI toggle. The module is pinned so
-  // an in-flight callback can never return through unloaded diagnostic code.
-  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-                          reinterpret_cast<LPCWSTR>(&ObserveCount), &own)) return;
+  // Core-side observer slots serialize callback invocation with unregister, so
+  // diagnostics no longer needs a permanent module PIN to protect in-flight callbacks.
   const auto core = GetModuleHandleW(L"renodx-mfgunlock.addon64");
+  g_core_module = core;
   if (core) {
     g_register_count = reinterpret_cast<mfgunlock::countobserver::Register>(
         GetProcAddress(core, "MfgUnlockSetCountObserver"));
@@ -529,15 +528,32 @@ void InstallCoreObservation() {
 }
 
 void UninstallHotObservers() {
-  if (g_register_lifecycle && g_lifecycle_bridge_connected)
+  // The core can unload before diagnostics during a hot-unload sequence. Only
+  // call saved registration exports while the exact module instance that
+  // supplied them is still mapped; core detach clears its observer slots too.
+  const HMODULE current_core = GetModuleHandleW(L"renodx-mfgunlock.addon64");
+  const bool core_current = g_core_module != nullptr && current_core == g_core_module;
+  if (core_current && g_register_lifecycle && g_lifecycle_bridge_connected)
     g_register_lifecycle(mfgunlock::diagnostic::kLifecycleVersion, nullptr);
   g_lifecycle_bridge_connected = false;
-  if (g_register_evaluate && g_evaluate_bridge_connected)
+  if (core_current && g_register_evaluate && g_evaluate_bridge_connected)
     g_register_evaluate(mfgunlock::diagnostic::kEvaluateVersion, nullptr);
-  if (g_register_count && g_count_bridge_connected)
+  if (core_current && g_register_count && g_count_bridge_connected)
     g_register_count(mfgunlock::countobserver::kVersion, nullptr);
   g_evaluate_bridge_connected = false;
   g_count_bridge_connected = false;
+  g_state_bridge_connected = false;
+  probe::g_sink.store(nullptr, std::memory_order_release);
+  probe::g_recording.store(nullptr, std::memory_order_release);
+  if (!probe::Uninstall()) {
+    reshade::log::message(reshade::log::level::error,
+        "mfgdiagnostics: failed to detach every NGX parameter observer; retained module ownership is preserved");
+  }
+  g_query_state = nullptr;
+  g_register_count = nullptr;
+  g_register_evaluate = nullptr;
+  g_register_lifecycle = nullptr;
+  g_core_module = nullptr;
 }
 
 bool ObserveDynamicCapability(const sl::DLSSGState& state, sl::Result result,
@@ -1056,6 +1072,28 @@ Json DiagnosticStateJson() {
   static constexpr const char* kTemporal[] = {"none", "midpoint", "blackwell"};
   const uint32_t architecture = state.architecture;
   const uint32_t temporal = static_cast<uint32_t>(state.temporal_backend);
+  const auto mode_json = [](uint32_t known, uint32_t mode) -> Json {
+    if (!known) return nullptr;
+    switch (mode) {
+      case 0: return "off";
+      case 1: return "on";
+      case 2: return "auto";
+      case 3: return "dynamic";
+      default: return mode;
+    }
+  };
+  const auto multiplier_json = [](uint32_t known, uint32_t generated) -> Json {
+    return known ? Json(generated == 0 ? 0u : generated + 1u) : Json(nullptr);
+  };
+  const auto verdict_json = [](uint32_t verdict) -> Json {
+    switch (verdict) {
+      case 0: return "UNKNOWN";
+      case 1: return "OBSERVED";
+      case 2: return "VALID";
+      case 3: return "INVALID";
+      default: return nullptr;
+    }
+  };
   return {
       {"architecture", architecture < std::size(kArchitectures) ? Json(kArchitectures[architecture]) : Json(nullptr)},
       {"target_sm", state.target_sm ? Json(state.target_sm) : Json(nullptr)},
@@ -1065,16 +1103,71 @@ Json DiagnosticStateJson() {
       {"warp_applied", state.warp_applied != 0},
       {"warp_target_sm", state.warp_target_sm ? Json(state.warp_target_sm) : Json(nullptr)},
       {"dynamic_requested", state.dynamic_requested != 0},
+      {"dynamic_support_seen", state.dynamic_support_seen != 0},
+      {"dynamic_supported", state.dynamic_support_seen ? Json(state.dynamic_supported != 0) : Json(nullptr)},
       {"dynamic_applied", state.dynamic_applied != 0},
-      {"fixed_multiplier", state.fixed_multiplier},
+      {"dynamic_setoptions_accepted", state.accepted_mode_known
+          ? Json(state.accepted_mode == static_cast<uint32_t>(sl::DLSSGMode::eDynamic))
+          : Json(nullptr)},
+      {"dynamic_effective", state.observed_mode_known
+          ? Json(state.observed_mode == static_cast<uint32_t>(sl::DLSSGMode::eDynamic))
+          : Json(nullptr)},
+      {"fixed_multiplier_override", state.fixed_multiplier},
+      {"requested_multiplier", multiplier_json(state.requested_generated_known, state.requested_generated)},
+      {"forwarded_multiplier", multiplier_json(state.forwarded_generated_known, state.forwarded_generated)},
+      {"accepted_multiplier", multiplier_json(state.accepted_generated_known, state.accepted_generated)},
+      {"provider_applied_multiplier", multiplier_json(
+          state.provider_applied_generated_known, state.provider_applied_generated)},
+      {"requested_mode", mode_json(state.requested_mode_known, state.requested_mode)},
+      {"forwarded_mode", mode_json(state.forwarded_mode_known, state.forwarded_mode)},
+      {"accepted_mode", mode_json(state.accepted_mode_known, state.accepted_mode)},
+      {"observed_mode", mode_json(state.observed_mode_known, state.observed_mode)},
+      {"structural_max_multiplier", multiplier_json(state.structural_max_known, state.structural_max_generated)},
+      {"runtime_max_multiplier", multiplier_json(state.runtime_max_known, state.runtime_max_generated)},
+      {"effective_max_multiplier", multiplier_json(state.effective_max_known, state.effective_max_generated)},
+      {"game_ui_max_multiplier", multiplier_json(state.game_ui_max_known, state.game_ui_max_generated)},
       {"effective_generated", state.effective_generated},
       {"preset_requested", state.preset_requested},
       {"preset_supplied", state.preset_supplied < 0 ? Json(nullptr) : Json(state.preset_supplied)},
       {"preset_applied", state.preset_applied < 0 ? Json(nullptr) : Json(state.preset_applied)},
+      {"hdr", state.hdr_state_seen ? Json(state.hdr_active != 0) : Json(nullptr)},
+      {"swapchain_color_space", state.swapchain_color_space_known ? Json(state.swapchain_color_space) : Json(nullptr)},
+      {"dlssg_color_space", state.dlssg_color_space_known ? Json(state.dlssg_color_space) : Json(nullptr)},
+      {"native_uir_observed", state.native_uir_observed != 0},
+      {"automatic_uir_eligible", state.automatic_uir_eligible != 0},
+      {"automatic_uir_applied", state.automatic_uir_applied != 0},
+      {"automatic_uir_rejected", state.automatic_uir_rejected != 0},
+      {"automatic_uir_reject_reasons", state.automatic_uir_reject_reasons},
       {"ui_composition_requested", state.ui_composition_requested != 0},
       {"ui_composition_applied", state.ui_composition_applied != 0},
       {"ui_composition_fallback", state.ui_composition_fallback != 0},
       {"prepared_provider_count", state.prepared_provider_count},
+      {"integration_contract", {
+          {"frame_index", verdict_json(state.frame_contract)},
+          {"resources", verdict_json(state.resource_contract)},
+          {"dynamic_resolution", verdict_json(state.dynamic_resolution_contract)},
+          {"queue", verdict_json(state.queue_contract)},
+          {"swapchain", verdict_json(state.swapchain_contract)},
+          {"viewport_ownership", verdict_json(state.viewport_contract)},
+          {"status_raw", state.dlssg_status_known ? Json(state.dlssg_status_raw) : Json(nullptr)},
+          {"status_unknown_bits", state.dlssg_status_known ? Json(state.dlssg_status_unknown_bits) : Json(nullptr)},
+          {"fail_reflex_missing", state.dlssg_status_known ? Json(state.fail_reflex_missing != 0) : Json(nullptr)},
+          {"fail_hdr_unsupported", state.dlssg_status_known ? Json(state.fail_hdr_unsupported != 0) : Json(nullptr)},
+          {"fail_common_constants", state.dlssg_status_known ? Json(state.fail_constants_invalid != 0) : Json(nullptr)},
+          {"fail_backbuffer_index", state.dlssg_status_known ? Json(state.fail_backbuffer_index_missing != 0) : Json(nullptr)},
+          {"resource_seen_mask", state.resource_seen_mask},
+          {"resource_active_mask", state.resource_active_mask},
+          {"resource_clear_mask", state.resource_clear_mask},
+          {"dynamic_resolution_enabled", state.dynamic_resolution_enabled != 0},
+          {"queue_parallelism_mode", state.queue_parallelism_known ? Json(state.queue_parallelism_mode) : Json(nullptr)},
+          {"completion_fence", state.completion_fence_known ? Json(state.completion_fence) : Json(nullptr)},
+          {"completion_fence_value", state.completion_fence_known ? Json(state.completion_fence_value) : Json(nullptr)},
+          {"swapchain_recreations", state.swapchain_recreation_count},
+          {"swapchain_resizes", state.swapchain_resize_count},
+          {"waitable_object_ownership", state.waitable_object_ownership_known ? Json("OBSERVED") : Json("UNKNOWN")},
+          {"fullscreen_transition", state.fullscreen_transition_known ? Json("OBSERVED") : Json("UNKNOWN")},
+          {"iflip", state.iflip_known ? Json("OBSERVED") : Json("UNKNOWN")},
+      }},
   };
 }
 
@@ -1580,7 +1673,11 @@ void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain,
   Event event(Kind::output);
   event.recognized = true;
   event.values[0] = reinterpret_cast<uintptr_t>(swapchain);
+#if MFGUNLOCK_RESHADE_HAS_COLOR_SPACE
   event.values[1] = static_cast<uint32_t>(swapchain->get_color_space());
+#else
+  event.values[1] = mfgunlock::diagnostic::kUnknown32;
+#endif
   event.values[5] = backbuffer_count;
   if (backbuffer_count != 0) {
     const auto desc = swapchain->get_device()->get_resource_desc(swapchain->get_back_buffer(0));
@@ -1742,8 +1839,8 @@ void OnOverlay(reshade::api::effect_runtime*) {
   std::unique_lock lock(g_output_mutex, std::try_to_lock);
   if (lock.owns_lock()) ImGui::TextWrapped("%s", g_output_message.c_str());
   ImGui::TextWrapped("Close the overlay during capture. For UI discovery, switch native FG off/on and "
-                    "leave the game running for a few seconds after HUD-less appears. Restart to disable "
-                    "hooks; do not hot-unload either addon.");
+                    "leave the game running for a few seconds after HUD-less appears. Observer callbacks "
+                    "disconnect symmetrically when capture stops or the addon unloads.");
 }
 } // namespace
 
@@ -1780,6 +1877,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     reshade::register_overlay("MFG Diagnostics", OnOverlay);
   } else if (reason == DLL_PROCESS_DETACH) {
     g_capture.Stop();
+    UninstallHotObservers();
     reshade::unregister_overlay("MFG Diagnostics", OnOverlay);
     if (g_enabled) {
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);

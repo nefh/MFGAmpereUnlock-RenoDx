@@ -36,7 +36,7 @@ inline bool CanRelaxRequirements(const RequirementsEvidence& evidence,
                                  const ArchitectureProfile* profile) {
   // AdapterUnsupported also covers non-architecture failures. Preserve all
   // other requirement flags and only override for the prepared DLSS-G provider.
-  return profile && profile->NeedsRetarget() && evidence.enabled && evidence.adapter_bound &&
+  return profile && profile->RequiresProviderRetarget() && evidence.enabled && evidence.adapter_bound &&
          evidence.prepared_providers == 1 && evidence.call_result == kNgxSuccess &&
          evidence.feature == kDlssGFeatureId &&
          (evidence.flags == 0 || evidence.flags == kAdapterUnsupported) &&
@@ -48,7 +48,7 @@ inline bool CanRelaxRequirements(const RequirementsEvidence& evidence,
 inline bool CanExposeArchitecture(bool enabled, bool fg_requirements_scope, bool same_physical_gpu,
                                    bool provider_ready, int nvapi_result,
                                    const ArchitectureProfile* profile) {
-  return profile && profile->NeedsRetarget() && enabled && fg_requirements_scope &&
+  return profile && profile->RequiresProviderRetarget() && enabled && fg_requirements_scope &&
          same_physical_gpu && provider_ready && nvapi_result == 0;
 }
 
@@ -66,7 +66,7 @@ inline bool CanRelaxStreamlineSupport(const StreamlineSupportEvidence& evidence,
   // required before relaxing Streamline's cached adapter-admission verdict.
   // Preserve all other SL errors so OS, driver, plugin and integration failures
   // continue to fail closed.
-  return profile && profile->NeedsRetarget() && evidence.enabled && evidence.adapter_bound &&
+  return profile && profile->RequiresProviderRetarget() && evidence.enabled && evidence.adapter_bound &&
          evidence.adapter_matches && evidence.prepared_providers == 1 &&
          evidence.result == kStreamlineNoSupportedAdapter;
 }

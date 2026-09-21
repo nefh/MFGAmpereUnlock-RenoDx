@@ -20,6 +20,7 @@ binaries are redistributed.**
    [RenoDX](https://github.com/clshortfuse/renodx) mod for the game.
 2. Download the [latest release](../../releases/latest).
 3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the game.
+   When updating, close the game before replacing the existing addon file.
 4. Append the following to `ReShade.ini`:
 
    ```ini
@@ -29,9 +30,8 @@ binaries are redistributed.**
 
    **If omitted, MFG Unlock will append itself automatically; restart the game
    once afterwards for MFG to be detected.**
-5. If 3x/4x/6x MFG is unavailable, update
-   [`nvngx_dlssg.dll`](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/)
-   to a recent version.
+5. For the full feature set in this release, use **DLSS-G 310.9.1**. NVIDIA
+   binaries are not included in this repository.
 6. For Dynamic MFG, replace the game's Streamline files with
    [Streamline 2.14.1 with DLSS-G 310.9.1](https://www.nexusmods.com/site/mods/1282?tab=files)
    only in games known to accept a Streamline update. This replacement works, for
@@ -42,10 +42,10 @@ binaries are redistributed.**
 
 ### Dynamic MFG and Validated Warp Blend
 
-- **Dynamic MFG** is available on **Ampere (RTX 30)** and **Turing (RTX 20)** with
+- **Dynamic MFG** is available on **Ada (RTX 40)**, **Ampere (RTX 30)** and **Turing (RTX 20)** with
   the supported Streamline/DLSS-G stack. NVIDIA varies the multiplier toward the
   selected output FPS.
-- **Validated Warp Blend** improves later-stage reprojection on RTX 20/30 with
+- **Validated Warp Blend** improves later-stage reprojection on qualified RTX 20/30/40 paths with
   DLSS-G **310.9.1**. Enable it and restart the game.
 - Advanced/debug contains Warp diagnostic modes; normal use stays on
   **Validated Warp**.
@@ -53,7 +53,7 @@ binaries are redistributed.**
 ### Intermediate Scatter Retention and Boundary Artifact Mitigation
 
 - **Intermediate Scatter Retention** improves preservation of thin geometry and
-  small moving details in generated frames on RTX 20/30 with DLSS-G **310.9.1**.
+  small moving details in generated frames on qualified RTX 20/30/40 paths with DLSS-G **310.9.1**.
 - **Boundary Artifact Mitigation** controls how ISR behaves near object edges.
   **Off** keeps the `0.10-pre1` ISR behavior; **Balanced** and **Aggressive** add
   progressively stronger boundary handling.
@@ -80,7 +80,17 @@ binaries are redistributed.**
 - If UI composition looks wrong, disable UI Color+Alpha injection; Automatic UI
   Composition can stay enabled.
 
-## Tested Games
+### Compatibility notes
+
+- Automatic UI Composition targets the supported SDR path; HDR handling follows
+  the capabilities of the active Streamline/DLSS-G stack.
+- Some games use older Streamline integrations and should keep their original
+  runtime files. Check the game compatibility table before replacing Streamline.
+
+## Game compatibility
+
+*Results include current and earlier compatible builds. Game, Streamline, driver
+and provider updates can change behavior.*
 
 | Game | Ampere | Turing | Ada | Comment |
 | --- | --- | --- | --- | --- |
@@ -118,7 +128,9 @@ binaries are redistributed.**
 
 *Ada results are inherited from MFGAdaUnlock.*
 
-## Known Multiplier Behavior
+## Multiplier behavior
+
+*Multiplier ceilings can change with game and provider updates.*
 
 | Game | Reaches | Notes |
 |---|---|---|
@@ -132,8 +144,8 @@ binaries are redistributed.**
 - GeForce RTX 20-, 30-, or 40-series GPU.
 - ReShade with addon support.
 - A game with NVIDIA DLSS Frame Generation through Streamline or NGX.
-- A recent `nvngx_dlssg.dll` when 3x/4x/6x MFG is unavailable.
-- For Dynamic MFG on Ampere or Turing: Direct3D 12, Streamline 2.14.1, DLSS 310.9.1, and
+- **DLSS-G 310.9.1** for the full supported feature set in this release.
+- For the qualified Dynamic MFG path: Direct3D 12, Streamline 2.14.1, DLSS 310.9.1, and
   NVIDIA driver 595.41 or newer.
 
 ## Vulkan
@@ -178,9 +190,9 @@ Temporal Fix, ISR, Boundary and Warp changes require a game restart.
 | `Architecture` | `Auto` | `Auto`, `Ada`, `Ampere`, or `Turing` |
 | `MaxCount` | `4` | Reported `DLSSG.MultiFrameCountMax` |
 | `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` requests that multiplier within the active Streamline structural limit |
-| `DynamicMFG` | `0` | Enables native Dynamic MFG on Ampere/Turing when the runtime reports support; takes priority over `ForceMultiplier` |
+| `DynamicMFG` | `0` | Enables native Dynamic MFG on Ada/Ampere/Turing when the runtime reports support; takes priority over `ForceMultiplier` |
 | `DynamicTargetFPS` | `0` | Dynamic output target; `0` follows display refresh |
-| `IntermediateScatterRetention` | `0` | Preserves thin-geometry motion on RTX 20/30 with exact DLSS-G 310.9.1; restart required |
+| `IntermediateScatterRetention` | `0` | Preserves thin-geometry motion on qualified RTX 20/30/40 paths with exact DLSS-G 310.9.1; restart required |
 | `BoundaryArtifactMitigationMode` | `0` | `0` keeps the `0.10-pre1` ISR behavior; `1` Balanced, `2` Aggressive; restart required |
 | `ValidatedWarpBlend` | `0` | Validated Warp quality path for RTX 20/30 with exact DLSS-G 310.9.1; restart required |
 | `ShowDebugOptions` | `0` | Shows diagnostic and advanced compatibility controls |
@@ -265,51 +277,38 @@ selected architecture:
    partner is unavailable; advanced injection can supply a detected D3D12 UI
    Color+Alpha target and recover across short UI-target handovers.
 
-Unknown provider layouts are left untouched.
+## Building from source
 
-Detailed regression and architecture qualification notes live under
-[`contrib/validation`](contrib/validation/README.md), including the RTX 20 / SM75
-compatibility path.
+MFGAmpereUnlock is built through RenoDX. You need **Visual Studio 2022** with
+the **Desktop development with C++** workload, **CMake**, and **Git**.
 
-## Building
-
-The addon is built as part of a [RenoDX](https://github.com/clshortfuse/renodx)
-tree. The Windows build pins NVIDIA/NVAPI commit `87dca62`.
+From the MFGAmpereUnlock repository root, run:
 
 ```powershell
-git clone --recursive https://github.com/clshortfuse/renodx
-Copy-Item -Recurse .\src\addons\mfgunlock .\renodx\src\addons\
-Set-Location .\renodx
-
-git clone https://github.com/NVIDIA/nvapi.git external/NVAPI
-git -C external/NVAPI checkout 87dca62
-
-$env:CL = '/I"' + (Resolve-Path ".\external\NVAPI").Path + '"'
-cmake --preset vs-x64
-cmake --build build.vs --config Release --target mfgunlock
-Remove-Item Env:CL
+.\tools\build_mfgunlock.ps1
 ```
 
-Output: `build.vs/Release/renodx-mfgunlock.addon64`
+On the first run, the helper automatically downloads the pinned RenoDX and NVAPI
+source dependencies into `external\RenoDX`, initializes RenoDX submodules, and
+sets up the repo-local shader compiler tools required by the build. System-wide
+prerequisites such as Visual Studio and the Windows SDK are not installed automatically.
 
-For an exact ReShade API compatibility build, use `tools/build_mfgunlock.ps1`.
-The API number is a build parameter and multiple variants can be built in one run:
+The compiled addon is written under:
+
+```text
+dist\mfgunlock\reshade-api18\renodx-mfgunlock.addon64
+```
+
+To build for any ReShade API version available in upstream ReShade history, pass the API number directly. Older API versions can be useful for compatibility with legacy ReShade releases required by some closed-source mods, such as PureDark mods:
 
 ```powershell
-.\tools\build_mfgunlock.ps1 -ReShadeApi 14
-.\tools\build_mfgunlock.ps1 -ReShadeApi 14,18
+.\tools\build_mfgunlock.ps1 -ReShadeApi 15
+.\tools\build_mfgunlock.ps1 -ReShadeApi 14,15,17,18,20
 ```
 
-API-specific binaries are written to `dist/mfgunlock/reshade-api<version>/`.
-The build script uses the exact ReShade release and matching ImGui submodule from
-`tools/reshade-api-targets.json`; API 14 currently maps to ReShade `v6.3.3` and
-API 18 to `v6.7.0`.
+The helper resolves the matching ReShade source revision automatically, detects the callback ABI from those headers and keeps every per-API ReShade checkout inside the repository at `external\reshade-api\api<version>`. API-specific builds are written to `dist\mfgunlock\reshade-api<version>\`. At the end of a build the helper prints the complete absolute path and SHA256 for every generated addon. If the requested API never existed upstream, the build stops with a clear error.
 
-Prebuilt binaries are attached to [Releases](../../releases).
-
-For development, the separate `mfgdiagnostics` addon records Streamline/NGX
-activity without changing it. Keep diagnostics disabled for performance tests.
-See [validation](contrib/validation/README.md) for regression and capture tooling.
+To re-check and refresh the managed build dependencies, use `-RefreshDependencies`.
 
 ## Credits
 
