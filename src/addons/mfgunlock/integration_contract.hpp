@@ -114,6 +114,11 @@ struct Snapshot {
   uint32_t swapchain_buffer_count = 0;
   uint32_t swapchain_color_space_known = 0;
   uint32_t swapchain_color_space = kUnknown32;
+  uint32_t swapchain_format_known = 0;
+  uint32_t swapchain_format = kUnknown32;
+  uint32_t output_encoding_known = 0;
+  uint32_t output_encoding = kUnknown32;
+  uint32_t output_dlssg_supported = 0;
   uint32_t fullscreen_transition_known = 0;
   uint32_t waitable_object_ownership_known = 0;
   uint32_t iflip_known = 0;
@@ -209,6 +214,11 @@ inline std::atomic_uint32_t g_swapchain_buffer_count_known{0};
 inline std::atomic_uint32_t g_swapchain_buffer_count{0};
 inline std::atomic_uint32_t g_swapchain_color_space_known{0};
 inline std::atomic_uint32_t g_swapchain_color_space{kUnknown32};
+inline std::atomic_uint32_t g_swapchain_format_known{0};
+inline std::atomic_uint32_t g_swapchain_format{kUnknown32};
+inline std::atomic_uint32_t g_output_encoding_known{0};
+inline std::atomic_uint32_t g_output_encoding{kUnknown32};
+inline std::atomic_uint32_t g_output_dlssg_supported{0};
 
 inline std::atomic_uint32_t g_status_known{0};
 inline std::atomic_uint32_t g_status_raw{0};
@@ -269,6 +279,12 @@ inline void Reset() {
   g_swapchain_alive.store(0, std::memory_order_relaxed);
   g_swapchain_buffer_count_known.store(0, std::memory_order_relaxed);
   g_swapchain_color_space_known.store(0, std::memory_order_relaxed);
+  g_swapchain_color_space.store(kUnknown32, std::memory_order_relaxed);
+  g_swapchain_format_known.store(0, std::memory_order_relaxed);
+  g_swapchain_format.store(kUnknown32, std::memory_order_relaxed);
+  g_output_encoding_known.store(0, std::memory_order_relaxed);
+  g_output_encoding.store(kUnknown32, std::memory_order_relaxed);
+  g_output_dlssg_supported.store(0, std::memory_order_relaxed);
   g_status_known.store(0, std::memory_order_relaxed);
   g_options_viewport_known.store(0, std::memory_order_relaxed);
   g_constants_viewport_known.store(0, std::memory_order_relaxed);
@@ -469,9 +485,23 @@ inline void ObserveSwapchainPresent(uint64_t swapchain, uint32_t thread) {
   if (swapchain != 0) g_last_swapchain.store(swapchain, std::memory_order_relaxed);
   ObservePresentThread(thread);
 }
+inline void ObserveSwapchainOutput(uint32_t format, bool format_known,
+                                  uint32_t color_space, bool color_space_known,
+                                  uint32_t encoding, bool encoding_known,
+                                  bool dlssg_supported) {
+  g_swapchain_format.store(format_known ? format : kUnknown32, std::memory_order_relaxed);
+  g_swapchain_format_known.store(format_known, std::memory_order_release);
+  g_swapchain_color_space.store(
+      color_space_known ? color_space : kUnknown32, std::memory_order_relaxed);
+  g_swapchain_color_space_known.store(color_space_known, std::memory_order_release);
+  g_output_encoding.store(encoding_known ? encoding : kUnknown32, std::memory_order_relaxed);
+  g_output_encoding_known.store(encoding_known, std::memory_order_release);
+  g_output_dlssg_supported.store(dlssg_supported, std::memory_order_release);
+}
+
 inline void ObserveSwapchainColorSpace(uint32_t color_space, bool known) {
-  g_swapchain_color_space.store(known ? color_space : kUnknown32, std::memory_order_relaxed);
-  g_swapchain_color_space_known.store(known, std::memory_order_release);
+  ObserveSwapchainOutput(kUnknown32, false, color_space, known,
+                         kUnknown32, false, false);
 }
 
 inline Verdict FrameVerdict() {
@@ -632,6 +662,11 @@ inline Snapshot Read() {
   out.swapchain_buffer_count = g_swapchain_buffer_count.load(std::memory_order_relaxed);
   out.swapchain_color_space_known = g_swapchain_color_space_known.load(std::memory_order_acquire);
   out.swapchain_color_space = g_swapchain_color_space.load(std::memory_order_relaxed);
+  out.swapchain_format_known = g_swapchain_format_known.load(std::memory_order_acquire);
+  out.swapchain_format = g_swapchain_format.load(std::memory_order_relaxed);
+  out.output_encoding_known = g_output_encoding_known.load(std::memory_order_acquire);
+  out.output_encoding = g_output_encoding.load(std::memory_order_relaxed);
+  out.output_dlssg_supported = g_output_dlssg_supported.load(std::memory_order_acquire);
   // ReShade's current callback surface used here does not authoritatively expose
   // exclusive-fullscreen/IFLIP/waitable ownership. Keep these unknown.
   out.fullscreen_transition_known = 0;

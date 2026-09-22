@@ -37,6 +37,7 @@
 #include "./count_observer.hpp"
 #include "./diagnostic_bridge.hpp"
 #include "./integration_contract.hpp"
+#include "./output_state.hpp"
 #include <optional>
 #include "./quality_guard.hpp"
 #include "./ui_candidate.hpp"
@@ -127,14 +128,9 @@ inline std::atomic<unsigned int> g_dynamic_result{0};
 inline bool (*g_dynamic_stack_ready)() = nullptr;
 
 // UI recomposition is independent of the selected Frame Generation preset.
-// Automatic mode requests Streamline's UI-capable path only after ReShade has
-// positively identified an SDR output; optional HUD/UI resources still pass
-// through a fail-closed metadata guard before Streamline can consume them.
+// Output encoding is owned by output_state.hpp; optional HUD/UI resources still
+// pass through a fail-closed metadata guard before Streamline can consume them.
 inline std::atomic_bool g_ui_composition_enabled{true};
-inline std::atomic_bool g_hdr_state_seen{false};
-inline std::atomic_bool g_hdr_active{false};
-inline std::atomic_bool g_output_color_space_seen{false};
-inline std::atomic<uint32_t> g_output_color_space{diagnostic::kUnknown32};
 inline std::atomic_bool g_ui_composition_applied{false};
 inline std::atomic_bool g_ui_composition_fell_back{false};
 inline std::atomic<unsigned int> g_ui_composition_result{0};
@@ -176,6 +172,7 @@ struct UiCandidateSnapshot {
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t format = 0;
+  uint32_t ui_encoding = static_cast<uint32_t>(outputstate::UiEncoding::kUnknown);
   uint32_t state = 0;
   uint32_t stable_frames = 0;
   uint32_t rtv_binds_after_clear = 0;
@@ -553,9 +550,7 @@ inline uint32_t SuppressUiResources(sl::ResourceTag* tags, uint32_t count) {
 inline bool ShouldRequestUiComposition(const sl::DLSSGOptions& options) {
   return g_ui_composition_enabled.load(std::memory_order_relaxed) &&
          options.mode != sl::DLSSGMode::eOff &&
-         qualityguard::ShouldRequestAutomaticUiPath(
-             g_hdr_state_seen.load(std::memory_order_acquire),
-             g_hdr_active.load(std::memory_order_relaxed));
+         qualityguard::ShouldRequestAutomaticUiPath(outputstate::Read());
 }
 
 using ModeObserver = void (*)(uint32_t, uint32_t, uint32_t);
@@ -666,9 +661,7 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
   if (!recompose) {
     ObserveUiOptionsTransition(viewport, options);
     const sl::Result result = CallSetOptions(viewport, options, origin);
-    if (result == sl::Result::eOk && (options.mode == sl::DLSSGMode::eOff ||
-        !g_ui_composition_enabled.load(std::memory_order_relaxed) ||
-        g_hdr_active.load(std::memory_order_relaxed))) {
+    if (result == sl::Result::eOk) {
       g_ui_composition_applied.store(false, std::memory_order_relaxed);
       g_ui_candidate_options_synced.store(false, std::memory_order_release);
     }
@@ -1183,7 +1176,12 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
   const bool injection_requested = CandidateInjectionRequested();
   const bool options_synced =
       g_ui_candidate_options_synced.load(std::memory_order_acquire);
-  const bool can_inject = uicandidate::CanInject(
+  const auto output = outputstate::Read();
+  const auto ui_encoding =
+      static_cast<outputstate::UiEncoding>(candidate.ui_encoding);
+  const bool encoding_compatible =
+      outputstate::IsUiEncodingCompatible(output, ui_encoding, false);
+  const bool can_inject = encoding_compatible && uicandidate::CanInject(
       candidate.reject_reasons, candidate.stable_frames, command_buffer != nullptr,
       options_synced, injection_requested);
   if (can_inject && count >= 64) {
@@ -1312,7 +1310,7 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
     g_observe_streamline_ui_tags(tags, count);
 
   UiViewportState* state = GetUiState(viewport);
-  const bool hdr = g_hdr_active.load(std::memory_order_relaxed);
+  const auto output_state = outputstate::Read();
   qualityguard::OutputDescription expected{};
   if (state != nullptr) {
     AcquireSRWLockShared(&state->lock);
@@ -1320,7 +1318,8 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
     ReleaseSRWLockShared(&state->lock);
   }
 
-  const auto assessment = qualityguard::AssessTags(tags, count, hdr, expected);
+  const auto assessment =
+      qualityguard::AssessTags(tags, count, output_state, expected);
   bool eligible = false;
   auto suppression = assessment.suppress_hud_separation
                          ? qualityguard::SuppressionPolicy::kAllHudSeparation
@@ -1397,16 +1396,21 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
           state->hudless_color_seen.load(std::memory_order_acquire);
       accumulated.has_ui_color_or_alpha =
           state->ui_color_or_alpha_seen.load(std::memory_order_acquire);
+      accumulated.has_ui_color_alpha =
+          state->ui_color_alpha_seen.load(std::memory_order_acquire);
+      accumulated.has_ui_alpha =
+          state->ui_alpha_seen.load(std::memory_order_acquire);
+      accumulated.ui_encoding = qualityguard::NativeUiEncoding(accumulated);
       if (state->ui_recomposition_invalid.load(std::memory_order_acquire))
         accumulated.issues |= qualityguard::kInvalidOptionalResource;
 
-      eligible = qualityguard::CanAutomaticallyUseUiRecomposition(accumulated, hdr);
+      eligible = qualityguard::CanAutomaticallyUseUiRecomposition(
+          accumulated, output_state);
       suppression = qualityguard::ResolveSuppression(
-          assessment, accumulated, hdr, was_eligible);
+          assessment, accumulated, output_state, was_eligible);
       const bool suppress = suppression != qualityguard::SuppressionPolicy::kNone;
       const bool native_hudless_fallback =
-          !hdr && accumulated.has_hudless_color &&
-          !accumulated.has_ui_color_or_alpha &&
+          accumulated.has_hudless_color && !accumulated.has_ui_color_or_alpha &&
           !qualityguard::HasStructuralIssues(accumulated);
       g_ui_native_hudless_fallback.store(native_hudless_fallback,
                                          std::memory_order_relaxed);
@@ -1431,7 +1435,7 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
   if (assessment.has_hud_separation)
     g_ui_pair_eligible.store(eligible, std::memory_order_relaxed);
 
-  const bool native_hudless_only = state != nullptr && !hdr &&
+  const bool native_hudless_only = state != nullptr &&
       assessment.has_hudless_color && !assessment.has_ui_color_or_alpha &&
       !qualityguard::HasStructuralIssues(assessment) &&
       suppression == qualityguard::SuppressionPolicy::kNone;
@@ -1861,29 +1865,22 @@ inline UiDebugSnapshot ReadUiDebugSnapshot() {
   return snapshot;
 }
 
-inline void NotifyHdrState(bool hdr, uint32_t color_space = diagnostic::kUnknown32) {
-  const bool previous = g_hdr_active.exchange(hdr, std::memory_order_relaxed);
-  const bool seen = g_hdr_state_seen.exchange(true, std::memory_order_acq_rel);
-  g_output_color_space_seen.store(color_space != diagnostic::kUnknown32,
-                                  std::memory_order_release);
-  g_output_color_space.store(color_space, std::memory_order_relaxed);
-  if (!seen || previous != hdr) {
-    internal::ForgetUiOutputs();
-    internal::RequestAllUiResets();
-    g_ui_composition_applied.store(false, std::memory_order_relaxed);
-    NotifyLiveOptionsChanged();
-  }
+inline void NotifyOutputStateChanged() {
+  internal::ForgetUiOutputs();
+  internal::RequestAllUiResets();
+  g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  g_ui_candidate_options_synced.store(false, std::memory_order_release);
+  NotifyLiveOptionsChanged();
 }
 
 inline void NotifyOutputUnknown() {
-  g_hdr_state_seen.store(false, std::memory_order_release);
-  g_hdr_active.store(false, std::memory_order_relaxed);
-  g_output_color_space_seen.store(false, std::memory_order_release);
-  g_output_color_space.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+  outputstate::Reset();
   g_ui_composition_applied.store(false, std::memory_order_relaxed);
+  g_ui_candidate_options_synced.store(false, std::memory_order_release);
   internal::NotifyUiCandidateUnavailable();
   internal::ForgetUiOutputs();
   internal::RequestAllUiResets();
+  NotifyLiveOptionsChanged();
 }
 
 inline const char* LiveOptionsActionText() {

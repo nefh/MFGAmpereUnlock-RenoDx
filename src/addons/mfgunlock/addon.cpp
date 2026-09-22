@@ -36,6 +36,7 @@
 #include "./integration_contract.hpp"
 #include "./loadhook.hpp"
 #include "./midpoint.hpp"
+#include "./output_state.hpp"
 #include "./streamline_bridge.hpp"
 #include "./ui_candidate.hpp"
 #include "./validated_warp.hpp"
@@ -113,6 +114,8 @@ struct UiCandidateDebugSnapshot {
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t format = 0;
+  uint32_t ui_encoding = static_cast<uint32_t>(
+      mfgunlock::outputstate::UiEncoding::kUnknown);
   uint32_t state = 0;
   uint32_t stable_frames = 0;
   uint32_t rtv_binds_after_clear = 0;
@@ -1170,6 +1173,17 @@ bool IsUiCandidateFormat(reshade::api::format resource_format,
          (resource_format == unorm || resource_format == srgb);
 }
 
+mfgunlock::outputstate::FormatKind OutputFormatKind(reshade::api::format format) {
+  const uint32_t raw = static_cast<uint32_t>(format);
+  return mfgunlock::outputstate::ClassifyFormat(raw, raw != 0);
+}
+
+mfgunlock::outputstate::UiEncoding DetectedUiEncoding(
+    uint32_t view_format) {
+  return mfgunlock::outputstate::DetectedUiEncoding(
+      OutputFormatKind(static_cast<reshade::api::format>(view_format)));
+}
+
 bool IsTransparentClear(const float color[4]) {
   return color != nullptr && color[0] == 0.0f && color[1] == 0.0f &&
          color[2] == 0.0f && color[3] == 0.0f;
@@ -1519,6 +1533,8 @@ bool ObserveUiCandidate(mfgunlock::framecount::UiCandidateSnapshot* snapshot) {
   snapshot->width = candidate.width;
   snapshot->height = candidate.height;
   snapshot->format = candidate.format;
+  snapshot->ui_encoding = static_cast<uint32_t>(
+      DetectedUiEncoding(candidate.view_format));
   snapshot->state = candidate.state;
   snapshot->state_known = candidate.state_known;
   snapshot->stable_frames = g_ui_selected_stable_frames;
@@ -1600,6 +1616,8 @@ UiCandidateDebugSnapshot ReadUiCandidateDebugSnapshot() {
     snapshot.width = candidate.width;
     snapshot.height = candidate.height;
     snapshot.format = candidate.format;
+    snapshot.ui_encoding = static_cast<uint32_t>(
+        DetectedUiEncoding(candidate.view_format));
     snapshot.state = candidate.state;
     snapshot.state_known = candidate.state_known;
     snapshot.swapchain = candidate.swapchain;
@@ -1652,33 +1670,45 @@ void OnDestroyCommandQueue(reshade::api::command_queue* queue) {
   mfgunlock::integration::ObserveQueueDestroy(reinterpret_cast<uint64_t>(queue));
 }
 
+mfgunlock::outputstate::State ClassifySwapchainOutput(
+    reshade::api::swapchain* swapchain) {
+  if (swapchain == nullptr) return {};
+  auto* device = swapchain->get_device();
+  if (device == nullptr || swapchain->get_back_buffer_count() == 0) return {};
+
+  const auto back_buffer = swapchain->get_back_buffer(0);
+  const auto desc = device->get_resource_desc(back_buffer);
+  const auto format = desc.texture.format;
+  const bool format_known = static_cast<uint32_t>(format) != 0;
 #if MFGUNLOCK_RESHADE_HAS_COLOR_SPACE
-bool IsHdrColorSpace(reshade::api::color_space color_space) {
-  // ReShade API 14 uses the legacy names extended_srgb_linear / hdr10_st2084,
-  // while newer APIs expose scrgb / hdr10_pq. The ABI values are stable:
-  // 2 = scRGB, 3 = HDR10 PQ/ST2084, 4 = HDR10 HLG. Compare the underlying
-  // value so one source tree compiles against both naming schemes.
-  const uint32_t value = static_cast<uint32_t>(color_space);
-  return value == 2u || value == 3u || value == 4u;
-}
+  const auto color_space = swapchain->get_color_space();
+  const bool color_known = color_space != reshade::api::color_space::unknown;
+  return mfgunlock::outputstate::Classify(
+      OutputFormatKind(format), static_cast<uint32_t>(format), format_known,
+      static_cast<uint32_t>(color_space), color_known);
+#else
+  return mfgunlock::outputstate::Classify(
+      OutputFormatKind(format), static_cast<uint32_t>(format), format_known, 0u, false);
 #endif
+}
 
 void ObserveUiOutput(reshade::api::swapchain* swapchain) {
-#if MFGUNLOCK_RESHADE_HAS_COLOR_SPACE
   if (swapchain == nullptr ||
       swapchain != g_primary_swapchain.load(std::memory_order_acquire)) {
     return;
   }
-  const auto color_space = swapchain->get_color_space();
-  const bool color_known = color_space != reshade::api::color_space::unknown;
-  mfgunlock::integration::ObserveSwapchainColorSpace(
-      static_cast<uint32_t>(color_space), color_known);
-  if (!color_known) return;
-  mfgunlock::framecount::NotifyHdrState(
-      IsHdrColorSpace(color_space), static_cast<uint32_t>(color_space));
-#else
-  (void)swapchain;
-#endif
+
+  const auto state = ClassifySwapchainOutput(swapchain);
+  mfgunlock::integration::ObserveSwapchainOutput(
+      state.format, state.format_known, state.color_space, state.color_space_known,
+      static_cast<uint32_t>(state.encoding), state.known, state.dlssg_supported);
+  const bool changed = mfgunlock::outputstate::Observe(
+      state.format_kind, state.format, state.format_known,
+      state.color_space, state.color_space_known);
+  if (changed) {
+    ResetUiCandidateSelection();
+    mfgunlock::framecount::NotifyOutputStateChanged();
+  }
 }
 
 void HandleInitSwapchain(reshade::api::swapchain* swapchain, bool resize = false) {
@@ -1704,21 +1734,7 @@ void HandleInitSwapchain(reshade::api::swapchain* swapchain, bool resize = false
   g_primary_swapchain.store(swapchain, std::memory_order_release);
   if (changed) ResetUiCandidateSelection();
 
-#if MFGUNLOCK_RESHADE_HAS_COLOR_SPACE
-  const auto color_space = swapchain->get_color_space();
-  const bool color_known = color_space != reshade::api::color_space::unknown;
-  mfgunlock::integration::ObserveSwapchainColorSpace(
-      static_cast<uint32_t>(color_space), color_known);
-  if (!color_known) {
-    mfgunlock::framecount::NotifyOutputUnknown();
-    return;
-  }
-  mfgunlock::framecount::NotifyHdrState(
-      IsHdrColorSpace(color_space), static_cast<uint32_t>(color_space));
-#else
-  mfgunlock::integration::ObserveSwapchainColorSpace(0u, false);
-  mfgunlock::framecount::NotifyOutputUnknown();
-#endif
+  ObserveUiOutput(swapchain);
 }
 
 void HandleDestroySwapchain(reshade::api::swapchain* swapchain, bool resize = false) {
@@ -1735,6 +1751,9 @@ void HandleDestroySwapchain(reshade::api::swapchain* swapchain, bool resize = fa
   g_primary_swapchain_area.store(0, std::memory_order_relaxed);
   g_primary_output_width.store(0, std::memory_order_relaxed);
   g_primary_output_height.store(0, std::memory_order_relaxed);
+  mfgunlock::integration::ObserveSwapchainOutput(
+      mfgunlock::diagnostic::kUnknown32, false, 0u, false,
+      mfgunlock::diagnostic::kUnknown32, false, false);
   ResetUiCandidateSelection();
   mfgunlock::framecount::NotifyOutputUnknown();
 }
@@ -1954,16 +1973,21 @@ void DrawMfgRuntimeDiagnostics() {
     ImGui::TextDisabled("Dynamic MFG: runtime support unknown.");
   }
 
-  if (fc::g_hdr_state_seen.load(std::memory_order_acquire)) {
-    const bool hdr = fc::g_hdr_active.load(std::memory_order_relaxed);
-    if (fc::g_output_color_space_seen.load(std::memory_order_acquire)) {
-      ImGui::Text("Output: %s, swapchain color-space value %u.", hdr ? "HDR" : "SDR",
-          fc::g_output_color_space.load(std::memory_order_relaxed));
+  const auto output_state = mfgunlock::outputstate::Read();
+  if (output_state.known) {
+    if (output_state.color_space_known) {
+      ImGui::Text("Output: %s, format %u, swapchain color-space value %u.",
+          mfgunlock::outputstate::EncodingName(output_state.encoding),
+          output_state.format_known ? output_state.format : mfgunlock::diagnostic::kUnknown32,
+          output_state.color_space);
     } else {
-      ImGui::Text("Output: %s, swapchain color space unknown.", hdr ? "HDR" : "SDR");
+      ImGui::Text("Output: %s, swapchain color space unknown.",
+          mfgunlock::outputstate::EncodingName(output_state.encoding));
     }
+    if (!output_state.dlssg_supported)
+      ImGui::TextDisabled("DLSS-G output path: unsupported for this encoding/format.");
   } else {
-    ImGui::TextDisabled("Output HDR/color space: unknown.");
+    ImGui::TextDisabled("Output encoding/color space: unknown.");
   }
   ImGui::TextDisabled(
       "DLSS-G effective color space is not exposed separately by the observed Streamline state; it remains unknown.");
@@ -1978,9 +2002,12 @@ void DrawMfgRuntimeDiagnostics() {
       : mfgunlock::diagnostic::kUiAutoNoCandidate;
   if (!fc::g_ui_candidate_injection_enabled.load(std::memory_order_relaxed))
     reject |= mfgunlock::diagnostic::kUiAutoDisabled;
-  if (fc::g_hdr_state_seen.load(std::memory_order_acquire) &&
-      fc::g_hdr_active.load(std::memory_order_relaxed))
-    reject |= mfgunlock::diagnostic::kUiAutoHdrOutput;
+  if (!mfgunlock::outputstate::SupportsHudSeparation(output_state))
+    reject |= mfgunlock::diagnostic::kUiAutoOutputUnsupported;
+  if (candidate.present && !mfgunlock::outputstate::IsUiEncodingCompatible(
+          output_state,
+          static_cast<mfgunlock::outputstate::UiEncoding>(candidate.ui_encoding), false))
+    reject |= mfgunlock::diagnostic::kUiAutoEncodingMismatch;
   if (!fc::g_ui_candidate_options_synced.load(std::memory_order_acquire))
     reject |= mfgunlock::diagnostic::kUiAutoOptionsUnsynced;
   if (fc::g_ui_candidate_runtime_declined.load(std::memory_order_acquire))
@@ -2255,10 +2282,11 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::TextDisabled(mfgunlock::framecount::g_ui_composition_applied.load()
         ? "UI Composition requested off; previous options are still the last accepted state."
         : "UI Composition: disabled; native final-color path.");
-  } else if (!mfgunlock::framecount::g_hdr_state_seen.load(std::memory_order_acquire)) {
-    ImGui::TextDisabled("UI Composition: waiting for output color-space detection.");
-  } else if (mfgunlock::framecount::g_hdr_active.load(std::memory_order_relaxed)) {
-    ImGui::TextDisabled("UI Composition: HDR output detected; guarded final-color fallback.");
+  } else if (!mfgunlock::outputstate::Read().known) {
+    ImGui::TextDisabled("UI Composition: waiting for output encoding detection.");
+  } else if (!mfgunlock::outputstate::Read().dlssg_supported) {
+    ImGui::TextDisabled(
+        "UI Composition: output encoding/format is not supported by the DLSS-G path; native options are preserved.");
   } else if (mfgunlock::framecount::g_ui_composition_fell_back.load(
                  std::memory_order_relaxed)) {
     ImGui::Text("UI Composition: runtime rejected the request (sl::Result 0x%x); native path restored.",
@@ -2304,10 +2332,8 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
         mfgunlock::framecount::g_ui_composition_applied.load(std::memory_order_relaxed);
     const bool composition_fell_back =
         mfgunlock::framecount::g_ui_composition_fell_back.load(std::memory_order_relaxed);
-    const bool output_known =
-        mfgunlock::framecount::g_hdr_state_seen.load(std::memory_order_acquire);
-    const bool output_hdr =
-        mfgunlock::framecount::g_hdr_active.load(std::memory_order_relaxed);
+    const auto output_state = mfgunlock::outputstate::Read();
+    const bool output_known = output_state.known;
     const uint32_t issue_mask =
         mfgunlock::framecount::g_ui_issue_mask.load(std::memory_order_relaxed);
     const uint64_t suppressed_tags =
@@ -2322,7 +2348,7 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     float slot_y = ImGui::GetCursorPosY();
     ImGui::TextWrapped(
         "Output: %s. SetOptions accepted: %s. Options observed: %s. Viewports: %u.",
-        !output_known ? "unknown" : (output_hdr ? "HDR" : "SDR"),
+        !output_known ? "unknown" : mfgunlock::outputstate::EncodingName(output_state.encoding),
         composition_applied ? "yes" : "no", ui_debug.options_seen ? "yes" : "no",
         ui_debug.viewport_count);
     ReserveDebugRows(slot_y, 2.0f);
@@ -2361,11 +2387,18 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::Separator();
     slot_y = ImGui::GetCursorPosY();
     if (candidate.present) {
+      const auto candidate_encoding = static_cast<mfgunlock::outputstate::UiEncoding>(
+          candidate.ui_encoding);
+      const bool encoding_compatible = mfgunlock::outputstate::IsUiEncodingCompatible(
+          output_state, candidate_encoding, false);
       ImGui::TextWrapped(
-          "Candidate: %ux%u %s (format %u). Stable: %s (%u frames). Safe: %s. Age: %llums.",
+          "Candidate: %ux%u %s (format %u), encoding %s. Stable: %s (%u frames). "
+          "Safe: %s. Output-compatible: %s. Age: %llums.",
           candidate.width, candidate.height, UiCandidateFormatName(candidate.format),
-          candidate.format, candidate.stable ? "yes" : "no", candidate.stable_frames,
-          candidate.safe ? "yes" : "no", static_cast<unsigned long long>(candidate.age_ms));
+          candidate.format, mfgunlock::outputstate::UiEncodingName(candidate_encoding),
+          candidate.stable ? "yes" : "no", candidate.stable_frames,
+          candidate.safe ? "yes" : "no", encoding_compatible ? "yes" : "no",
+          static_cast<unsigned long long>(candidate.age_ms));
     } else {
       ImGui::TextWrapped("Candidate: not currently available.");
     }
@@ -2837,14 +2870,12 @@ extern "C" __declspec(dllexport) bool MfgUnlockGetDiagnosticState(
   state.dynamic_supported = state.dynamic_support_seen &&
       mfgunlock::framecount::g_dynamic_supported.load(std::memory_order_relaxed);
 
-  state.hdr_state_seen = mfgunlock::framecount::g_hdr_state_seen.load(std::memory_order_acquire);
-  state.hdr_active = state.hdr_state_seen &&
-      mfgunlock::framecount::g_hdr_active.load(std::memory_order_relaxed);
-  state.swapchain_color_space_known =
-      mfgunlock::framecount::g_output_color_space_seen.load(std::memory_order_acquire);
-  state.swapchain_color_space = state.swapchain_color_space_known
-      ? mfgunlock::framecount::g_output_color_space.load(std::memory_order_relaxed)
-      : mfgunlock::diagnostic::kUnknown32;
+  const auto output_state = mfgunlock::outputstate::Read();
+  state.hdr_state_seen = output_state.known;
+  state.hdr_active = output_state.known && output_state.hdr;
+  state.swapchain_color_space_known = output_state.color_space_known;
+  state.swapchain_color_space = output_state.color_space_known
+      ? output_state.color_space : mfgunlock::diagnostic::kUnknown32;
   // Streamline exposes buffer formats but no separate observed DLSS-G output
   // color-space state. Keep it unknown rather than infer it from the swapchain.
   state.dlssg_color_space_known = 0;
@@ -2859,8 +2890,12 @@ extern "C" __declspec(dllexport) bool MfgUnlockGetDiagnosticState(
       : mfgunlock::diagnostic::kUiAutoNoCandidate;
   if (!mfgunlock::framecount::g_ui_candidate_injection_enabled.load(std::memory_order_relaxed))
     auto_reject |= mfgunlock::diagnostic::kUiAutoDisabled;
-  if (state.hdr_active)
-    auto_reject |= mfgunlock::diagnostic::kUiAutoHdrOutput;
+  if (!mfgunlock::outputstate::SupportsHudSeparation(output_state))
+    auto_reject |= mfgunlock::diagnostic::kUiAutoOutputUnsupported;
+  if (candidate.present && !mfgunlock::outputstate::IsUiEncodingCompatible(
+          output_state,
+          static_cast<mfgunlock::outputstate::UiEncoding>(candidate.ui_encoding), false))
+    auto_reject |= mfgunlock::diagnostic::kUiAutoEncodingMismatch;
   if (!mfgunlock::framecount::g_ui_candidate_options_synced.load(std::memory_order_acquire))
     auto_reject |= mfgunlock::diagnostic::kUiAutoOptionsUnsynced;
   if (mfgunlock::framecount::g_ui_candidate_runtime_declined.load(std::memory_order_acquire))

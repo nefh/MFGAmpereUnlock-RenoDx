@@ -59,6 +59,7 @@ int main() {
 
   ic::Reset();
   ic::ObserveSwapchainInit(0x10, 3, false);
+  ic::ObserveSwapchainOutput(24, true, 3, true, 3, true, true);
   ic::ObserveSwapchainPresent(0x10, 33);
   ic::ObserveSwapchainDestroy(0x10, true);
   ic::ObserveSwapchainInit(0x20, 3, true);
@@ -66,6 +67,11 @@ int main() {
   Check(swap.swapchain == ic::Verdict::kObserved, "swapchain lifecycle is observed without unsupported inference");
   Check(swap.swapchain_resize_count == 2 && swap.swapchain_recreation_count >= 1,
         "resize/recreation accounting is retained");
+  Check(swap.swapchain_format_known && swap.swapchain_format == 24 &&
+            swap.swapchain_color_space_known && swap.swapchain_color_space == 3 &&
+            swap.output_encoding_known && swap.output_encoding == 3 &&
+            swap.output_dlssg_supported,
+        "swapchain output format, color space and classified encoding remain separate evidence");
   Check(!swap.fullscreen_transition_known && !swap.waitable_object_ownership_known && !swap.iflip_known,
         "fullscreen waitable-object and IFLIP ownership remain unknown without evidence");
 

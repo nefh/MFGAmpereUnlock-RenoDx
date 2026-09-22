@@ -12,6 +12,7 @@ namespace fc = mfgunlock::framecount;
 namespace ngx = mfgunlock::ngx;
 namespace qc = mfgunlock::qualityconfig;
 namespace dg = mfgunlock::diagnostic;
+namespace output = mfgunlock::outputstate;
 namespace {
 unsigned g_checks = 0;
 std::vector<unsigned> g_counts;
@@ -95,10 +96,7 @@ void Reset() {
   fc::g_pacing_ready = [] { return true; };
   fc::g_ensure_pacing = nullptr;
   fc::g_ui_composition_enabled = false;
-  fc::g_hdr_state_seen = false;
-  fc::g_hdr_active = false;
-  fc::g_output_color_space_seen = false;
-  fc::g_output_color_space = dg::kUnknown32;
+  output::Reset();
   fc::g_ui_candidate_injection_enabled = true;
   fc::g_ui_candidate_ready = false;
   fc::g_ui_candidate_format = 0;
@@ -379,28 +377,42 @@ void PacingAndCeiling() {
 }
 void HdrTelemetry() {
   Reset();
-  fc::NotifyHdrState(true, 3);
-  Check(fc::g_hdr_state_seen.load() && fc::g_hdr_active.load() &&
-            fc::g_output_color_space_seen.load() && fc::g_output_color_space.load() == 3,
-        "HDR10/PQ observation preserves the raw swapchain color-space value");
-  fc::NotifyHdrState(true, 2);
-  Check(fc::g_hdr_active.load() && fc::g_output_color_space.load() == 2,
-        "scRGB/FP16 observation stays distinct from HDR10/PQ");
-  fc::NotifyHdrState(false, 0);
-  Check(!fc::g_hdr_active.load() && fc::g_output_color_space.load() == 0,
-        "SDR observation remains a known non-HDR color space");
+  output::Observe(output::FormatKind::kRgb10A2Unorm, 24, true,
+                  output::kColorSpaceHdr10Pq, true);
+  fc::NotifyOutputStateChanged();
+  auto state = output::Read();
+  Check(state.known && state.hdr && state.encoding == output::Encoding::kHdr10Pq &&
+            state.color_space == output::kColorSpaceHdr10Pq && state.dlssg_supported,
+        "HDR10/PQ observation preserves output encoding and format support");
+
+  output::Observe(output::FormatKind::kRgba16Float, 10, true,
+                  output::kColorSpaceScRgbLinear, true);
+  fc::NotifyOutputStateChanged();
+  state = output::Read();
+  Check(state.encoding == output::Encoding::kScRgbLinear && state.hdr && state.linear &&
+            !state.dlssg_supported,
+        "scRGB/FP16 observation stays distinct and fails closed for DLSS-G");
+
+  output::Observe(output::FormatKind::kRgba8Unorm, 28, true,
+                  output::kColorSpaceSrgbNonlinear, true);
+  fc::NotifyOutputStateChanged();
+  state = output::Read();
+  Check(state.encoding == output::Encoding::kSdrSrgb && !state.hdr &&
+            state.dlssg_supported,
+        "SDR observation remains a known supported output");
+
   fc::NotifyOutputUnknown();
-  Check(!fc::g_hdr_state_seen.load() && !fc::g_output_color_space_seen.load() &&
-            fc::g_output_color_space.load() == dg::kUnknown32,
-        "swapchain destruction/unknown output clears color-space evidence");
+  state = output::Read();
+  Check(!state.known && !state.color_space_known,
+        "swapchain destruction/unknown output clears output evidence");
 }
 
 void LiveUiOptions() {
   Reset();
   sl::DLSSGOptions native{};
   fc::g_ui_composition_applied = false;
-  fc::g_hdr_state_seen = true;
-  fc::g_hdr_active = false;
+  output::Observe(output::FormatKind::kRgba8Unorm, 28, true,
+                  output::kColorSpaceSrgbNonlinear, true);
   fc::internal::HookedSetOptions({}, native);
   fc::g_ui_composition_enabled = true;
   fc::NotifyUiCompositionChanged();
@@ -415,8 +427,8 @@ void LiveUiOptions() {
 void UiCandidateRecovery() {
   Reset();
   fc::g_ui_composition_enabled = true;
-  fc::g_hdr_state_seen = true;
-  fc::g_hdr_active = false;
+  output::Observe(output::FormatKind::kRgba8Unorm, 28, true,
+                  output::kColorSpaceSrgbNonlinear, true);
   sl::DLSSGOptions native{};
 
   fc::internal::UpdateUiCandidateFormat(29);
@@ -439,8 +451,8 @@ void UiCandidateRecovery() {
 
   Reset();
   fc::g_ui_composition_enabled = true;
-  fc::g_hdr_state_seen = true;
-  fc::g_hdr_active = false;
+  output::Observe(output::FormatKind::kRgba8Unorm, 28, true,
+                  output::kColorSpaceSrgbNonlinear, true);
   native = {};
   fc::internal::UpdateUiCandidateFormat(29);
   fc::internal::HookedSetOptions({}, native);

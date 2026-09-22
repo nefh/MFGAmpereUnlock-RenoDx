@@ -15,6 +15,7 @@
 #include "../mfgunlock/reshade_compat.hpp"
 #include "../mfgunlock/ngx_hook.hpp"
 #include "../mfgunlock/diagnostic_bridge.hpp"
+#include "../mfgunlock/output_state.hpp"
 #include "./nvapi_observer.hpp"
 #include "./trace.hpp"
 #include "./mfg_probe.hpp"
@@ -1094,6 +1095,16 @@ Json DiagnosticStateJson() {
       default: return nullptr;
     }
   };
+  const auto output_encoding_json = [&state]() -> Json {
+    if (!state.swapchain_color_space_known) return nullptr;
+    const auto output = mfgunlock::outputstate::Classify(
+        mfgunlock::outputstate::FormatKind::kUnknown,
+        mfgunlock::outputstate::kUnknown32, false,
+        state.swapchain_color_space, true);
+    return output.known
+        ? Json(mfgunlock::outputstate::EncodingName(output.encoding))
+        : Json(nullptr);
+  };
   return {
       {"architecture", architecture < std::size(kArchitectures) ? Json(kArchitectures[architecture]) : Json(nullptr)},
       {"target_sm", state.target_sm ? Json(state.target_sm) : Json(nullptr)},
@@ -1131,6 +1142,7 @@ Json DiagnosticStateJson() {
       {"preset_supplied", state.preset_supplied < 0 ? Json(nullptr) : Json(state.preset_supplied)},
       {"preset_applied", state.preset_applied < 0 ? Json(nullptr) : Json(state.preset_applied)},
       {"hdr", state.hdr_state_seen ? Json(state.hdr_active != 0) : Json(nullptr)},
+      {"output_encoding", output_encoding_json()},
       {"swapchain_color_space", state.swapchain_color_space_known ? Json(state.swapchain_color_space) : Json(nullptr)},
       {"dlssg_color_space", state.dlssg_color_space_known ? Json(state.dlssg_color_space) : Json(nullptr)},
       {"native_uir_observed", state.native_uir_observed != 0},
@@ -1361,8 +1373,16 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
         } else if (event.kind == Kind::output) {
           row["values"][0] = identity(event.values[0]);
           trace["host_present"] = {{"swapchain", identity(event.values[0])},
+              {"color_space", OptionalValue(event.values[1])},
               {"format", OptionalValue(event.values[2])}, {"width", OptionalValue(event.values[3])},
               {"height", OptionalValue(event.values[4])}, {"backbuffer_count", OptionalValue(event.values[5])},
+              {"output_encoding", event.values[8] == 1
+                  ? Json(mfgunlock::outputstate::EncodingName(
+                        static_cast<mfgunlock::outputstate::Encoding>(event.values[6])))
+                  : Json(nullptr)},
+              {"hdr", event.values[9] == kUnknown ? Json(nullptr) : Json(event.values[9] != 0)},
+              {"dlssg_output_supported", event.values[8] == 1
+                  ? Json(event.values[7] != 0) : Json(nullptr)},
               {"classification", "host_present_boundary_only"}};
           ++host_present_count;
         } else if (event.kind == Kind::lifecycle) {
@@ -1428,6 +1448,10 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
             {"resource", identity(candidate.resource)},
             {"width", candidate.width}, {"height", candidate.height},
             {"format", candidate.format}, {"view_format", candidate.view_format},
+            {"ui_encoding", mfgunlock::outputstate::UiEncodingName(
+                mfgunlock::outputstate::DetectedUiEncoding(
+                    mfgunlock::outputstate::ClassifyFormat(
+                        candidate.view_format, candidate.view_format != 0)))},
             {"view_usage", candidate.view_usage}, {"flags", candidate.flags},
             {"swapchain", candidate.seen_as_swapchain},
             {"hudless_tag_matches", candidate.hudless_tag_matches},
@@ -1673,18 +1697,33 @@ void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain,
   Event event(Kind::output);
   event.recognized = true;
   event.values[0] = reinterpret_cast<uintptr_t>(swapchain);
+  uint32_t color_space = 0;
+  bool color_space_known = false;
 #if MFGUNLOCK_RESHADE_HAS_COLOR_SPACE
-  event.values[1] = static_cast<uint32_t>(swapchain->get_color_space());
+  color_space = static_cast<uint32_t>(swapchain->get_color_space());
+  color_space_known = color_space != 0;
+  event.values[1] = color_space_known ? color_space : kUnknown;
 #else
-  event.values[1] = mfgunlock::diagnostic::kUnknown32;
+  event.values[1] = kUnknown;
 #endif
   event.values[5] = backbuffer_count;
+  uint32_t format = 0;
+  bool format_known = false;
   if (backbuffer_count != 0) {
     const auto desc = swapchain->get_device()->get_resource_desc(swapchain->get_back_buffer(0));
-    event.values[2] = static_cast<uint32_t>(desc.texture.format);
+    format = static_cast<uint32_t>(desc.texture.format);
+    format_known = format != 0;
+    event.values[2] = format_known ? format : kUnknown;
     event.values[3] = desc.texture.width;
     event.values[4] = desc.texture.height;
   }
+  const auto output = mfgunlock::outputstate::Classify(
+      mfgunlock::outputstate::ClassifyFormat(format, format_known),
+      format, format_known, color_space, color_space_known);
+  event.values[6] = output.known ? static_cast<uint32_t>(output.encoding) : kUnknown;
+  event.values[7] = output.dlssg_supported ? 1u : 0u;
+  event.values[8] = output.known ? 1u : 0u;
+  event.values[9] = output.known ? static_cast<uint32_t>(output.hdr) : kUnknown;
   Submit(event, ticket, present_qpc, UINT32_MAX, UINT32_MAX, sl::Result::eOk);
 }
 

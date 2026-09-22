@@ -8,7 +8,15 @@ include(CTest)
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 set(TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
-foreach(test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test)
+# Validation ReShade doubles intentionally omit RESHADE_API_VERSION while
+# exposing the modern logging/config surface. Pin only that mock ABI here so
+# the production compatibility shim does not select legacy wrappers around the
+# doubles. Real addon builds still detect these values from the selected SDK.
+add_compile_definitions(
+  MFGUNLOCK_RESHADE_LOG_STYLE=2
+  MFGUNLOCK_RESHADE_CONFIG_STYLE=1)
+
+foreach(test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test output_state_test)
   add_executable(${test} "${TEST_ROOT}/${test}.cpp")
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
@@ -25,7 +33,7 @@ if(NOT WIN32)
     configure_file("${header}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   foreach(name architecture.hpp provider_profile.hpp feature_capabilities.hpp streamline_bridge.hpp ngx_bridge.hpp capability_policy.hpp
-               framecount.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp quality_config.hpp)
+               framecount.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp output_state.hpp quality_config.hpp)
     configure_file("${REPO_ROOT}/src/addons/mfgunlock/${name}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/quality_guard.hpp"

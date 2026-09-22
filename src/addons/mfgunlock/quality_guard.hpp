@@ -12,6 +12,8 @@
 #include <sl.h>
 #include <sl_dlss_g.h>
 
+#include "./output_state.hpp"
+
 namespace mfgunlock::qualityguard {
 
 enum Issue : uint32_t {
@@ -22,6 +24,9 @@ enum Issue : uint32_t {
   kHudlessFormatMismatch = 1u << 3,
   kUiExtentMismatch = 1u << 4,
   kUiColorAlphaLowPrecision = 1u << 5,
+  kOutputEncodingUnknown = 1u << 6,
+  kOutputEncodingUnsupported = 1u << 7,
+  kUiEncodingMismatch = 1u << 8,
 };
 
 enum class SuppressionPolicy : uint32_t {
@@ -51,6 +56,9 @@ struct Assessment {
   bool clears_ui_color_alpha = false;
   bool clears_ui_alpha = false;
   bool suppress_hud_separation = false;
+  outputstate::Encoding render_encoding = outputstate::Encoding::kUnknown;
+  bool render_encoding_known = false;
+  outputstate::UiEncoding ui_encoding = outputstate::UiEncoding::kUnknown;
   OutputDescription observed_backbuffer{};
 };
 
@@ -108,7 +116,8 @@ inline OutputDescription Describe(const sl::ResourceTag& tag, bool* valid = null
   return result;
 }
 
-inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count, bool hdr,
+inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count,
+                             const outputstate::State& output_state,
                              const OutputDescription& previous_output = {}) {
   Assessment result{};
   if (tags == nullptr || count == 0) return result;
@@ -170,9 +179,47 @@ inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count, bool h
     }
   }
 
-  if (hdr && result.has_hud_separation) result.issues |= kHdrFinalColorIsolation;
-  result.suppress_hud_separation = result.has_hud_separation && result.issues != kNone;
+  if (result.has_hudless_color && output_state.known) {
+    // Native Streamline Hudless is application-provided and is documented to
+    // use the same color space/post-processing domain as the color backbuffer.
+    result.render_encoding = output_state.encoding;
+    result.render_encoding_known = true;
+  }
+
+  if (result.has_ui_alpha) {
+    result.ui_encoding = outputstate::UiEncoding::kAlphaOnly;
+  } else if (result.has_ui_color_alpha) {
+    // A native Streamline UI Color+Alpha tag is application-owned. The documented
+    // contract requires it to reconstruct FinalColor from Hudless in the output
+    // composition domain, so preserve that provenance rather than guessing from
+    // the resource format alone.
+    result.ui_encoding = outputstate::UiEncoding::kOutputEncoded;
+  }
+
+  if (result.has_hud_separation) {
+    if (!output_state.known) {
+      result.issues |= kOutputEncodingUnknown;
+    } else if (!output_state.dlssg_supported) {
+      result.issues |= kOutputEncodingUnsupported;
+    } else if (result.has_ui_color_or_alpha &&
+               !outputstate::IsUiEncodingCompatible(
+                   output_state, result.ui_encoding, true)) {
+      result.issues |= kUiEncodingMismatch;
+    }
+  }
+
+  // Only malformed optional resources are rewritten. Unknown/unsupported output
+  // encodings remain observational and leave native game tags untouched.
+  result.suppress_hud_separation =
+      result.has_hud_separation && HasStructuralIssues(result);
   return result;
+}
+
+inline outputstate::UiEncoding NativeUiEncoding(const Assessment& assessment) {
+  if (assessment.has_ui_alpha) return outputstate::UiEncoding::kAlphaOnly;
+  if (assessment.has_ui_color_alpha)
+    return outputstate::UiEncoding::kOutputEncoded;
+  return outputstate::UiEncoding::kUnknown;
 }
 
 inline bool IsStructurallyValidForUiRecomposition(const Assessment& assessment) {
@@ -180,25 +227,31 @@ inline bool IsStructurallyValidForUiRecomposition(const Assessment& assessment) 
          !HasStructuralIssues(assessment);
 }
 
-inline bool CanAutomaticallyUseUiRecomposition(const Assessment& assessment, bool hdr) {
-  return !hdr && IsStructurallyValidForUiRecomposition(assessment);
+inline bool CanAutomaticallyUseUiRecomposition(
+    const Assessment& assessment, const outputstate::State& output_state) {
+  return outputstate::SupportsHudSeparation(output_state) &&
+         IsStructurallyValidForUiRecomposition(assessment) &&
+         outputstate::IsUiEncodingCompatible(
+             output_state, NativeUiEncoding(assessment), true);
 }
 
-inline SuppressionPolicy ResolveSuppression(const Assessment& current,
-                                            const Assessment& accumulated,
-                                            bool hdr,
-                                            bool was_recomposition_eligible) {
+inline SuppressionPolicy ResolveSuppression(
+    const Assessment& current, const Assessment& accumulated,
+    const outputstate::State& output_state, bool was_recomposition_eligible) {
   if (!current.has_hud_separation) return SuppressionPolicy::kNone;
-  if (hdr || HasStructuralIssues(accumulated))
+  if (HasStructuralIssues(accumulated))
     return SuppressionPolicy::kAllHudSeparation;
 
-  const bool eligible = CanAutomaticallyUseUiRecomposition(accumulated, hdr);
+  // If the output domain is unknown or unsupported, do not rewrite a native
+  // game's optional tags. The addon simply declines automatic UIR.
+  if (!outputstate::SupportsHudSeparation(output_state))
+    return SuppressionPolicy::kNone;
+
+  const bool eligible =
+      CanAutomaticallyUseUiRecomposition(accumulated, output_state);
   const bool complete_current_pair =
       current.has_hudless_color && current.has_ui_color_or_alpha;
   if (eligible) {
-    // If split tags first complete the pair, the UI half was withheld earlier.
-    // Preserve a valid native HUD-less tag, but keep the UI half gated until a
-    // later submission can carry the validated pair coherently.
     if (!was_recomposition_eligible && !complete_current_pair &&
         current.has_ui_color_or_alpha) {
       return SuppressionPolicy::kUiOnly;
@@ -206,15 +259,12 @@ inline SuppressionPolicy ResolveSuppression(const Assessment& current,
     return SuppressionPolicy::kNone;
   }
 
-  // HUD-less by itself is a valid native DLSS-G input. Missing UI must not turn
-  // an existing HUD-less integration into final-color-only Frame Generation.
   return current.has_ui_color_or_alpha ? SuppressionPolicy::kUiOnly
                                        : SuppressionPolicy::kNone;
 }
 
-inline constexpr bool ShouldRequestAutomaticUiPath(bool output_color_space_seen,
-                                                     bool hdr) {
-  return output_color_space_seen && !hdr;
+inline bool ShouldRequestAutomaticUiPath(const outputstate::State& output_state) {
+  return outputstate::SupportsHudSeparation(output_state);
 }
 
 inline size_t ConstantsCopySize(const sl::Constants& source) {

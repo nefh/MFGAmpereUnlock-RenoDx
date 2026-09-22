@@ -5,6 +5,7 @@
 #include <cstdlib>
 
 namespace fc = mfgunlock::framecount;
+namespace output = mfgunlock::outputstate;
 namespace {
 unsigned int g_checks = 0;
 unsigned int g_acquires = 0;
@@ -53,6 +54,8 @@ void Reset() {
   fc::g_ui_candidate_last_result = 0;
   fc::g_acquire_ui_candidate = AcquireCandidate;
   fc::g_release_ui_candidate = ReleaseCandidate;
+  output::Observe(output::FormatKind::kRgba8Unorm, 28, true,
+                  output::kColorSpaceSrgbNonlinear, true);
 }
 
 fc::UiCandidateSnapshot Candidate() {
@@ -61,6 +64,7 @@ fc::UiCandidateSnapshot Candidate() {
   candidate.width = 2560;
   candidate.height = 1440;
   candidate.format = 29;
+  candidate.ui_encoding = static_cast<uint32_t>(output::UiEncoding::kSdrSrgb);
   candidate.state = 0x40;
   candidate.stable_frames = mfgunlock::uicandidate::kRequiredStableFrames;
   candidate.rtv_binds_after_clear = 5;
@@ -199,6 +203,16 @@ int main() {
             g_forward_calls == 1 && g_seen_count == 1 && g_acquires == 0 &&
             fc::g_ui_candidate_missing_command_buffer.load() == 1,
         "missing command buffer preserves the native HUD-less submission");
+
+  Reset();
+  output::Observe(output::FormatKind::kRgb10A2Unorm, 24, true,
+                  output::kColorSpaceHdr10Pq, true);
+  candidate = Candidate();
+  Check(fc::internal::TryInjectUiCandidate(
+            nullptr, candidate, &hudless_tag, 1, commands, forward) == sl::Result::eOk &&
+            g_forward_calls == 1 && g_seen_count == 1 && g_acquires == 0 &&
+            fc::g_ui_candidate_tags_injected.load() == 0,
+        "detected SDR UI is not injected into an HDR10/PQ output domain");
 
   std::printf("PASS UI injection path: %u checks\n", g_checks);
 }

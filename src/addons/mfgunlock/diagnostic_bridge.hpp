@@ -39,10 +39,13 @@ enum class TemporalBackend : uint32_t { kNone = 0, kMidpoint = 1, kBlackwell = 2
 enum UiAutomaticRejectReason : uint32_t {
   kUiAutoAccept = 0,
   kUiAutoNoCandidate = 1u << 16,
-  kUiAutoHdrOutput = 1u << 17,
+  kUiAutoOutputUnsupported = 1u << 17,
+  // ABI/source compatibility alias for 0.11 diagnostics.
+  kUiAutoHdrOutput = kUiAutoOutputUnsupported,
   kUiAutoOptionsUnsynced = 1u << 18,
   kUiAutoRuntimeDeclined = 1u << 19,
   kUiAutoDisabled = 1u << 20,
+  kUiAutoEncodingMismatch = 1u << 21,
 };
 
 struct ResourceSnapshot {
