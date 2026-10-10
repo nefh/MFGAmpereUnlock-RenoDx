@@ -11,14 +11,8 @@ Ampere, and Turing** GPUs through a ReShade/RenoDX addon.
   </a>
 </p>
 
-Patches are process-local. Orderly rollback is attempted during teardown; live
-addon unload is **not** qualified. Close the game before replacing the addon.
-**No NVIDIA binaries are redistributed.**
-
-This tree is a universal-compatibility **Stage 3 runtime candidate**. Portable
-validation is separate from Windows/MSVC builds and game validation. The game
-results below are historical references, not a claim that this candidate passed
-those games. See `docs/UNIVERSAL_COMPATIBILITY.md`.
+The addon makes changes in game memory; it does not modify or redistribute
+NVIDIA DLLs. Close the game before updating the addon.
 
 ## Usage
 
@@ -27,43 +21,32 @@ those games. See `docs/UNIVERSAL_COMPATIBILITY.md`.
 2. Download the [latest release](../../releases/latest).
 3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the game.
    When updating, close the game before replacing the existing addon file.
-4. Default loading retries attachment to already-loaded modules. For additional
-   startup observation, early loading remains optional:
-
-   ```ini
-   [ADDON]
-   LoadFromDllMain=renodx-mfgunlock.addon64
-   ```
-
-   The existing early-load helper can append this setting; a newly written
-   setting takes effect after a restart. Missing startup events are not replayed.
-5. Start with the game's supplied libraries. **DLSS-G 310.9.1 is an optional
-   known-good configuration for the currently qualified private provider
-   patches**, not a global requirement for the addon. Unqualified layouts keep
-   dependent unsafe features closed while independent diagnostics/admission/UI
-   remain available where their own contracts permit.
-6. Dynamic MFG uses the typed Streamline contract, current hooks, prepared target
-   and observed Options/State support, not an exact DLL version pair.
-   Streamline 2.14.1 / DLSS-G 310.9.1 is a historical known-good configuration,
-   not a mandatory update. Do not replace a legacy Streamline integration with
-   modern DLLs. There is no DLL downloader or automatic replacement.
-7. Use the game's multiplier selector when available. Otherwise use **Force frame
+4. Start with the game's original DLSS-G and Streamline libraries. **You do not
+   need to replace them with the latest versions for MFG Unlock to work.** Newer
+   versions are recommended for advanced features. You can find the
+   [latest DLSS-G DLL](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/)
+   on TechPowerUp.
+5. For native Dynamic MFG and the DLSS-G 310.9.1 quality features,
+   [Streamline 2.14.1 with DLSS-G 310.9.1](https://www.nexusmods.com/site/mods/1282?tab=files)
+   is a known working combination in **Cyberpunk 2077**. Update Streamline only
+   in games that support it. **Do not replace Streamline 1.x with 2.x** in older
+   games such as **A Plague Tale: Requiem**.
+6. Use the game's multiplier selector when available. Otherwise use **Force frame
    multiplier** in the ReShade **MFG Unlock** panel.
 
 ### Dynamic MFG and Validated Warp Blend
 
-- **Dynamic MFG** is available on **Ada (RTX 40)**, **Ampere (RTX 30)** and **Turing (RTX 20)** with
-  the supported Streamline/DLSS-G stack. NVIDIA varies the multiplier toward the
-  selected output FPS.
-- **Validated Warp Blend** improves later-stage reprojection on qualified RTX 20/30/40 paths with
-  DLSS-G **310.9.1**. Enable it and restart the game.
-- Advanced/debug contains Warp diagnostic modes; normal use stays on
-  **Validated Warp**.
+- **Dynamic MFG** lets NVIDIA adjust the multiplier to reach the selected
+  output FPS. It requires a Streamline/DLSS-G version that supports native Dynamic MFG.
+  After enabling it, toggle Frame Generation off and on in the game's menu.
+- **Validated Warp Blend** ports the quality improvement from
+  [MFGAdaUnlock](https://github.com/mavismmg/MFGAdaUnlock-RenoDx) to compatible
+  DLSS-G **310.9.1** setups. Enable it and restart the game.
 
 ### Intermediate Scatter Retention and Boundary Artifact Mitigation
 
-- **Intermediate Scatter Retention** improves preservation of thin geometry and
-  small moving details in generated frames on qualified RTX 20/30/40 paths with DLSS-G **310.9.1**.
+- **Intermediate Scatter Retention** helps preserve thin geometry and small
+  moving details with compatible DLSS-G **310.9.1** setups.
 - **Boundary Artifact Mitigation** controls how ISR behaves near object edges.
   **Off** keeps the `0.10-pre1` ISR behavior; **Balanced** and **Aggressive** add
   progressively stronger boundary handling.
@@ -73,8 +56,7 @@ those games. See `docs/UNIVERSAL_COMPATIBILITY.md`.
 
 - Choose **Application / driver default**, **Preset A**, or **Preset B**.
 - A/B overrides are process-local and do not change NVIDIA App or driver profiles.
-- The selector is limited to the supported **DLSS-G 310.9.1** provider build;
-  unsupported builds are left unchanged.
+- Preset overrides are available with compatible **DLSS-G 310.9.1** versions.
 - Preset selection is independent from multiplier, Dynamic MFG, Warp, Temporal
   Fix and UI Composition. Restart the game if a preset change is not picked up.
 
@@ -85,92 +67,60 @@ those games. See `docs/UNIVERSAL_COMPATIBILITY.md`.
 - **Inject detected UI Color+Alpha** is enabled by default for D3D12 games that
   do not provide a Streamline UI tag. If no usable target is available, the
   native HUD-less path is preserved.
-- Dialog/menu UI-target changes are reacquired automatically and transient tag
-  failures are retried instead of disabling UIR for the session.
+- UI targets are refreshed when dialogs or menus change.
 - If UI composition looks wrong, disable UI Color+Alpha injection; Automatic UI
   Composition can stay enabled.
 
-### Compatibility notes
+### SDR, HDR and Vulkan
 
-- Automatic UI Composition targets the supported SDR path; HDR handling follows
-  the capabilities of the active Streamline/DLSS-G stack.
-- Some games use older Streamline integrations and should keep their original
-  runtime files. Check the game compatibility table before replacing Streamline.
+- **SDR/HDR:** improved output color-space detection and UI resource handling.
+  HDR output and UI behavior depend on the game and its graphics pipeline.
+- **Vulkan:** expanded NGX integration, resource handling and Fixed MFG support.
+  Check the Vulkan section below for games that block third-party layers.
 
 ## Game compatibility
 
-*Historical results from earlier project builds. They are regression targets,
-not Stage 3 runtime validation. Game, Streamline, driver and provider updates
-can change behavior.*
+*The following games have been tested with MFGAmpereUnlock on Ampere.
+Results may vary with game, driver, Streamline and DLSS-G versions.*
 
-| Game | Ampere | Turing | Ada | Comment |
-| --- | --- | --- | --- | --- |
-| S.T.A.L.K.E.R. 2: Heart of Chornobyl | | | Working | |
-| God of War Ragnarök | | | Working | |
-| Hogwarts Legacy | Working | | | |
-| Death Stranding 2: On the Beach | | | Working | |
-| Clair Obscur: Expedition 33 | Working | | Working | |
-| The Last of Us Part II Remastered | | | Working | |
-| Resident Evil Requiem | | | Working | |
-| Assassin's Creed IV: Black Flag | | | Working | |
-| PRAGMATA | | | Working | |
-| Cyberpunk 2077 | Working | | Working | Dynamic MFG + Validated Warp Blend + Preset B; Streamline 2.14.1 / DLSS-G 310.9.1 |
-| Portal with RTX | Partial | | | Native DLSS-G/MFG loads on Ampere; RTX Remix frame pacing remains unresolved |
-| Alan Wake 2 | | | Working | |
-| Dragon's Dogma 2 | | | Working | |
-| The Blood of Dawnwalker | | | Maybe | |
-| Starfield | | | Working | |
-| Star Wars Outlaws | | | Working | |
-| Marvel's Spider-Man 2 | | | Working | |
-| Mortal Shell II | | | Working | |
-| Resonance: A Plague Tale Legacy | | | Working | |
-| A Plague Tale: Requiem | Working | | | Legacy Streamline 1.x; do not replace with Streamline 2.x |
-| Black Myth: Wukong | | | Working | |
-| Assetto Corsa Rally | | | Working | |
-| Indiana Jones and the Great Circle | | | Working | Launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
-| Hell Is Us | | | Working | |
-| Silent Hill 2 | | | Working | |
-| Forza Horizon 6 | | | Working | |
-| Assassin's Creed Shadows | | | Working | |
-| Stellar Blade | | | Working | |
-| Doom the Dark Ages | | | Working | Launch with `+r_allowBlackListedLayers 1` so ReShade can load through Vulkan |
-| Horizon Forbidden West | | | Working | |
-| 007 The First Light | | | Working | |
+| Game | Ampere | Comment |
+| --- | --- | --- |
+| A Plague Tale: Requiem | Working | Legacy Streamline 1.x; do not replace with Streamline 2.x |
+| Alan Wake 2 | Working | |
+| Assetto Corsa Rally | Working | |
+| Clair Obscur: Expedition 33 | Working | |
+| Control Resonant | Working | |
+| Cyberpunk 2077 | Working | Dynamic MFG, Validated Warp Blend and Preset B; Streamline 2.14.1 / DLSS-G 310.9.1 |
+| Grand Theft Auto V Enhanced | Working | |
+| Hogwarts Legacy | Working | |
+| JDM: Japanese Drift Master | Working | |
+| Portal with RTX | Working | RTX Remix |
+| Red Dead Redemption 2 | Working | PureDark Frame Generation mod |
+| The Witcher 3: Wild Hunt — Remastered | Working | |
 
-*Ada results are inherited from MFGAdaUnlock.*
-
-## Multiplier behavior
-
-*Multiplier ceilings can change with game and provider updates.*
-
-| Game | Reaches | Notes |
-|---|---|---|
-| Cyberpunk 2077 | 6x | Has its own 2x/3x/4x selector; the addon can force beyond it |
-| Deep Rock Galactic | 6x | FG is on/off only, so the addon drives the count entirely. Needs a modern `nvngx_dlssg.dll` |
-| Grand Theft Auto V Enhanced | 4x | Genuine ceiling — its bundled `sl.dlss_g` 2.9.1.0 clamps to 3 generated frames |
-| S.T.A.L.K.E.R. 2: Heart of Chornobyl | 4x | Uses both a bundled snippet and an opaque NVIDIA OTA provider. The addon patches both, bypasses Streamline's stale Ada limit, and exposes 3x/4x through the native menu |
+*So far, we haven't encountered a game that doesn't work with MFG Unlock.
+We encourage you to try it in other DLSS Frame Generation titles and share
+what you find!*
 
 ## Requirements
 
 - GeForce RTX 20-, 30-, or 40-series GPU.
 - ReShade with addon support.
 - A game with NVIDIA DLSS Frame Generation through Streamline or NGX.
-- **DLSS-G 310.9.1** for the full supported feature set in this release.
-- For the qualified Dynamic MFG path: Direct3D 12, Streamline 2.14.1, DLSS 310.9.1, and
-  NVIDIA driver 595.41 or newer.
+- The game's original DLSS-G and Streamline libraries are sufficient to start.
+- **DLSS-G 310.9.1** is recommended for Presets A/B, Intermediate Scatter
+  Retention, Boundary Artifact Mitigation and Validated Warp Blend.
+- Native Dynamic MFG and higher multipliers depend on what the game's
+  Streamline/DLSS-G combination supports.
 
 ## Vulkan
 
-Vulkan NGX is supported. Some games block third-party Vulkan layers by default.
-For **Indiana Jones and the Great Circle** and **Doom: The Dark Ages**, ReShade may
-require:
+The addon includes Vulkan NGX adapter and resource support. Some Vulkan games
+block third-party layers by default. Where applicable, ReShade may require:
 
 ```text
 +r_allowBlackListedLayers 1
 ```
-
-**Portal with RTX** reaches native DLSS-G/MFG on Ampere, but RTX Remix frame
-pacing remains unresolved.
 
 ## RenoDX DLSS5
 
@@ -200,24 +150,20 @@ Temporal Fix, ISR, Boundary and Warp changes require a game restart.
 | `Enabled` | `1` | Enables the addon |
 | `Architecture` | `Auto` | `Auto`, `Ada`, `Ampere`, or `Turing` |
 | `MaxCount` | `4` | Reported `DLSSG.MultiFrameCountMax` |
-| `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` requests that multiplier within the active Streamline structural limit |
+| `ForceMultiplier` | `0` | `0` uses the game's choice; `2`–`6` requests that multiplier, subject to game/provider limits |
 | `DynamicMFG` | `0` | Enables native Dynamic MFG on Ada/Ampere/Turing when the runtime reports support; takes priority over `ForceMultiplier` |
 | `DynamicTargetFPS` | `0` | Dynamic output target; `0` follows display refresh |
-| `IntermediateScatterRetention` | `0` | Preserves thin-geometry motion on qualified RTX 20/30/40 paths with exact DLSS-G 310.9.1; restart required |
-| `BoundaryArtifactMitigationMode` | `0` | `0` keeps the `0.10-pre1` ISR behavior; `1` Balanced, `2` Aggressive; restart required |
-| `ValidatedWarpBlend` | `0` | Validated Warp quality path for RTX 20/30 with exact DLSS-G 310.9.1; restart required |
+| `IntermediateScatterRetention` | `0` | Helps preserve fine moving details with compatible DLSS-G 310.9.1; restart required |
+| `BoundaryArtifactMitigationMode` | `0` | `0` Off, `1` Balanced, `2` Aggressive; restart required |
+| `ValidatedWarpBlend` | `0` | Warp Blend quality improvement for compatible DLSS-G 310.9.1; restart required |
 | `ShowDebugOptions` | `0` | Shows diagnostic and advanced compatibility controls |
 | `WarpDiagnosticMode` | `2` | `0` relocation control, `1` baseline rebuild, `2` normal Warp; advanced/debug only changes visibility |
 | `FrameGenerationPreset` | `0` | `0` application/driver default, `1` A, `2` B; supported 310.9.1 build only |
-| `UIComposition` | `1` | Automatic guarded UI recomposition on SDR |
-| `UICandidateInjection` | `1` | Automatic guarded D3D12 UI Color+Alpha injection |
+| `UIComposition` | `1` | Automatic UI recomposition on SDR |
+| `UICandidateInjection` | `1` | D3D12 UI Color+Alpha injection when needed |
 | `TemporalFix` | `1` | Corrects generated-frame temporal positions |
 | `ForceFlipMeteringOff` | `0` | Legacy software pacing fallback |
 | `RuntimeSelectionMode` | `0` | `0` keeps the game policy, `1` prefers local Streamline plugins, `2` forces NVIDIA OTA flags |
-
-Advanced/debug is presentation-only. Hiding it does not rewrite Warp mode, UI
-injection, `TemporalFix`, `MaxCount`, `ForceFlipMeteringOff`, `Architecture` or
-`RuntimeSelectionMode`.
 
 When updating from `0.10-pre1`, an existing `IntermediateScatterRetention=1`
 configuration without a boundary setting keeps the previous ISR behavior until
@@ -239,10 +185,11 @@ configuration without a boundary setting keeps the previous ISR behavior until
 
 ### Dynamic MFG is unavailable or Warp Blend is not applied
 
-- Confirm the MFG Unlock panel shows Streamline 2.14.1 and DLSS-G 310.9.1.
+- Check whether the loaded Streamline/DLSS-G combination supports native
+  Dynamic MFG. DLSS-G 310.9.1 is recommended for Warp Blend.
 - After enabling Dynamic MFG, toggle Frame Generation off/on in the game.
-- Validated Warp Blend requires a restart. Legacy Streamline 1.x games should
-  keep their existing fixed MFG path.
+- Warp Blend requires a restart. Keep the original Streamline files in legacy
+  Streamline 1.x games.
 
 ### UI Recomposition problems
 
@@ -254,7 +201,6 @@ configuration without a boundary setting keeps the previous ISR behavior until
 
 - Leave `ForceFlipMeteringOff=0` with current Streamline builds.
 - If higher multipliers specifically freeze, set `ForceFlipMeteringOff=1` and restart.
-- Portal with RTX is a separate known RTX Remix pacing case.
 
 ### Performance collapses with RenoDX DLSS5
 
@@ -264,29 +210,17 @@ configuration without a boundary setting keeps the previous ISR behavior until
 
 ## How it works
 
-MFGAmpereUnlock keeps NVIDIA's native DLSS-G path and adapts the provider for the
-selected architecture:
+MFGAmpereUnlock uses NVIDIA's own DLSS Frame Generation rather than replacing
+it with a different frame generator.
 
-1. `Auto` detects Ada, Ampere, or Turing; an explicit profile can override it.
-2. On Ada, the DLSS-G provider already contains compatible `sm_89` code, so only
-   the architecture and MFG capability checks need to be adjusted.
-3. On Ampere and Turing, the provider's compatible `sm_89` PTX is additionally
-   retargeted to `sm_86` or `sm_75` so the NVIDIA driver can JIT-compile it for
-   those GPUs.
-4. Before changing anything, the addon checks that the loaded DLSS-G provider
-   and its embedded CUDA code match a layout it knows how to patch.
-5. Only after the provider is ready does the addon make Streamline or NGX report
-   Frame Generation as available for the selected GPU.
-6. At higher MFG multipliers, the temporal fix preserves a distinct intended
-   temporal position for each generated frame.
-7. On Ampere/Turing D3D12 with the supported Streamline/DLSS-G stack, Dynamic MFG
-   requests NVIDIA's native `DLSSGMode::eDynamic`; NVIDIA selects the multiplier
-   and owns pacing.
-8. For DLSS-G 310.9.1, Validated Warp Blend ports the MFGAdaUnlock quality path
-   to Ampere/Turing and checks later-stage reprojection candidates before blending.
-9. Automatic UI Composition keeps native HUD-less fallback when a usable UI
-   partner is unavailable; advanced injection can supply a detected D3D12 UI
-   Color+Alpha target and recover across short UI-target handovers.
+1. On **Ada**, NVIDIA's DLSS-G code is already compatible with the GPU. The
+   addon adjusts Frame Generation availability and MFG settings.
+2. On **Ampere** and **Turing**, compatible DLSS-G PTX code is adapted from
+   `sm_89` to `sm_86` or `sm_75` so the NVIDIA driver can compile it for the GPU.
+3. The addon works with the game's Streamline/NGX integration to expose
+   supported multipliers, keeping NVIDIA and the game in control of frame pacing.
+4. **Temporal Fix**, UI Recomposition and optional image-quality features help
+   improve the appearance of generated frames.
 
 ## Building from source
 
