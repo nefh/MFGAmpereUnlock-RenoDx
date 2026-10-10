@@ -111,8 +111,8 @@ Results may vary with game, driver, Streamline and DLSS-G versions.*
 | Red Dead Redemption 2 | Working | PureDark Frame Generation mod |
 | The Witcher 3: Wild Hunt — Remastered | Working | |
 
-*So far, we haven't encountered a game that doesn't work with MFG Unlock.
-We encourage you to try it in other DLSS Frame Generation titles and share
+*So far, I haven't encountered a game that doesn't work with MFG Unlock.
+Try it in other DLSS Frame Generation titles and share
 what you find!*
 
 ## Requirements
