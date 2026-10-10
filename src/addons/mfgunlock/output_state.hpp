@@ -2,12 +2,23 @@
 #pragma once
 
 #include <cstdint>
+#include <atomic>
+#include "./vulkan_contract.hpp"
 #include <mutex>
 #include <shared_mutex>
 
 namespace mfgunlock::outputstate {
 
 inline constexpr uint32_t kUnknown32 = UINT32_MAX;
+enum class ResourceApi : uint32_t { kD3D12, kVulkan };
+inline std::atomic<ResourceApi> g_resource_api{ResourceApi::kD3D12};
+inline void SetResourceApi(ResourceApi api) { g_resource_api.store(api, std::memory_order_release); }
+inline ResourceApi GetResourceApi() { return g_resource_api.load(std::memory_order_acquire); }
+inline bool LowPrecisionUiAlpha(uint32_t native_format) {
+  return GetResourceApi() == ResourceApi::kVulkan
+      ? vulkancontract::LowPrecisionColorAlpha(native_format) : native_format == 24;
+}
+
 
 // ReShade color-space enum values are stable across the supported API history,
 // even though the symbolic names changed in newer headers.
@@ -55,7 +66,9 @@ inline FormatKind ClassifyFormat(uint32_t format, bool known = true) {
     case kFormatRgba16Float: return FormatKind::kRgba16Float;
     case kFormatRgb10A2Unorm: return FormatKind::kRgb10A2Unorm;
     case kFormatRgba8Unorm: return FormatKind::kRgba8Unorm;
+    case 87: return GetResourceApi() == ResourceApi::kVulkan ? FormatKind::kRgba8Unorm : FormatKind::kOther;
     case kFormatRgba8Srgb: return FormatKind::kRgba8Srgb;
+    case 91: return GetResourceApi() == ResourceApi::kVulkan ? FormatKind::kRgba8Srgb : FormatKind::kOther;
     default: return FormatKind::kOther;
   }
 }
@@ -98,7 +111,11 @@ inline State Classify(FormatKind format_kind, uint32_t format, bool format_known
     case kColorSpaceSrgbNonlinear:
       state.encoding = Encoding::kSdrSrgb;
       state.known = true;
-      state.dlssg_supported = true;
+      // A color-space label alone does not qualify an unknown/FP16 format.
+      state.dlssg_supported = format_known &&
+          (format_kind == FormatKind::kRgba8Unorm ||
+           format_kind == FormatKind::kRgba8Srgb ||
+           format_kind == FormatKind::kRgb10A2Unorm);
       break;
     case kColorSpaceScRgbLinear:
       state.encoding = Encoding::kScRgbLinear;
@@ -115,7 +132,7 @@ inline State Classify(FormatKind format_kind, uint32_t format, bool format_known
       state.wide_gamut = true;
       state.known = true;
       // The documented DLSS-G HDR path is UINT10/RGB10 + HDR10/BT.2100.
-      state.dlssg_supported = format_kind == FormatKind::kRgb10A2Unorm;
+      state.dlssg_supported = format_known && format_kind == FormatKind::kRgb10A2Unorm;
       break;
     case kColorSpaceHdr10Hlg:
       state.encoding = Encoding::kHdrOther;
@@ -139,7 +156,8 @@ inline UiEncoding DetectedUiEncoding(FormatKind format_kind) {
     case FormatKind::kRgba8Srgb:
       return UiEncoding::kSdrSrgb;
     case FormatKind::kRgba8Unorm:
-      return UiEncoding::kSdrLinear;
+      // UNORM describes storage, not the transfer function of its pixels.
+      return UiEncoding::kUnknown;
     default:
       return UiEncoding::kUnknown;
   }
@@ -155,8 +173,9 @@ inline bool IsUiEncodingCompatible(const State& output, UiEncoding ui_encoding,
   // that path for SDR outputs, but never treat those pixels as HDR10/PQ data.
   if (output.encoding == Encoding::kSdrSrgb ||
       output.encoding == Encoding::kSdrLinear) {
-    return ui_encoding == UiEncoding::kSdrSrgb ||
-           ui_encoding == UiEncoding::kSdrLinear;
+    return output.encoding == Encoding::kSdrSrgb
+        ? ui_encoding == UiEncoding::kSdrSrgb
+        : ui_encoding == UiEncoding::kSdrLinear;
   }
   return false;
 }

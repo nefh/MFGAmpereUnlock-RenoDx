@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 namespace mfgunlock::integration {
 
@@ -49,7 +50,17 @@ enum class ResourceRole : uint32_t {
   kOutputInterpolated,
   kOutputReal,
   kOutputDisableInterpolation,
+  // Appended to preserve the numeric identity of the legacy resource-mask ABI.
+  kColorInput,
+  kColorOutput,
+  kExposure,
   kCount,
+};
+
+enum class ResourceProvenance : uint32_t {
+  kUnknown = 0,
+  kStreamline,
+  kNgx,
 };
 
 struct ResourceState {
@@ -67,6 +78,10 @@ struct ResourceState {
   uint32_t state = kUnknown32;
   uint32_t format_known = 0;
   uint32_t format = kUnknown32;
+  uint32_t frame_known = 0;
+  uint64_t frame = kUnknown64;
+  ResourceProvenance provenance = ResourceProvenance::kUnknown;
+  uint32_t replacements = 0;
   uint64_t object = 0;
 };
 
@@ -80,6 +95,10 @@ struct Snapshot {
   uint32_t present_end_frame = 0;
   uint32_t present_marker_mismatches = 0;
   uint32_t constants_marker_mismatches = 0;
+  uint32_t history_reset_known = 0;
+  uint32_t history_reset = 0;
+  uint32_t rendering_game_frames_known = 0;
+  uint32_t rendering_game_frames = 0;
 
   Verdict resources = Verdict::kUnknown;
   std::array<ResourceState, static_cast<size_t>(ResourceRole::kCount)> resource{};
@@ -168,8 +187,14 @@ struct AtomicResourceState {
   std::atomic_uint32_t state{kUnknown32};
   std::atomic_uint32_t format_known{0};
   std::atomic_uint32_t format{kUnknown32};
+  std::atomic_uint32_t frame_known{0};
+  std::atomic_uint64_t frame{kUnknown64};
+  std::atomic_uint32_t provenance{static_cast<uint32_t>(ResourceProvenance::kUnknown)};
+  std::atomic_uint32_t replacements{0};
   std::atomic_uint64_t object{0};
 };
+
+inline std::mutex g_resource_mutex;
 
 inline std::array<AtomicResourceState, static_cast<size_t>(ResourceRole::kCount)> g_resources{};
 
@@ -183,6 +208,10 @@ inline std::atomic_uint32_t g_present_end_known{0};
 inline std::atomic_uint32_t g_present_end_frame{0};
 inline std::atomic_uint32_t g_present_marker_mismatches{0};
 inline std::atomic_uint32_t g_constants_marker_mismatches{0};
+inline std::atomic_uint32_t g_history_reset_known{0};
+inline std::atomic_uint32_t g_history_reset{0};
+inline std::atomic_uint32_t g_rendering_game_frames_known{0};
+inline std::atomic_uint32_t g_rendering_game_frames{0};
 
 inline std::atomic_uint32_t g_dynamic_resolution_seen{0};
 inline std::atomic_uint32_t g_dynamic_resolution_enabled{0};
@@ -240,6 +269,7 @@ inline std::atomic_uint32_t g_vsync_support_known{0};
 inline std::atomic_uint32_t g_vsync_support{0};
 
 inline void Reset() {
+  std::lock_guard lock(g_resource_mutex);
   for (auto& state : g_resources) {
     state.seen.store(0, std::memory_order_relaxed);
     state.active.store(0, std::memory_order_relaxed);
@@ -255,6 +285,11 @@ inline void Reset() {
     state.state.store(kUnknown32, std::memory_order_relaxed);
     state.format_known.store(0, std::memory_order_relaxed);
     state.format.store(kUnknown32, std::memory_order_relaxed);
+    state.frame_known.store(0, std::memory_order_relaxed);
+    state.frame.store(kUnknown64, std::memory_order_relaxed);
+    state.provenance.store(static_cast<uint32_t>(ResourceProvenance::kUnknown),
+                           std::memory_order_relaxed);
+    state.replacements.store(0, std::memory_order_relaxed);
     state.object.store(0, std::memory_order_relaxed);
   }
   g_constants_frame_known.store(0, std::memory_order_relaxed);
@@ -265,6 +300,10 @@ inline void Reset() {
   g_present_end_known.store(0, std::memory_order_relaxed);
   g_present_marker_mismatches.store(0, std::memory_order_relaxed);
   g_constants_marker_mismatches.store(0, std::memory_order_relaxed);
+  g_history_reset_known.store(0, std::memory_order_relaxed);
+  g_history_reset.store(0, std::memory_order_relaxed);
+  g_rendering_game_frames_known.store(0, std::memory_order_relaxed);
+  g_rendering_game_frames.store(0, std::memory_order_relaxed);
   g_dynamic_resolution_seen.store(0, std::memory_order_relaxed);
   g_queue_parallelism_known.store(0, std::memory_order_relaxed);
   g_completion_fence_known.store(0, std::memory_order_relaxed);
@@ -365,24 +404,42 @@ inline void ObservePresentMarker(bool start, uint32_t frame) {
   }
 }
 
-inline void ObserveTag(uint32_t viewport, ResourceRole role, bool resource_present,
-                       bool lifecycle_known, uint32_t lifecycle,
-                       bool extent_known, uint32_t left, uint32_t top,
-                       uint32_t width, uint32_t height,
-                       bool state_known, uint32_t state,
-                       bool format_known, uint32_t format,
-                       uint64_t object) {
-  ObserveViewport(g_tag_viewport_known, g_tag_viewport, viewport);
+inline void ObserveResourceState(ResourceRole role, bool resource_present,
+                                 bool lifecycle_known, uint32_t lifecycle,
+                                 bool extent_known, uint32_t left, uint32_t top,
+                                 uint32_t width, uint32_t height,
+                                 bool state_known, uint32_t state,
+                                 bool format_known, uint32_t format,
+                                 uint64_t object, bool frame_known, uint64_t frame,
+                                 ResourceProvenance provenance) {
+  std::lock_guard lock(g_resource_mutex);
   const auto index = static_cast<size_t>(role);
   if (index >= g_resources.size()) return;
   auto& slot = g_resources[index];
   slot.seen.store(1, std::memory_order_release);
+  slot.provenance.store(static_cast<uint32_t>(provenance), std::memory_order_relaxed);
+  slot.frame_known.store(frame_known, std::memory_order_relaxed);
+  slot.frame.store(frame_known ? frame : kUnknown64, std::memory_order_relaxed);
+  const uint64_t previous = slot.object.load(std::memory_order_relaxed);
   if (!resource_present) {
     slot.active.store(0, std::memory_order_release);
     slot.object.store(0, std::memory_order_relaxed);
+    slot.lifecycle_known.store(0, std::memory_order_relaxed);
+    slot.lifecycle.store(kUnknown32, std::memory_order_relaxed);
+    slot.extent_known.store(0, std::memory_order_relaxed);
+    slot.extent_left.store(0, std::memory_order_relaxed);
+    slot.extent_top.store(0, std::memory_order_relaxed);
+    slot.extent_width.store(0, std::memory_order_relaxed);
+    slot.extent_height.store(0, std::memory_order_relaxed);
+    slot.state_known.store(0, std::memory_order_relaxed);
+    slot.state.store(kUnknown32, std::memory_order_relaxed);
+    slot.format_known.store(0, std::memory_order_relaxed);
+    slot.format.store(kUnknown32, std::memory_order_relaxed);
     slot.clears.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  if (previous != 0 && previous != object)
+    slot.replacements.fetch_add(1, std::memory_order_relaxed);
   slot.active.store(1, std::memory_order_release);
   slot.object.store(object, std::memory_order_relaxed);
   slot.lifecycle_known.store(lifecycle_known, std::memory_order_relaxed);
@@ -398,30 +455,140 @@ inline void ObserveTag(uint32_t viewport, ResourceRole role, bool resource_prese
   slot.format.store(format_known ? format : kUnknown32, std::memory_order_relaxed);
 }
 
+inline uint64_t ReadTaggedBackbuffer(uint32_t& viewport) {
+  std::lock_guard lock(g_resource_mutex);
+  const auto& slot = g_resources[static_cast<size_t>(ResourceRole::kBackbuffer)];
+  if (!slot.active.load(std::memory_order_acquire) ||
+      !slot.frame_known.load(std::memory_order_relaxed) ||
+      !g_constants_frame_known.load(std::memory_order_acquire) ||
+      slot.frame.load(std::memory_order_relaxed) != g_constants_frame.load(std::memory_order_relaxed) ||
+      slot.provenance.load(std::memory_order_relaxed) !=
+          static_cast<uint32_t>(ResourceProvenance::kStreamline) ||
+      !g_tag_viewport_known.load(std::memory_order_acquire) ||
+      !g_constants_viewport_known.load(std::memory_order_acquire) ||
+      g_tag_viewport.load(std::memory_order_relaxed) != g_constants_viewport.load(std::memory_order_relaxed))
+    return 0;
+  viewport = g_tag_viewport.load(std::memory_order_relaxed);
+  return slot.object.load(std::memory_order_relaxed);
+}
+
+inline void ObserveTag(uint32_t viewport, ResourceRole role, bool resource_present,
+                       bool lifecycle_known, uint32_t lifecycle,
+                       bool extent_known, uint32_t left, uint32_t top,
+                       uint32_t width, uint32_t height,
+                       bool state_known, uint32_t state,
+                       bool format_known, uint32_t format,
+                       uint64_t object, bool frame_known, uint64_t frame) {
+  ObserveViewport(g_tag_viewport_known, g_tag_viewport, viewport);
+  ObserveResourceState(role, resource_present, lifecycle_known, lifecycle,
+                       extent_known, left, top, width, height,
+                       state_known, state, format_known, format, object,
+                       frame_known, frame, ResourceProvenance::kStreamline);
+}
+
+inline void ObserveTag(uint32_t viewport, ResourceRole role, bool resource_present,
+                       bool lifecycle_known, uint32_t lifecycle,
+                       bool extent_known, uint32_t left, uint32_t top,
+                       uint32_t width, uint32_t height,
+                       bool state_known, uint32_t state,
+                       bool format_known, uint32_t format,
+                       uint64_t object) {
+  ObserveTag(viewport, role, resource_present, lifecycle_known, lifecycle,
+             extent_known, left, top, width, height, state_known, state,
+             format_known, format, object, false, 0);
+}
+
+inline void ObserveNgxResource(ResourceRole role, bool known, uint64_t object,
+                               uint64_t width, uint32_t height, uint32_t format,
+                               bool frame_known, uint64_t frame) {
+  const bool present = known && object != 0;
+  if (!known) { object = 0; frame_known = false; }
+  const bool extent_known = present && width != 0 && height != 0;
+  ObserveResourceState(
+      role, present, false, kUnknown32, extent_known, 0, 0,
+      static_cast<uint32_t>(width > UINT32_MAX ? UINT32_MAX : width),
+      height, false, kUnknown32, present && format != 0,
+      format, object, frame_known, frame, ResourceProvenance::kNgx);
+}
+
 inline void ObserveNgxResource(ResourceRole role, bool known, uint64_t object,
                                uint64_t width, uint32_t height, uint32_t format) {
-  if (!known) return;
-  const auto index = static_cast<size_t>(role);
-  if (index >= g_resources.size()) return;
-  auto& slot = g_resources[index];
-  slot.seen.store(1, std::memory_order_release);
-  slot.active.store(object != 0, std::memory_order_release);
-  slot.object.store(object, std::memory_order_relaxed);
-  if (object == 0) {
+  ObserveNgxResource(role, known, object, width, height, format, false, 0);
+}
+
+inline void ObserveHistory(bool reset_known, bool reset,
+                           bool rendering_known, bool rendering) {
+  g_history_reset.store(reset_known && reset, std::memory_order_relaxed);
+  g_history_reset_known.store(reset_known, std::memory_order_release);
+  g_rendering_game_frames.store(rendering_known && rendering, std::memory_order_relaxed);
+  g_rendering_game_frames_known.store(rendering_known, std::memory_order_release);
+}
+
+// Metadata only: never retain or release the caller's COM/Vulkan resource.
+inline bool InvalidateResource(uint64_t object) {
+  if (object == 0) return false;
+  std::lock_guard lock(g_resource_mutex);
+  bool found = false;
+  for (auto& slot : g_resources) {
+    if (slot.object.load(std::memory_order_relaxed) != object) continue;
+    found = true;
+    slot.active.store(0, std::memory_order_release);
+    slot.object.store(0, std::memory_order_relaxed);
+    slot.frame_known.store(0, std::memory_order_relaxed);
+    slot.frame.store(kUnknown64, std::memory_order_relaxed);
+    slot.lifecycle_known.store(0, std::memory_order_relaxed);
+    slot.extent_known.store(0, std::memory_order_relaxed);
+    slot.state_known.store(0, std::memory_order_relaxed);
+    slot.format_known.store(0, std::memory_order_relaxed);
     slot.clears.fetch_add(1, std::memory_order_relaxed);
-    return;
   }
-  const bool extent_known = width != 0 && height != 0;
-  slot.extent_known.store(extent_known, std::memory_order_relaxed);
-  slot.extent_left.store(0, std::memory_order_relaxed);
-  slot.extent_top.store(0, std::memory_order_relaxed);
-  slot.extent_width.store(
-      static_cast<uint32_t>(width > UINT32_MAX ? UINT32_MAX : width),
-      std::memory_order_relaxed);
-  slot.extent_height.store(height, std::memory_order_relaxed);
-  slot.format_known.store(format != 0, std::memory_order_relaxed);
-  slot.format.store(format != 0 ? format : kUnknown32, std::memory_order_relaxed);
-  // NGX snapshots have no Streamline lifecycle, state, or viewport evidence.
+  return found;
+}
+
+inline void InvalidateNgxResources() {
+  std::lock_guard lock(g_resource_mutex);
+  for (auto& slot : g_resources) {
+    if (slot.provenance.load(std::memory_order_relaxed) !=
+        static_cast<uint32_t>(ResourceProvenance::kNgx)) continue;
+    slot.active.store(0, std::memory_order_release);
+    slot.object.store(0, std::memory_order_relaxed);
+    slot.frame_known.store(0, std::memory_order_relaxed);
+    slot.extent_known.store(0, std::memory_order_relaxed);
+    slot.state_known.store(0, std::memory_order_relaxed);
+    slot.format_known.store(0, std::memory_order_relaxed);
+  }
+}
+
+// NGX feature lifetime is not Streamline tag lifetime. Clear observations from
+// a released/recreated feature without erasing independent native game tags.
+// This is metadata invalidation only; it does not release a COM/Vulkan object.
+inline void InvalidateNgxFeatureEvidence() {
+  InvalidateNgxResources();
+  g_history_reset_known.store(0, std::memory_order_release);
+  g_rendering_game_frames_known.store(0, std::memory_order_release);
+}
+
+inline void InvalidateFrameEvidence() {
+  std::lock_guard lock(g_resource_mutex);
+  for (auto& slot : g_resources) {
+    slot.active.store(0, std::memory_order_release);
+    slot.object.store(0, std::memory_order_relaxed);
+    slot.frame_known.store(0, std::memory_order_relaxed);
+    slot.frame.store(kUnknown64, std::memory_order_relaxed);
+    slot.lifecycle_known.store(0, std::memory_order_relaxed);
+    slot.extent_known.store(0, std::memory_order_relaxed);
+    slot.state_known.store(0, std::memory_order_relaxed);
+    slot.format_known.store(0, std::memory_order_relaxed);
+  }
+  g_constants_frame_known.store(0, std::memory_order_release);
+  g_constants_sequence.store(0, std::memory_order_release);
+  g_present_start_known.store(0, std::memory_order_release);
+  g_present_end_known.store(0, std::memory_order_release);
+  g_present_marker_mismatches.store(0, std::memory_order_relaxed);
+  g_constants_marker_mismatches.store(0, std::memory_order_relaxed);
+  g_history_reset_known.store(0, std::memory_order_release);
+  g_rendering_game_frames_known.store(0, std::memory_order_release);
+  g_completion_fence_known.store(0, std::memory_order_release);
 }
 
 inline void ObserveState(uint32_t viewport, uint32_t status,
@@ -524,14 +691,18 @@ inline Verdict FrameVerdict() {
 }
 
 inline Verdict ResourceVerdict() {
-  const bool depth = g_resources[static_cast<size_t>(ResourceRole::kDepth)]
-                         .seen.load(std::memory_order_acquire) != 0;
-  const bool mvec = g_resources[static_cast<size_t>(ResourceRole::kMotionVectors)]
-                        .seen.load(std::memory_order_acquire) != 0;
+  const auto& depth = g_resources[static_cast<size_t>(ResourceRole::kDepth)];
+  const auto& mvec = g_resources[static_cast<size_t>(ResourceRole::kMotionVectors)];
+  const bool depth_seen = depth.seen.load(std::memory_order_acquire) != 0;
+  const bool mvec_seen = mvec.seen.load(std::memory_order_acquire) != 0;
+  const bool depth_active = depth.active.load(std::memory_order_acquire) != 0;
+  const bool mvec_active = mvec.active.load(std::memory_order_acquire) != 0;
   const uint32_t status = g_status_known.load(std::memory_order_acquire)
       ? g_status_raw.load(std::memory_order_relaxed) : 0;
   if (status & kStatusConstantsInvalid) return Verdict::kInvalid;
-  if (depth && mvec) return Verdict::kValid;
+  if ((depth_seen && !depth_active) || (mvec_seen && !mvec_active))
+    return Verdict::kInvalid;
+  if (depth_active && mvec_active) return Verdict::kValid;
   bool any = false;
   for (const auto& slot : g_resources)
     any |= slot.seen.load(std::memory_order_acquire) != 0;
@@ -560,7 +731,7 @@ inline Verdict QueueVerdict() {
   if (g_queue_parallelism_known.load(std::memory_order_acquire) &&
       g_queue_parallelism_mode.load(std::memory_order_relaxed) == 1 &&
       g_completion_fence_known.load(std::memory_order_acquire))
-    return Verdict::kValid;
+    return Verdict::kObserved;
   return Verdict::kObserved;
 }
 
@@ -600,6 +771,7 @@ inline Verdict ViewportVerdict() {
 }
 
 inline Snapshot Read() {
+  std::lock_guard lock(g_resource_mutex);
   Snapshot out;
   out.frame_index = FrameVerdict();
   out.constants_frame_known = g_constants_frame_known.load(std::memory_order_acquire);
@@ -610,6 +782,11 @@ inline Snapshot Read() {
   out.present_end_frame = g_present_end_frame.load(std::memory_order_relaxed);
   out.present_marker_mismatches = g_present_marker_mismatches.load(std::memory_order_relaxed);
   out.constants_marker_mismatches = g_constants_marker_mismatches.load(std::memory_order_relaxed);
+  out.history_reset_known = g_history_reset_known.load(std::memory_order_acquire);
+  out.history_reset = g_history_reset.load(std::memory_order_relaxed);
+  out.rendering_game_frames_known =
+      g_rendering_game_frames_known.load(std::memory_order_acquire);
+  out.rendering_game_frames = g_rendering_game_frames.load(std::memory_order_relaxed);
 
   out.resources = ResourceVerdict();
   for (size_t i = 0; i < g_resources.size(); ++i) {
@@ -629,6 +806,11 @@ inline Snapshot Read() {
     target.state = source.state.load(std::memory_order_relaxed);
     target.format_known = source.format_known.load(std::memory_order_relaxed);
     target.format = source.format.load(std::memory_order_relaxed);
+    target.frame_known = source.frame_known.load(std::memory_order_relaxed);
+    target.frame = source.frame.load(std::memory_order_relaxed);
+    target.provenance = static_cast<ResourceProvenance>(
+        source.provenance.load(std::memory_order_relaxed));
+    target.replacements = source.replacements.load(std::memory_order_relaxed);
     target.object = source.object.load(std::memory_order_relaxed);
   }
 

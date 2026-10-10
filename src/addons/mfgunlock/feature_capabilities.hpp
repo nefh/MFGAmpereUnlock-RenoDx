@@ -25,6 +25,12 @@ enum class Feature : uint32_t {
   kVsyncSupport = 1u << 9,
   kDynamicResolution = 1u << 10,
   kQueueParallelism = 1u << 11,
+  kMotionValidation = 1u << 12,
+  kHistoryValidation = 1u << 13,
+  kOcclusionDisocclusion = 1u << 14,
+  kThinGeometryStability = 1u << 15,
+  kConfidencePropagation = 1u << 16,
+  kFallbackSelection = 1u << 17,
 };
 
 struct FeatureCapabilities {
@@ -47,7 +53,13 @@ inline constexpr uint32_t kAllFeatureBits =
     static_cast<uint32_t>(Feature::kHdrPaths) |
     static_cast<uint32_t>(Feature::kVsyncSupport) |
     static_cast<uint32_t>(Feature::kDynamicResolution) |
-    static_cast<uint32_t>(Feature::kQueueParallelism);
+    static_cast<uint32_t>(Feature::kQueueParallelism) |
+    static_cast<uint32_t>(Feature::kMotionValidation) |
+    static_cast<uint32_t>(Feature::kHistoryValidation) |
+    static_cast<uint32_t>(Feature::kOcclusionDisocclusion) |
+    static_cast<uint32_t>(Feature::kThinGeometryStability) |
+    static_cast<uint32_t>(Feature::kConfidencePropagation) |
+    static_cast<uint32_t>(Feature::kFallbackSelection);
 
 inline constexpr uint32_t kNativeSm89BackendBits =
     static_cast<uint32_t>(Feature::kFixedMfg) |
@@ -61,11 +73,23 @@ inline constexpr uint32_t kNativeSm89BackendBits =
     static_cast<uint32_t>(Feature::kHdrPaths) |
     static_cast<uint32_t>(Feature::kVsyncSupport) |
     static_cast<uint32_t>(Feature::kDynamicResolution) |
-    static_cast<uint32_t>(Feature::kQueueParallelism);
+    static_cast<uint32_t>(Feature::kQueueParallelism) |
+    static_cast<uint32_t>(Feature::kMotionValidation) |
+    static_cast<uint32_t>(Feature::kHistoryValidation) |
+    static_cast<uint32_t>(Feature::kOcclusionDisocclusion) |
+    static_cast<uint32_t>(Feature::kThinGeometryStability) |
+    static_cast<uint32_t>(Feature::kFallbackSelection);
+
+// Keep retargeted architecture capability declarations separate even while the
+// currently verified feature sets are equal. Future evidence for one target
+// must not silently enable the other.
+inline constexpr uint32_t kRetargetSm86BackendBits = kNativeSm89BackendBits;
+inline constexpr uint32_t kRetargetSm75BackendBits = kNativeSm89BackendBits;
 
 inline constexpr FeatureCapabilities kTargetCapabilities{kAllFeatureBits};
 inline constexpr FeatureCapabilities kNativeSm89BackendCapabilities{kNativeSm89BackendBits};
-inline constexpr FeatureCapabilities kRetargetedBackendCapabilities{kAllFeatureBits};
+inline constexpr FeatureCapabilities kRetargetSm86BackendCapabilities{kRetargetSm86BackendBits};
+inline constexpr FeatureCapabilities kRetargetSm75BackendCapabilities{kRetargetSm75BackendBits};
 inline constexpr FeatureCapabilities kNoCapabilities{};
 
 inline constexpr FeatureCapabilities TargetCapabilities(
@@ -80,8 +104,9 @@ inline constexpr FeatureCapabilities BackendCapabilities(
     case ProviderBackend::kNativeSm89:
       return kNativeSm89BackendCapabilities;
     case ProviderBackend::kRetargetSm86:
+      return kRetargetSm86BackendCapabilities;
     case ProviderBackend::kRetargetSm75:
-      return kRetargetedBackendCapabilities;
+      return kRetargetSm75BackendCapabilities;
     default:
       return kNoCapabilities;
   }

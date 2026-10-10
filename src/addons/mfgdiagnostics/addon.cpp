@@ -11,11 +11,16 @@
 #include <string>
 #include <unordered_map>
 #include <nlohmann/json.hpp>
-#include <deps/imgui/imgui.h>
+#define ImTextureID ImU64
+#include "../mfgunlock/imgui_compat.hpp"
 #include "../mfgunlock/reshade_compat.hpp"
 #include "../mfgunlock/ngx_hook.hpp"
 #include "../mfgunlock/diagnostic_bridge.hpp"
+#include "../mfgunlock/advanced_features.hpp"
 #include "../mfgunlock/output_state.hpp"
+#include "../mfgunlock/presentation_observer.hpp"
+#include "../mfgunlock/composition_state.hpp"
+#include "../mfgunlock/runtime_lifecycle.hpp"
 #include "./nvapi_observer.hpp"
 #include "./trace.hpp"
 #include "./mfg_probe.hpp"
@@ -44,6 +49,11 @@ mfgunlock::countobserver::Register g_register_count = nullptr;
 mfgunlock::diagnostic::RegisterEvaluate g_register_evaluate = nullptr;
 mfgunlock::diagnostic::RegisterLifecycle g_register_lifecycle = nullptr;
 mfgunlock::diagnostic::QueryState g_query_state = nullptr;
+mfgunlock::presentation::Query g_query_presentation = nullptr;
+mfgunlock::presentation::passive::Query g_query_passive_metrics = nullptr;
+mfgunlock::runtime::Query g_query_runtime_lifecycle = nullptr;
+mfgunlock::advanced::Query g_query_advanced_features = nullptr;
+mfgunlock::composition::Query g_query_composition = nullptr;
 HMODULE g_core_module = nullptr;
 timeline::OneShotCapture g_evaluate_capture;
 std::atomic<uint64_t> g_last_evaluation_id{0};
@@ -423,7 +433,7 @@ void ObserveEvaluate(const mfgunlock::diagnostic::EvaluateEvent* source) noexcep
     }
     if (!source || source->version != mfgunlock::diagnostic::kEvaluateVersion ||
         source->bytes != sizeof(*source) ||
-        static_cast<uint32_t>(source->backend) != 0 ||
+        static_cast<uint32_t>(source->backend) > 1 ||
         static_cast<uint32_t>(source->phase) > 1) return;
 
     const auto classification = timeline::Classify(*source);
@@ -508,6 +518,16 @@ void InstallCoreObservation() {
         GetProcAddress(core, "MfgUnlockSetLifecycleObserver"));
     g_query_state = reinterpret_cast<mfgunlock::diagnostic::QueryState>(
         GetProcAddress(core, "MfgUnlockGetDiagnosticState"));
+    g_query_presentation = reinterpret_cast<mfgunlock::presentation::Query>(
+        GetProcAddress(core, "MfgUnlockGetPresentationState"));
+    g_query_passive_metrics = reinterpret_cast<mfgunlock::presentation::passive::Query>(
+        GetProcAddress(core, "MfgUnlockGetPassiveMetrics"));
+    g_query_runtime_lifecycle = reinterpret_cast<mfgunlock::runtime::Query>(
+        GetProcAddress(core, "MfgUnlockGetRuntimeLifecycleState"));
+    g_query_advanced_features = reinterpret_cast<mfgunlock::advanced::Query>(
+        GetProcAddress(core, "MfgUnlockGetAdvancedFeatureState"));
+    g_query_composition = reinterpret_cast<mfgunlock::composition::Query>(
+        GetProcAddress(core, "MfgUnlockGetCompositionState"));
   }
   g_count_bridge_connected = g_register_count &&
       g_register_count(mfgunlock::countobserver::kVersion, ObserveCount);
@@ -551,6 +571,11 @@ void UninstallHotObservers() {
         "mfgdiagnostics: failed to detach every NGX parameter observer; retained module ownership is preserved");
   }
   g_query_state = nullptr;
+  g_query_presentation = nullptr;
+  g_query_passive_metrics = nullptr;
+  g_query_runtime_lifecycle = nullptr;
+  g_query_advanced_features = nullptr;
+  g_query_composition = nullptr;
   g_register_count = nullptr;
   g_register_evaluate = nullptr;
   g_register_lifecycle = nullptr;
@@ -999,7 +1024,7 @@ Json EvaluateEventJson(const Event& event, std::unordered_map<uint64_t, uint64_t
   Json row = {
       {"evaluation_id", event.values[1]},
       {"phase", event.values[0] == 0 ? "begin" : "end"},
-      {"backend", "ngx_d3d12"},
+      {"backend", event.values[2] == 1 ? "ngx_vulkan" : "ngx_d3d12"},
       {"caller", CountOwner(event, 3, 98)},
       {"generated_count", count_known ? Json(count) : Json(nullptr)},
       {"generated_index", index_known ? Json(index) : Json(nullptr)},
@@ -1010,7 +1035,7 @@ Json EvaluateEventJson(const Event& event, std::unordered_map<uint64_t, uint64_t
       {"frame_kind", timeline::FrameKindName(classification.kind)},
       {"marker_label", timeline::MarkerLabel(classification).empty() ? Json(nullptr) : Json(timeline::MarkerLabel(classification))},
       {"displayed", nullptr},
-      {"display_note", "provider-generated candidate; Streamline pacing may drop generated frames"},
+      {"display_note", "provider call classification; GPU completion and physical display are unverified"},
       {"resources", Json::array()},
   };
   for (size_t i = 0; i < static_cast<size_t>(mfgunlock::diagnostic::ResourceKey::kCount); ++i)
@@ -1049,7 +1074,8 @@ Json BridgeEvaluateJson(const mfgunlock::diagnostic::EvaluateEvent& event,
   const bool reset_known = timeline::ResetKnown(event);
   Json row = {{"evaluation_id", event.evaluation_id},
               {"phase", event.phase == mfgunlock::diagnostic::EvaluatePhase::kBegin ? "begin" : "end"},
-              {"backend", "ngx_d3d12"}, {"viewport", nullptr},
+              {"backend", event.backend == mfgunlock::diagnostic::Backend::kNgxVulkan
+                  ? "ngx_vulkan" : "ngx_d3d12"}, {"viewport", nullptr},
               {"generated_count", event.generated_count_known ? Json(event.generated_count) : Json(nullptr)},
               {"generated_index", event.generated_index_known ? Json(event.generated_index) : Json(nullptr)},
               {"reset", reset_known ? Json(reset) : Json(nullptr)},
@@ -1065,10 +1091,89 @@ Json BridgeEvaluateJson(const mfgunlock::diagnostic::EvaluateEvent& event,
   return row;
 }
 
+// Reads the core-owned snapshot only. Never consumes a second GetState counter.
+Json PassiveMetricsJson() {
+  namespace passive = mfgunlock::presentation::passive;
+  passive::Snapshot state;
+  if (!g_query_passive_metrics || !g_query_passive_metrics(passive::kVersion, &state)) return nullptr;
+  const auto rate = [](const passive::RateStats& value) -> Json {
+    return {{"hz", value.valid ? Json(value.hz) : Json(nullptr)},
+            {"intervals", value.intervals}, {"count", value.count},
+            {"span_ns", value.span_ns}, {"first_ns", value.first_ns}, {"last_ns", value.last_ns},
+            {"age_ns", value.age_ns == UINT64_MAX ? Json(nullptr) : Json(value.age_ns)}};
+  };
+  Json result = {{"schema", 1}, {"owner", "mfgunlock.presentation"},
+      {"enabled", state.enabled != 0}, {"generation", state.generation},
+      {"timestamp_ns", state.timestamp_ns}, {"clock", "steady_monotonic_ns"},
+      {"lost_events", state.lost_events}, {"invalid_events", state.invalid_events},
+      {"capacity_per_ring", state.capacity}, {"native_viewport_conflict", state.native_viewport_conflict != 0},
+      {"source_callback_cadence", rate(state.source_callbacks)},
+      {"sl_getstate_reported_presented_cadence", rate(state.native_presented)},
+      {"displayed_frames", nullptr}, {"generated_frames", nullptr},
+      {"dropped_frames", nullptr}, {"duplicates", nullptr}, {"own_cpu", Json::array()}};
+  for (size_t index=0; index<passive::kCpuKinds; ++index) {
+    const auto& value = state.cpu[index];
+    result["own_cpu"].push_back({{"scope", passive::Name(static_cast<passive::CpuKind>(index))},
+      {"unit", "ns"}, {"excludes", "native Streamline calls inside this hook"},
+      {"samples", value.retained}, {"total", value.total}, {"warmup_discarded", value.warmup},
+      {"overwritten", value.overwritten}, {"first_ns", value.first_ns}, {"last_ns", value.last_ns},
+      {"p50", value.valid ? Json(value.p50_ns) : Json(nullptr)},
+      {"p95", value.valid ? Json(value.p95_ns) : Json(nullptr)},
+      {"p99", value.valid ? Json(value.p99_ns) : Json(nullptr)}});
+  }
+  return result;
+}
+
 Json DiagnosticStateJson() {
   if (!g_query_state) return nullptr;
   mfgunlock::diagnostic::DiagnosticState state;
   if (!g_query_state(mfgunlock::diagnostic::kStateVersion, &state)) return nullptr;
+  mfgunlock::presentation::Snapshot presentation;
+  const bool presentation_available = g_query_presentation &&
+      g_query_presentation(mfgunlock::presentation::kVersion, &presentation);
+  mfgunlock::runtime::Snapshot runtime_lifecycle;
+  const bool runtime_lifecycle_available = g_query_runtime_lifecycle &&
+      g_query_runtime_lifecycle(mfgunlock::runtime::kVersion, &runtime_lifecycle);
+  mfgunlock::advanced::Snapshot advanced_features;
+  const bool advanced_features_available = g_query_advanced_features &&
+      g_query_advanced_features(mfgunlock::advanced::kVersion, &advanced_features);
+  mfgunlock::composition::Snapshot composition;
+  const bool composition_available = g_query_composition &&
+      g_query_composition(mfgunlock::composition::kVersion, &composition);
+  Json advanced_features_json = nullptr;
+  if (advanced_features_available) {
+    advanced_features_json = {
+        {"architecture", mfgunlock::architecture::Name(
+            static_cast<mfgunlock::Architecture>(advanced_features.architecture))},
+        {"provider_backend", mfgunlock::advanced::ProviderBackendName(
+            static_cast<mfgunlock::ProviderBackend>(advanced_features.provider_backend))},
+        {"target_sm", advanced_features.target_sm},
+        {"provider_profile_index", advanced_features.provider_profile_index
+            ? Json(advanced_features.provider_profile_index) : Json(nullptr)},
+        {"provider_inventory_qualified", advanced_features.provider_exact != 0},
+        {"provider_file_sha256_verified", nullptr},
+        {"provider_ready", advanced_features.provider_ready != 0},
+        {"resource_contract", advanced_features.resource_contract},
+        {"history_reset", advanced_features.history_reset_known
+            ? Json(advanced_features.history_reset != 0) : Json(nullptr)},
+        {"rendering_game_frames", advanced_features.rendering_game_frames_known
+            ? Json(advanced_features.rendering_game_frames != 0) : Json(nullptr)},
+        {"features", Json::array()},
+    };
+    for (const auto& feature : advanced_features.features) {
+      advanced_features_json["features"].push_back({
+          {"feature", mfgunlock::advanced::FeatureName(feature.feature)},
+          {"category", mfgunlock::advanced::CategoryName(feature.category)},
+          {"backend", mfgunlock::advanced::BackendName(feature.backend)},
+          {"input_eligible", feature.input_eligible != 0},
+          {"execution_active", feature.execution_known ? Json(feature.execution_active != 0) : Json(nullptr)},
+          {"eligibility_is_runtime_gate", false},
+          {"partial", feature.partial != 0},
+          {"fallback_reason", mfgunlock::advanced::FallbackReasonName(
+              feature.fallback_reason)},
+      });
+    }
+  }
   static constexpr const char* kArchitectures[] = {"auto", "ada", "ampere", "turing", "unknown"};
   static constexpr const char* kTemporal[] = {"none", "midpoint", "blackwell"};
   const uint32_t architecture = state.architecture;
@@ -1104,6 +1209,14 @@ Json DiagnosticStateJson() {
     return output.known
         ? Json(mfgunlock::outputstate::EncodingName(output.encoding))
         : Json(nullptr);
+  };
+  const auto provider_backend_json = [](uint32_t backend) -> Json {
+    switch (static_cast<mfgunlock::ProviderBackend>(backend)) {
+      case mfgunlock::ProviderBackend::kNativeSm89: return "native_sm89";
+      case mfgunlock::ProviderBackend::kRetargetSm86: return "retarget_sm86";
+      case mfgunlock::ProviderBackend::kRetargetSm75: return "retarget_sm75";
+      default: return nullptr;
+    }
   };
   return {
       {"architecture", architecture < std::size(kArchitectures) ? Json(kArchitectures[architecture]) : Json(nullptr)},
@@ -1154,6 +1267,127 @@ Json DiagnosticStateJson() {
       {"ui_composition_applied", state.ui_composition_applied != 0},
       {"ui_composition_fallback", state.ui_composition_fallback != 0},
       {"prepared_provider_count", state.prepared_provider_count},
+      {"passive_metrics", PassiveMetricsJson()},
+      {"presentation", {
+          {"model", presentation_available && presentation.effective_multiplier_known
+              ? Json("streamline_getstate_correlated") : Json(nullptr)},
+          {"requested_multiplier", multiplier_json(
+              state.requested_generated_known, state.requested_generated)},
+          {"provider_accepted_multiplier", multiplier_json(
+              state.accepted_generated_known, state.accepted_generated)},
+          {"actual_generated_multiplier", nullptr},
+          {"source_binding_verified", presentation_available
+              ? Json(presentation.source_binding_verified != 0) : Json(nullptr)},
+          {"effective_presented_multiplier",
+              presentation_available && presentation.effective_multiplier_known
+                  ? Json(static_cast<double>(presentation.effective_multiplier_milli) / 1000.0)
+                  : Json(nullptr)},
+          {"confidence", presentation_available
+              ? Json(mfgunlock::presentation::ConfidenceName(presentation.confidence))
+              : Json(nullptr)},
+          {"health", presentation_available
+              ? Json(mfgunlock::presentation::HealthName(presentation.health))
+              : Json(nullptr)},
+          {"evidence_reason", presentation_available
+              ? Json(mfgunlock::presentation::EvidenceReasonName(presentation.evidence_reason))
+              : Json(nullptr)},
+          {"source_presents", presentation_available
+              ? Json(presentation.correlated_source_presents) : Json(nullptr)},
+          {"provider_presented_frames", presentation_available
+              ? Json(presentation.correlated_provider_presented) : Json(nullptr)},
+          {"presented_interpolated_frames",
+              presentation_available && presentation.presented_interpolated_known
+                  ? Json(presentation.presented_interpolated_frames) : Json(nullptr)},
+          {"dropped_interpolated_estimate",
+              presentation_available && presentation.dropped_interpolated_known
+                  ? Json(presentation.dropped_interpolated_frames) : Json(nullptr)},
+          {"swap_effect",
+              presentation_available && presentation.swap_effect_known
+                  ? Json(mfgunlock::presentation::SwapEffectName(presentation.swap_effect))
+                  : Json(nullptr)},
+          {"window_mode",
+              presentation_available && presentation.window_mode_known
+                  ? Json(mfgunlock::presentation::WindowModeName(presentation.window_mode))
+                  : Json(nullptr)},
+          {"waitable_swapchain",
+              presentation_available && presentation.waitable_flag_known
+                  ? Json(presentation.waitable_flag != 0) : Json(nullptr)},
+          {"waitable_object",
+              presentation_available && presentation.waitable_object_known
+                  ? Json(presentation.waitable_object_available != 0) : Json(nullptr)},
+          {"max_frame_latency",
+              presentation_available && presentation.max_frame_latency_known
+                  ? Json(presentation.max_frame_latency) : Json(nullptr)},
+          {"window_mode_transitions", presentation_available
+              ? Json(presentation.window_mode_transition_count) : Json(nullptr)},
+          {"max_frame_latency_changes", presentation_available
+              ? Json(presentation.max_frame_latency_change_count) : Json(nullptr)},
+          {"allow_tearing_creation_flag",
+              presentation_available && presentation.allow_tearing_flag_known
+                  ? Json(presentation.allow_tearing_flag != 0) : Json(nullptr)},
+          {"sync_interval", nullptr},
+          {"present_flags", nullptr},
+          {"iflip", nullptr},
+          {"frame_id_continuity", verdict_json(state.frame_contract)},
+          {"pcl_present_marker_mismatches", state.present_marker_mismatches},
+          {"pcl_constants_marker_mismatches", state.constants_marker_mismatches},
+          {"reflex_missing_reported", state.dlssg_status_known
+              ? Json(state.fail_reflex_missing != 0) : Json(nullptr)},
+          {"reflex_runtime_detected", nullptr},
+      }},
+      {"runtime_lifecycle", runtime_lifecycle_available ? Json{
+          {"phase", mfgunlock::runtime::PhaseName(runtime_lifecycle.phase)},
+          {"last_event", mfgunlock::runtime::EventName(runtime_lifecycle.last_event)},
+          {"fallback_reason", mfgunlock::runtime::FallbackReasonName(runtime_lifecycle.fallback_reason)},
+          {"revision", runtime_lifecycle.revision},
+          {"target_sm", runtime_lifecycle.target_sm ? Json(runtime_lifecycle.target_sm) : Json(nullptr)},
+          {"provider_backend", provider_backend_json(runtime_lifecycle.provider_backend)},
+          {"backend_capability_bits", runtime_lifecycle.backend_capability_bits},
+          {"allowed_capability_bits", runtime_lifecycle.allowed_capability_bits},
+          {"device_known", runtime_lifecycle.device_known != 0},
+          {"device_generation", runtime_lifecycle.device_generation},
+          {"swapchain_alive", runtime_lifecycle.swapchain_alive != 0},
+          {"swapchain_generation", runtime_lifecycle.swapchain_generation},
+          {"provider_known", runtime_lifecycle.provider_known != 0},
+          {"provider_module", runtime_lifecycle.provider_known ? Json(runtime_lifecycle.provider_module) : Json(nullptr)},
+          {"provider_generation", runtime_lifecycle.provider_generation},
+          {"provider_profile_index", runtime_lifecycle.provider_profile_index
+              ? Json(runtime_lifecycle.provider_profile_index) : Json(nullptr)},
+          {"provider_inventory_qualified", runtime_lifecycle.provider_exact_qualified != 0},
+          {"provider_file_sha256_verified", nullptr},
+          {"provider_qualification", mfgunlock::profiles::QualificationName(
+              static_cast<mfgunlock::profiles::Qualification>(runtime_lifecycle.provider_qualification))},
+          {"ngx_epoch", runtime_lifecycle.ngx_epoch},
+          {"ngx_handles", runtime_lifecycle.ngx_handles},
+          {"ngx_tracking_uncertain", runtime_lifecycle.ngx_tracking_uncertain != 0},
+          {"streamline_state", runtime_lifecycle.streamline_state == mfgunlock::runtime::kUnknown32
+              ? Json(nullptr) : Json(runtime_lifecycle.streamline_state)},
+          {"restart_required", runtime_lifecycle.restart_required != 0},
+          {"live_unload_safe", runtime_lifecycle.live_unload_safe != 0},
+      } : Json(nullptr)},
+      {"advanced_features", advanced_features_json},
+      {"composition", composition_available ? Json{
+          {"api", composition.api == mfgunlock::composition::Api::kD3D12 ? "d3d12" :
+                  composition.api == mfgunlock::composition::Api::kVulkan ? "vulkan" : "unknown"},
+          {"generation", composition.generation},
+          {"application_present_callbacks", composition.source_present_calls},
+          {"before_effects_resource", composition.before_effects_resource
+              ? Json(composition.before_effects_resource) : Json(nullptr)},
+          {"after_effects_resource", composition.after_effects_resource
+              ? Json(composition.after_effects_resource) : Json(nullptr)},
+          {"effects_pair_observed", composition.effects_pair_observed != 0},
+          {"overlay_callbacks", composition.overlay_callbacks},
+          {"screenshot_event_available", composition.screenshot_event_available != 0},
+          {"screenshots_saved", composition.screenshots_saved},
+          {"generated_resource", nullptr},
+          {"ui_composed_pixels_verified", nullptr},
+          {"physical_display_cadence", nullptr},
+          {"obs_game_capture", nullptr},
+          {"obs_display_capture", nullptr},
+          {"desktop_duplication", nullptr},
+          {"capture_output_encoding", nullptr},
+          {"capture_evidence_reason", "external capture pixels are not observed by this addon"},
+      } : Json(nullptr)},
       {"integration_contract", {
           {"frame_index", verdict_json(state.frame_contract)},
           {"resources", verdict_json(state.resource_contract)},
@@ -1288,7 +1522,7 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
           {"probe_attempted", g_dynamic_probe_attempted.load(std::memory_order_acquire)},
           {"probe_result", g_dynamic_probe_result.load(std::memory_order_relaxed) == UINT32_MAX
               ? Json(nullptr) : Json(g_dynamic_probe_result.load(std::memory_order_relaxed))}}},
-      {"notes", "Read-only diagnostic boundary. NGX D3D12 Evaluate events are exact provider-call observations, "
+      {"notes", "Read-only diagnostic boundary. NGX Evaluate events are provider-call observations, not GPU completion, "
                 "but generated candidates are not proof of displayed pixels because Streamline pacing may drop them. "
                 "Legacy tags have no explicit frame ID. Format does not establish color encoding. "
                 "Other addon wrappers may be downstream. The optional one-shot Dynamic MFG probe "
@@ -1510,7 +1744,7 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
         {"resource_capture", "metadata only: resource state and pacer synchronization are not verified"},
         {"replay", "gated: raw resources, standalone provider initialization and synchronization are incomplete"},
         {"backend_support", {{"d3d12", "NGX Evaluate metadata/classification + metadata capture"},
-                             {"vulkan", "frame-count/parameter trace only"},
+                             {"vulkan", "NGX create/evaluate/release + scalar metadata; resource contents unverified"},
                              {"d3d11", "Streamline trace only when observed"}}},
         {"core_state", core_state},
     };
@@ -1520,7 +1754,7 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
     if (g_evaluate_capture.Snapshot(capture_begin, capture_end)) {
       std::unordered_map<uint64_t, uint64_t> capture_ids;
       manifest = {
-          {"schema", 2}, {"capture", "one_shot_ngx_d3d12_evaluate_metadata"},
+          {"schema", 2}, {"capture", "one_shot_ngx_evaluate_metadata"},
           {"provider", {{"module", ModuleInfo(provider_module)},
                          {"sha256", provider_sha256.empty() ? Json(nullptr) : Json(provider_sha256)}}},
           {"streamline", {{"interposer", ModuleInfo(GetModuleHandleW(L"sl.interposer.dll"))},
@@ -1529,16 +1763,16 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
           {"evaluate_begin", BridgeEvaluateJson(capture_begin, capture_ids)},
           {"evaluate_end", BridgeEvaluateJson(capture_end, capture_ids)},
           {"resource_contents_captured", false},
-          {"resource_capture_reason", "D3D12 resource states and Streamline asynchronous pacer ownership are not verified at this observer boundary"},
+          {"resource_capture_reason", "GPU resource contents and asynchronous ownership are not verified at this observer boundary"},
           {"replay", {{"status", "gated"},
                        {"missing", Json::array({"exact resource contents", "verified standalone DLSS-G initialization context", "verified resource-state/synchronization contract", "Streamline pacer context"})}}},
       };
     }
     summary["evaluate_capture_count"] = manifest.is_null() ? 0 : 1;
 
-    wchar_t temporary[MAX_PATH]{};
-    if (GetTempPathW(MAX_PATH, temporary) == 0) throw std::runtime_error("Cannot locate TEMP");
-    const auto directory = std::filesystem::path(temporary) / "MFGUnlock-Diagnostics";
+    const auto addon_path = ModulePath(static_cast<HMODULE>(pinned_module));
+    if (addon_path.empty()) throw std::runtime_error("Cannot locate diagnostics addon directory");
+    const auto directory = std::filesystem::path(addon_path).parent_path() / "mfg-diagnostics";
     std::filesystem::create_directories(directory);
     const std::string stem = std::string(kLabels[g_recorded_label]) + "-" +
         std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64());

@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <type_traits>
 
 using namespace mfgunlock;
 
@@ -211,6 +213,46 @@ sl::Result RealSupport(sl::Feature feature, const sl::AdapterInfo&) {
       : sl::Result::eErrorAdapterNotSupported;
 }
 
+bool g_legacy_discovery_result = false;
+unsigned int g_legacy_discovery_calls = 0;
+sl::Feature g_legacy_discovery_feature = 0;
+bool DiscoverySupport(sl::Feature feature, uint32_t* mask) {
+  ++g_legacy_discovery_calls;
+  g_legacy_discovery_feature = feature;
+  if (g_legacy_discovery_result && mask) *mask = 5;
+  SetLastError(1234);
+  return g_legacy_discovery_result;
+}
+bool g_set_enabled_argument = false;
+bool DiscoveryEnabled(sl::Feature feature) { return DiscoverySupport(feature, nullptr); }
+bool DiscoverySetEnabled(sl::Feature feature, bool enabled) {
+  g_set_enabled_argument = enabled;
+  return DiscoverySupport(feature, nullptr);
+}
+bool DiscoverySettings(sl::Feature feature, const void*, void*) { return DiscoverySupport(feature, nullptr); }
+unsigned int g_passive_lookups = 0;
+unsigned int g_passive_loads = 0;
+unsigned int g_passive_starts = 0;
+const char kPassiveJson[] = "{\"supportedAdapters\":0,\"name\":\"sl.dlss\"}";
+bool PassiveLoad(sl::param::IParameters*, const char*, const char** output) {
+  ++g_passive_loads;
+  if (output) *output = kPassiveJson;
+  SetLastError(4567);
+  return g_legacy_discovery_result;
+}
+static_assert(std::is_same_v<decltype(&PassiveLoad), streamline_internal::LoadFn>);
+bool PassiveStartup(const char*, void*) {
+  ++g_passive_starts;
+  SetLastError(5678);
+  return g_legacy_discovery_result;
+}
+void* PassiveGateway(const char* name) {
+  ++g_passive_lookups;
+  SetLastError(6789);
+  if (!std::strcmp(name, "slOnPluginLoad")) return reinterpret_cast<void*>(PassiveLoad);
+  if (!std::strcmp(name, "slOnPluginStartup")) return reinterpret_cast<void*>(PassiveStartup);
+  return nullptr;
+}
 unsigned int g_legacy_init_calls = 0;
 int g_legacy_application_id = 0;
 bool g_legacy_result = true;
@@ -263,7 +305,9 @@ bool RealStartup(const char*, void*) {
 
 void Unrelated() {}
 
+unsigned int g_gateway_lookups = 0;
 void* RealGateway(const char* name) {
+  ++g_gateway_lookups;
   if (!name) return nullptr;
   if (std::strcmp(name, "slOnPluginLoad") == 0) return reinterpret_cast<void*>(&RealLoad);
   if (std::strcmp(name, "slOnPluginStartup") == 0) return reinterpret_cast<void*>(&RealStartup);
@@ -301,7 +345,163 @@ void ResetParameters(int available, int maximum, int needs_driver,
 
 }  // namespace
 
-int main() {
+
+std::vector<unsigned char> VersionNode(const std::u16string& key, uint16_t type,
+    const std::vector<unsigned char>& value,
+    const std::vector<std::vector<unsigned char>>& children = {}) {
+  std::vector<unsigned char> result(6, 0);
+  for (const auto ch : key) { result.push_back(static_cast<unsigned char>(ch)); result.push_back(ch >> 8); }
+  result.insert(result.end(), 2, 0);
+  while (result.size() % 4) result.push_back(0);
+  result.insert(result.end(), value.begin(), value.end());
+  for (const auto& child : children) {
+    while (result.size() % 4) result.push_back(0);
+    result.insert(result.end(), child.begin(), child.end());
+  }
+  const uint16_t length = static_cast<uint16_t>(result.size());
+  const uint16_t count = static_cast<uint16_t>(type == 1 ? value.size() / 2 : value.size());
+  std::memcpy(result.data(), &length, 2);
+  std::memcpy(result.data() + 2, &count, 2);
+  std::memcpy(result.data() + 4, &type, 2);
+  return result;
+}
+std::vector<unsigned char> VersionText(const std::u16string& text) {
+  std::vector<unsigned char> value;
+  for (auto ch : text) { value.push_back(static_cast<unsigned char>(ch)); value.push_back(ch >> 8); }
+  value.insert(value.end(), 2, 0);
+  return value;
+}
+void DisplayVersionTests() {
+  using namespace streamline_internal;
+  const auto module = Module(0x123456);
+  SetVersion(module, 1, 0);
+  const auto fixed_blob = mock::resources[module];
+  const std::vector<unsigned char> fixed(fixed_blob.begin() + 40, fixed_blob.end());
+  const auto make = [&](const std::u16string& value) {
+    return VersionNode(u"VS_VERSION_INFO", 0, fixed,
+        {VersionNode(u"StringFileInfo", 1, {},
+          {VersionNode(u"040904b0", 1, {}, {VersionNode(u"FileVersion", 1, VersionText(value))})})});
+  };
+  mock::resources[module] = make(u"1.5.4.0");
+  Check(ReadModuleVersion(module).minor == 0, "fixed version retained as raw metadata");
+  const auto display = ReadModuleDisplayVersion(module);
+  Check(display.major == 1 && display.minor == 5 && display.build == 4 && display.revision == 0,
+        "StringFileInfo preferred for diagnostic version");
+  for (const auto* value : {u"1, 5, 4, 0", u" 1.5.4.0 ", u"1.5.4.65535"}) {
+    mock::resources[module] = make(value);
+    Check(ReadModuleDisplayVersion(module).minor == 5, "comma/space version syntax");
+  }
+  for (const auto* value : {u"1.5.4.65536", u"1.5.4.0oops", u"1..4.0", u"1.5.4", u"garbage"}) {
+    mock::resources[module] = make(value);
+    Check(ReadModuleDisplayVersion(module).minor == 0, "malformed display falls back to fixed");
+  }
+  auto valid = make(u"1.5.4.0");
+  for (size_t bytes = 0; bytes < valid.size(); ++bytes) {
+    mock::resources[module].assign(valid.begin(), valid.begin() + bytes);
+    Check(ReadModuleDisplayVersion(module).minor != 5, "truncated resource never exposes string version");
+  }
+  mock::resources[module] = VersionNode(u"VS_VERSION_INFO", 0, fixed,
+      {VersionNode(u"StringFileInfo", 1, {}, {VersionNode(u"040904b0", 1, {},
+        {VersionNode(u"FileVersion", 1, VersionText(u"1.5.4.0")),
+         VersionNode(u"FileVersion", 1, VersionText(u"99.1.0.0"))})})});
+  Check(ReadModuleDisplayVersion(module).minor == 0, "ambiguous display versions fall back");
+  mock::resources[module] = fixed_blob;
+  Check(ReadModuleDisplayVersion(module).major == 1, "fixed-only resource fallback");
+  mock::resources.erase(module);
+  Check(ReadModuleDisplayVersion(module).major == 0, "absent version stays unknown");
+  // All offsets in the parser are relative; arbitrary input alignment is valid.
+  valid.insert(valid.begin(), 0);
+  bool found = false;
+  unsigned budget = 256;
+  ModuleVersion unaligned;
+  Check(FindDisplayVersion(std::span<const unsigned char>(valid).subspan(1), 0,
+      valid.size() - 1, 0, false, budget, found, unaligned) && found && unaligned.minor == 5,
+      "unaligned resource byte buffer");
+}
+void TestDiscoveryPassThrough() {
+  const auto state = streamline_internal::g_lifecycle_state.load();
+  const auto maintenance = g_provider_maintenance_calls;
+  const auto binds = g_plugin_bound_calls;
+  const auto unloads = g_plugin_unloaded_calls;
+  const auto scope = ngx_internal::g_arch_scope;
+  mock::readable_regions[reinterpret_cast<uintptr_t>(kPassiveJson)] = sizeof(kPassiveJson);
+  Check(streamline_internal::DiscoveryJson(kPassiveJson) == kPassiveJson, "bounded JSON exact read");
+  Check(streamline_internal::DiscoveryJson(nullptr) == "NULL", "null JSON is not dereferenced");
+  Check(streamline_internal::DiscoveryJson(reinterpret_cast<const char*>(1)) == "<UNREADABLE>",
+        "unmapped JSON not dereferenced");
+  std::string large(5000, 'a');
+  mock::readable_regions[reinterpret_cast<uintptr_t>(large.data())] = large.size();
+  Check(streamline_internal::DiscoveryJson(large.data()) == std::string(4096, 'a') + "<TRUNCATED>",
+        "diagnostic JSON is capped");
+  mock::readable_regions.erase(reinterpret_cast<uintptr_t>(large.data()));
+
+  auto sr = Module(0x5158);
+  mock::modules[L"sl.dlss.dll"] = sr;
+  mock::paths[sr] = L"X:\\fixture\\sl.dlss.dll";
+  mock::exports[{sr, "slGetPluginFunction"}] = Proc(PassiveGateway);
+  mock::allocation[reinterpret_cast<const void*>(Proc(PassiveGateway))] = sr;
+  const auto before = g_passive_lookups;
+  Check(streamline_internal::BindPlugin(sr, Proc(PassiveGateway)) == Proc(PassiveGateway),
+        "SR observer returns native gateway");
+  Check(g_passive_lookups == before && g_plugin_bound_calls == binds,
+        "passive bind neither probes gateway nor publishes a FG bind");
+  auto& runtime = streamline_internal::g_plugins[1];
+  Check(runtime.module == sr && runtime.role == streamline_internal::PluginRole::kSr,
+        "SR observer occupies the existing role-tagged registry");
+  auto gateway = reinterpret_cast<streamline_internal::GatewayFn>(runtime.gateway_hook.replacement.load());
+  Check(gateway && gateway("slOnPluginLoad") == reinterpret_cast<void*>(PassiveLoad) && GetLastError() == 6789,
+        "SR load callback lookup preserves pointer and LastError");
+  Check(gateway("slOnPluginStartup") == reinterpret_cast<void*>(PassiveStartup) && GetLastError() == 6789,
+        "SR startup callback lookup preserves pointer and LastError");
+  auto load = reinterpret_cast<streamline_internal::LoadFn>(runtime.load_hook.replacement.load());
+  auto startup = reinterpret_cast<streamline_internal::StartupFn>(runtime.startup_hook.replacement.load());
+  const char* output = nullptr;
+  g_legacy_discovery_result = true;
+  Check(load && load(nullptr, kPassiveJson, &output) && output == kPassiveJson && g_passive_loads == 1 && GetLastError() == 4567,
+        "SR onLoad original result, output pointer, call count and LastError");
+  Check(startup && startup(kPassiveJson, nullptr) && g_passive_starts == 1 && GetLastError() == 5678,
+        "SR startup original result, count and LastError");
+  g_legacy_discovery_result = false;
+  Check(!load(nullptr, kPassiveJson, &output) && g_passive_loads == 2 && GetLastError() == 4567,
+        "SR load rejection is not changed to success");
+  Check(!startup(kPassiveJson, nullptr) && g_passive_starts == 2 && GetLastError() == 5678,
+        "SR startup rejection is preserved");
+  const auto repeat_count = g_passive_lookups;
+  Check(streamline_internal::BindPlugin(sr, Proc(PassiveGateway)) == Proc(PassiveGateway) &&
+        g_passive_lookups == repeat_count, "passive repeated attach is idempotent");
+  Check(streamline_internal::g_lifecycle_state.load() == state &&
+        g_provider_maintenance_calls == maintenance && ngx_internal::g_arch_scope == scope,
+        "SR diagnostics do not mutate FG lifecycle, prepare providers or change spoof scope");
+  mock::module_current[runtime.gateway_hook.identity.module] = false;
+  streamline_internal::RefreshPluginLifetimes();
+  Check(!runtime.module && g_plugin_unloaded_calls == unloads &&
+        streamline_internal::g_lifecycle_state.load() == state,
+        "SR unload cannot publish FG unload");
+  mock::module_current[reinterpret_cast<HMODULE>(Proc(PassiveGateway))] = true;
+  mock::install_ok = false;
+  streamline_internal::BindPlugin(sr, Proc(PassiveGateway));
+  Check(!runtime.module && runtime.role == streamline_internal::PluginRole::kFg,
+        "failed passive hook cannot leave an SR role in a slot later used by FG");
+  mock::install_ok = true;
+  mock::readable_regions.clear();
+}
+
+int main(int argc, char** argv) {
+  if (argc == 3 && std::strcmp(argv[1], "--version-resource") == 0) {
+    std::ifstream input(argv[2], std::ios::binary | std::ios::ate);
+    if (!input || input.tellg() < 0 || input.tellg() > 65535) return 2;
+    std::vector<unsigned char> bytes(static_cast<size_t>(input.tellg()));
+    input.seekg(0);
+    if (!input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) return 2;
+    const auto module = Module(0x123456);
+    mock::resources[module] = bytes;
+    const auto fixed = streamline_internal::ReadModuleVersion(module);
+    const auto display = streamline_internal::ReadModuleDisplayVersion(module);
+    std::cout << "fixed=" << fixed.major << '.' << fixed.minor << '.' << fixed.build << '.' << fixed.revision
+              << " display=" << display.major << '.' << display.minor << '.' << display.build << '.' << display.revision << '\n';
+    return 0;
+  }
+  DisplayVersionTests();
   g_enabled = true;
   architecture::Configure(Architecture::kAmpere);
   mfgunlock::provider::g_test_prepared_count = 1;
@@ -370,9 +570,9 @@ int main() {
   const auto vulkan_before = g_vulkan_requirement_calls;
   ngx_internal::VulkanRequirements<0>(nullptr, nullptr, &discovery, &requirements);
   Check(g_vulkan_requirement_calls == vulkan_before + 1 &&
-            requirements.FeatureSupported == 0 &&
-            requirements.MinHWArchitecture == architecture::kAmpereArchitecture,
-        "Vulkan requirements use the same policy");
+            requirements.FeatureSupported == g_requirement_flags &&
+            requirements.MinHWArchitecture == g_requirement_architecture,
+        "Vulkan cannot inherit a DXGI binding without its own physical identity");
 
   ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
   ngx_internal::ApplyCapabilities(&g_parameters, 3);
@@ -381,6 +581,19 @@ int main() {
         "eligible provider exposes frame generation");
   Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 3,
         "capability maximum raised to verified limit");
+
+  ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
+  ngx_internal::ApplyCapabilities(&g_parameters, 0);
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1,
+        "base FG is admitted after preparation even when optional MFG count is unavailable");
+  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 1,
+        "admitting base FG does not invent a higher frame count");
+  mfgunlock::provider::g_test_prepared_count = 0;
+  ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
+  ngx_internal::ApplyCapabilities(&g_parameters, 3);
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 0,
+        "requested count alone cannot claim successful provider preparation");
+  mfgunlock::provider::g_test_prepared_count = 1;
 
   ResetParameters(0, 1, 1);
   ngx_internal::ApplyCapabilities(&g_parameters, 3);
@@ -401,6 +614,27 @@ int main() {
   ngx_internal::ApplyCapabilities(&g_parameters, 5, 0);
   Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 5,
         "direct NGX capability path has no Streamline ceiling");
+
+  architecture::Configure(Architecture::kAda);
+  ResetParameters(1, 1, 0);
+  ngx_internal::ApplyCapabilities(&g_parameters, 3);
+  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 3,
+        "native Ada capability bridge raises the MFG count without provider retargeting");
+
+  ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
+  ngx_internal::ApplyCapabilities(&g_parameters, 3);
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 0,
+        "native Ada capability bridge never overrides native FG admission");
+
+  ResetParameters(1, 1, 0);
+  g_provider_maintenance_calls = 0;
+  NVSDK_NGX_Parameter* ada_output_parameters = nullptr;
+  Check(ngx_internal::Capabilities<0, 0>(&ada_output_parameters) == NVSDK_NGX_Result_Success &&
+            ada_output_parameters == &g_parameters && g_provider_maintenance_calls == 2,
+        "native Ada executes the NGX capability bridge");
+  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 3,
+        "native Ada capability wrapper exposes the verified MFG count");
+  architecture::Configure(Architecture::kAmpere);
 
   ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
   g_provider_maintenance_calls = 0;
@@ -486,6 +720,26 @@ int main() {
   Check(g_release_architecture == architecture::kAmpereArchitecture,
         "Ampere NGX Release keeps native execution architecture");
 
+  output_handle = nullptr;
+  ngx_internal::Create<0>(nullptr, NVSDK_NGX_Feature_FrameGeneration, nullptr, &output_handle);
+  const auto lifecycle_before_device_reset = ngx_internal::LifecycleSnapshot();
+  Check(output_handle == &g_handle && lifecycle_before_device_reset.handles == 1,
+        "device recreation fixture starts with one tracked FG handle");
+  Check(mfgunlock::ngx::ResetFeatureTrackingForDeviceRecreation(),
+        "quiescent device recreation invalidates NGX handle ownership");
+  const auto lifecycle_after_device_reset = ngx_internal::LifecycleSnapshot();
+  Check(!ngx_internal::IsTracked(runtime, &g_handle) &&
+            lifecycle_after_device_reset.handles == 0 &&
+            lifecycle_after_device_reset.epoch == lifecycle_before_device_reset.epoch + 1 &&
+            !mfgunlock::ngx::g_status.feature_created.load() &&
+            !mfgunlock::ngx::g_status.feature_active.load(),
+        "device recreation clears stale NGX feature state and advances epoch");
+  output_handle = nullptr;
+  ngx_internal::Create<0>(nullptr, NVSDK_NGX_Feature_FrameGeneration, nullptr, &output_handle);
+  Check(output_handle == &g_handle && ngx_internal::IsTracked(runtime, &g_handle),
+        "FG feature can be recreated after device-owned state invalidation");
+  ngx_internal::Release<0>(&g_handle);
+
   architecture::Configure(Architecture::kTuring);
   g_architecture = architecture::kTuringArchitecture;
   output_handle = nullptr;
@@ -543,30 +797,83 @@ int main() {
         "modern slInit observes DLSS-G in featuresToLoad");
 
   const auto interposer = Module(0x5151);
+  mock::modules[L"sl.common.dll"] = Module(0x5152);
   mock::modules[L"sl.interposer.dll"] = interposer;
   mock::paths[interposer] = L"X:\\fixture\\sl.interposer.dll";
   SetVersion(interposer, 1, 5);
   mock::exports[{interposer, "slInit"}] = Proc(RealLegacyInit);
+  for (const char* name : {"slShutdown", "slSetTag", "slEvaluateFeature",
+                           "slGetFeatureSettings", "slSetFeatureConstants"})
+    mock::exports[{interposer, name}] = Proc(Unrelated);
+  mock::exports[{interposer, "slSetFeatureEnabled"}] = Proc(DiscoverySetEnabled);
+  mock::allocation[reinterpret_cast<const void*>(Proc(DiscoverySetEnabled))] = interposer;
+  mock::exports[{interposer, "slIsFeatureSupported"}] = Proc(DiscoverySupport);
+  mock::exports[{interposer, "slIsFeatureEnabled"}] = Proc(DiscoveryEnabled);
+  mock::exports[{interposer, "slGetFeatureSettings"}] = Proc(DiscoverySettings);
+  for (auto function : {Proc(DiscoverySupport), Proc(DiscoveryEnabled), Proc(DiscoverySettings)})
+    mock::allocation[reinterpret_cast<const void*>(function)] = interposer;
+  mock::allocation[reinterpret_cast<const void*>(Proc(RealLegacyInit))] = interposer;
+  mock::allocation[reinterpret_cast<const void*>(Proc(Unrelated))] = interposer;
   Check(streamline_internal::GetInterposerAbi(interposer) == streamline_internal::InterposerAbi::kLegacy,
         "Streamline 1.x ABI detected");
   Check(!mfgunlock::streamline::CanHookInit(interposer), "legacy slInit excluded from modern ABI hook");
   streamline_internal::InstallLegacyInitHook();
   Check(streamline_internal::g_legacy_init_hooked.load() && streamline_internal::g_real_legacy_init == RealLegacyInit,
         "legacy slInit hook installed");
+  Check(streamline_internal::g_real_legacy_support == DiscoverySupport &&
+        streamline_internal::g_real_legacy_enabled == DiscoveryEnabled &&
+        streamline_internal::g_real_legacy_settings == DiscoverySettings,
+        "legacy query diagnostics bind the actual bool ABI exports");
+  uint32_t discovery_mask = 0xfeed;
+  g_legacy_discovery_result = false;
+  const auto discovery_calls = g_legacy_discovery_calls;
+  Check(!streamline_internal::HookedLegacySupport(0, &discovery_mask) && discovery_mask == 0xfeed &&
+        GetLastError() == 1234 && g_legacy_discovery_calls == discovery_calls + 1,
+        "support failure preserves mask, false, LastError and single native call");
+  g_legacy_discovery_result = true;
+  Check(streamline_internal::HookedLegacySupport(0, &discovery_mask) && discovery_mask == 5 &&
+        GetLastError() == 1234, "support success preserves adapter mask and bool result");
+  Check(streamline_internal::HookedLegacySupport(0, nullptr), "support null mask stays legal");
+  Check(streamline_internal::HookedLegacyEnabled(0) && GetLastError() == 1234,
+        "enabled query pass-through");
+  g_legacy_discovery_result = false;
+  Check(!streamline_internal::HookedLegacySettings(0, nullptr, nullptr) && GetLastError() == 1234,
+        "settings failure pass-through");
+  Check(!streamline_internal::HookedLegacySetEnabled(0, true) && g_set_enabled_argument &&
+        GetLastError() == 1234, "feature-enable request and rejected native result both preserved");
+  const auto sr_budget = streamline_internal::g_legacy_query_traces[0].load();
+  streamline_internal::HookedLegacySupport(3, nullptr);
+  Check(streamline_internal::g_legacy_query_traces[0].load() == sr_budget,
+        "Reflex query does not exhaust SR diagnostic budget");
   streamline_internal::LegacyPreferences legacy_preferences{};
   Check(streamline_internal::HookedLegacyInit(legacy_preferences, 77) == g_legacy_result &&
             g_legacy_init_calls == 1 && g_legacy_application_id == 77,
         "legacy slInit preserves bool result and application id");
 
   SetVersion(interposer, 2, 12);
+  mock::exports.erase({interposer, "slGetFeatureSettings"});
+  mock::exports.erase({interposer, "slSetFeatureConstants"});
+  mock::exports[{interposer, "slInit"}] = Proc(RealInit);
   mock::exports[{interposer, "slGetFeatureFunction"}] = Proc(Unrelated);
+  mock::exports[{interposer, "slGetFeatureVersion"}] = Proc(Unrelated);
   mock::exports[{interposer, "slIsFeatureSupported"}] = Proc(RealSupport);
   mock::exports[{interposer, "slGetFeatureRequirements"}] = Proc(RealFeatureRequirements);
   mock::exports[{interposer, "slIsFeatureLoaded"}] = Proc(RealFeatureLoaded);
   mock::exports[{interposer, "slSetD3DDevice"}] = Proc(RealSetD3DDevice);
+  mock::allocation[reinterpret_cast<const void*>(Proc(RealInit))] = interposer;
+  mock::allocation[reinterpret_cast<const void*>(Proc(RealFeatureRequirements))] = interposer;
+  SetVersion(interposer, 3, 0);
+  Check(streamline_internal::GetInterposerAbi(interposer) == streamline_internal::InterposerAbi::kModern,
+        "new file version retains complete modern export contract");
+  SetVersion(interposer, 2, 12);
   Check(streamline_internal::GetInterposerAbi(interposer) == streamline_internal::InterposerAbi::kModern &&
             mfgunlock::streamline::CanHookInit(interposer),
         "modern Streamline ABI admitted separately");
+  mock::modules.erase(L"sl.common.dll");
+  Check(mfgunlock::streamline::CanHookInit(interposer) &&
+            !mfgunlock::streamline::FullModernContractReady(interposer),
+        "modern init hook precedes common without qualifying full contract");
+  mock::modules[L"sl.common.dll"] = Module(0x5152);
   streamline_internal::InstallSupportHook();
   Check(streamline_internal::g_support_hooked.load() &&
             streamline_internal::g_real_support == RealSupport,
@@ -590,6 +897,15 @@ int main() {
             sl::Result::eOk && g_set_device_calls == 1 &&
             streamline_internal::g_set_device_completed.load(),
         "slSetD3DDevice result preserved and phase recorded");
+  mfgunlock::streamline::NotifyD3D12DeviceRecreated();
+  Check(streamline_internal::g_d3d12_device_observed.load() &&
+            !streamline_internal::g_set_device_active.load() &&
+            !streamline_internal::g_set_device_completed.load(),
+        "device recreation invalidates Streamline device-owned evidence");
+  Check(streamline_internal::HookedSetD3DDevice(reinterpret_cast<void*>(0x5678)) ==
+            sl::Result::eOk && g_set_device_calls == 2 &&
+            streamline_internal::g_set_device_completed.load(),
+        "Streamline device evidence can be rebuilt after recreation");
   sl::AdapterInfo adapter_info{};
   adapter_info.deviceLUID = &g_luid;
   adapter_info.deviceLUIDSizeInBytes = sizeof(g_luid);
@@ -622,7 +938,9 @@ int main() {
 
   const auto plugin_module = Module(0x6161);
   mock::paths[plugin_module] = L"X:\\fixture\\sl.dlss_g.dll";
-  SetVersion(plugin_module, 2, 12);
+  SetVersion(plugin_module, 99, 42);
+  mock::exports[{plugin_module, "slGetPluginFunction"}] = Proc(RealGateway);
+  mock::allocation[reinterpret_cast<const void*>(Proc(RealGateway))] = plugin_module;
   mfgunlock::streamline::g_on_dlssg_plugin_bound = ObservePlugin;
   mfgunlock::streamline::g_on_dlssg_plugin_unloaded = ObservePluginUnload;
   Check(streamline_internal::BindPlugin(plugin_module, Proc(RealGateway)) == Proc(RealGateway),
@@ -631,6 +949,11 @@ int main() {
         "plugin binding publishes the active Streamline module");
   auto& plugin = streamline_internal::g_plugins[0];
   Check(plugin.gateway_hook.installed.load(), "plugin gateway detour installed");
+  const auto prior_lookups = g_gateway_lookups;
+  Check(prior_lookups != 0, "initial binding probes vendor gateway");
+  Check(streamline_internal::BindPlugin(plugin_module, Proc(RealGateway)) == Proc(RealGateway) &&
+            g_plugin_bound_calls == 1 && g_gateway_lookups == prior_lookups,
+        "repeated plugin attach performs zero vendor lookups and callbacks");
   auto gateway = reinterpret_cast<streamline_internal::GatewayFn>(
       plugin.gateway_hook.replacement.load(std::memory_order_acquire));
   Check(gateway && gateway("slOnPluginLoad") == RealGateway("slOnPluginLoad") &&
@@ -673,6 +996,12 @@ int main() {
             streamline_internal::g_lifecycle_state.load() ==
                 streamline_internal::LifecycleState::kUnloaded,
         "plugin disappearance clears lifecycle hooks and publishes unload");
+  mock::module_current[reinterpret_cast<HMODULE>(Proc(RealGateway))] = true;
+  Check(streamline_internal::BindPlugin(plugin_module, Proc(RealGateway)) == Proc(RealGateway) &&
+            plugin.gateway_hook.installed.load() && g_plugin_bound_calls == 2,
+        "plugin reload binds a fresh gateway after stale pointers were discarded");
+
+  TestDiscoveryPassThrough();
 
   mfgunlock::streamline::Shutdown();
   Check(!plugin.gateway_hook.installed.load() && !plugin.load_hook.installed.load() &&
@@ -717,6 +1046,8 @@ int main() {
   const auto ada_plugin = Module(0x8181);
   mock::paths[ada_plugin] = L"X:\\fixture\\sl.dlss_g.dll";
   SetVersion(ada_plugin, 2, 14);
+  mock::exports[{ada_plugin, "slGetPluginFunction"}] = Proc(RealGateway);
+  mock::allocation[reinterpret_cast<const void*>(Proc(RealGateway))] = ada_plugin;
   mfgunlock::streamline::g_on_dlssg_plugin_bound = ObservePlugin;
   Check(streamline_internal::BindPlugin(ada_plugin, Proc(RealGateway)) == Proc(RealGateway),
         "Ada binds the native DLSS-G lifecycle gateway");
@@ -740,7 +1071,32 @@ int main() {
                 streamline_internal::LifecycleState::kStartupSucceeded,
         "Ada plugin lifecycle stays native and reaches STARTUP_SUCCEEDED");
   mfgunlock::streamline::Shutdown();
+  mfgunlock::streamline::Initialize(Module(0x9191));
+  Check(streamline_internal::LifecycleEnabled(),
+        "Streamline lifecycle can be initialized again after shutdown");
+  mfgunlock::streamline::Shutdown();
+  Check(!streamline_internal::g_support_hooked.load() &&
+            !streamline_internal::g_diagnostic_hooked.load(),
+        "repeated shutdown leaves no duplicate Streamline entry hooks");
 
+  const auto unloaded_ngx = Module(0x9991);
+  runtime.module = unloaded_ngx;
+  Check(mfgunlock::hook::CaptureModule(unloaded_ngx, runtime.identity),
+        "NGX unload fixture has a captured module identity");
+  runtime.entry_create = RealCreate;
+  mock::module_current[unloaded_ngx] = false;
+  mfgunlock::ngx::RefreshEntryLifetimes();
+  Check(runtime.module == nullptr && runtime.entry_create == nullptr,
+        "periodic NGX lifetime refresh invalidates stale entry pointers");
+
+  g_parameters.values["SuperSampling.Available"] = 0;
+  g_parameters.values["SuperSampling.FeatureInitResult"] = 0xbad;
+  const auto cap_values = g_parameters.values;
+  const auto cap_writes = g_parameters.writes;
+  SetLastError(9911);
+  ngx_internal::TraceCapabilityBlock("TEST", "NATIVE", &g_parameters, 1);
+  Check(g_parameters.values == cap_values && g_parameters.writes == cap_writes && GetLastError() == 9911,
+        "capability diagnostic only reads, never converts SR failure into success");
   std::cout << "host wrappers: " << g_checks
             << " checks PASS (mock APIs; no ABI/Detours/GPU test)\n";
   return 0;

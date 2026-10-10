@@ -31,6 +31,8 @@ inline FARPROC (*g_on_get_proc_address)(HMODULE, LPCSTR, FARPROC, const void*) =
 // so catch the interposer as it is mapped rather than hoping to beat it.
 inline void (*g_on_interposer_loaded)() = nullptr;
 inline void (*g_on_ngx_loaded)(HMODULE) = nullptr;
+// Diagnostic result observer; cannot influence discovery or the returned handle.
+inline void (*g_on_load_result)(LPCWSTR, HMODULE, DWORD, DWORD) noexcept = nullptr;
 inline std::atomic_bool g_hooked{false};
 
 namespace internal {
@@ -71,6 +73,33 @@ inline void Notify(HMODULE module, const wchar_t* path) {
   if (g_on_ngx_loaded && NameContains(path, L"nvngx.dll")) g_on_ngx_loaded(module);
 }
 
+using LoadLibraryExAFn = HMODULE(WINAPI*)(LPCSTR, HANDLE, DWORD);
+using LoadLibraryAFn = HMODULE(WINAPI*)(LPCSTR);
+inline LoadLibraryExAFn g_real_load_library_ex_a = nullptr;
+inline LoadLibraryAFn g_real_load_library_a = nullptr;
+inline void ObserveAnsiLoad(LPCSTR path, HMODULE module, DWORD flags, DWORD error) noexcept {
+  if (!g_on_load_result || !path) return;
+  // Names in this diagnostic are ASCII; the collector records resolved Unicode
+  // module paths. Never reinterpret/replace the argument passed to Windows.
+  wchar_t text[1025]{};
+  size_t n = 0;
+  for (; n < 1024 && path[n]; ++n) text[n] = static_cast<unsigned char>(path[n]);
+  g_on_load_result(text, module, flags, error);
+}
+inline HMODULE WINAPI HookedLoadLibraryExA(LPCSTR path, HANDLE file, DWORD flags) {
+  HMODULE module = g_real_load_library_ex_a(path, file, flags);
+  const DWORD error = GetLastError();
+  ObserveAnsiLoad(path, module, flags, error);
+  SetLastError(error);
+  return module;
+}
+inline HMODULE WINAPI HookedLoadLibraryA(LPCSTR path) {
+  HMODULE module = g_real_load_library_a(path);
+  const DWORD error = GetLastError();
+  ObserveAnsiLoad(path, module, 0, error);
+  SetLastError(error);
+  return module;
+}
 using LoadLibraryExWFn = HMODULE(WINAPI*)(LPCWSTR, HANDLE, DWORD);
 using LoadLibraryWFn = HMODULE(WINAPI*)(LPCWSTR);
 using GetProcAddressFn = FARPROC(WINAPI*)(HMODULE, LPCSTR);
@@ -86,6 +115,7 @@ inline HMODULE WINAPI HookedLoadLibraryExW(LPCWSTR file_name, HANDLE file, DWORD
   constexpr DWORD kDataOnly = LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE |
                               LOAD_LIBRARY_AS_IMAGE_RESOURCE | DONT_RESOLVE_DLL_REFERENCES;
   if ((flags & kDataOnly) == 0) Notify(module, file_name);
+  if (g_on_load_result) g_on_load_result(file_name, module, flags, last_error);
   SetLastError(last_error);
   return module;
 }
@@ -94,6 +124,7 @@ inline HMODULE WINAPI HookedLoadLibraryW(LPCWSTR file_name) {
   HMODULE module = g_real_load_library_w(file_name);
   const DWORD last_error = GetLastError();
   Notify(module, file_name);
+  if (g_on_load_result) g_on_load_result(file_name, module, 0, last_error);
   SetLastError(last_error);
   return module;
 }
@@ -106,16 +137,35 @@ inline FARPROC WINAPI HookedGetProcAddress(HMODULE module, LPCSTR name) {
     struct Guard {
       ~Guard() { resolving = false; }
     } guard;
+    const void* caller = _ReturnAddress();
     if (reinterpret_cast<uintptr_t>(name) > 0xffff &&
-        std::strcmp(name, "NVSDK_NGX_GetGPUArchitecture") == 0) Notify(module, nullptr);
+        std::strcmp(name, "NVSDK_NGX_GetGPUArchitecture") == 0) {
+      // Provider inspection resolves this export itself. Treating that lookup
+      // as a new load re-arms provider maintenance from inside its own scan.
+      // Filter only proven self-lookups; real LoadLibrary notifications and
+      // lookups from other/unknown callers must still reach the addon.
+      MEMORY_BASIC_INFORMATION caller_memory{}, self_memory{};
+      const bool own_lookup = caller &&
+          VirtualQuery(caller, &caller_memory, sizeof(caller_memory)) &&
+          VirtualQuery(reinterpret_cast<const void*>(&HookedGetProcAddress),
+                       &self_memory, sizeof(self_memory)) &&
+          caller_memory.Type == MEM_IMAGE && self_memory.Type == MEM_IMAGE &&
+          self_memory.AllocationBase != nullptr &&
+          caller_memory.AllocationBase == self_memory.AllocationBase;
+      if (!own_lookup) Notify(module, nullptr);
+    }
     if (g_on_get_proc_address)
-      resolved = g_on_get_proc_address(module, name, resolved, _ReturnAddress());
+      resolved = g_on_get_proc_address(module, name, resolved, caller);
   }
   SetLastError(last_error);
   return resolved;
 }
 
 inline const std::vector<hook::HookItem> kHooks = {
+    {"LoadLibraryA", reinterpret_cast<void**>(&g_real_load_library_a),
+     reinterpret_cast<void*>(&HookedLoadLibraryA)},
+    {"LoadLibraryExA", reinterpret_cast<void**>(&g_real_load_library_ex_a),
+     reinterpret_cast<void*>(&HookedLoadLibraryExA)},
     {"LoadLibraryExW", reinterpret_cast<void**>(&g_real_load_library_ex_w),
      reinterpret_cast<void*>(&HookedLoadLibraryExW)},
     {"LoadLibraryW", reinterpret_cast<void**>(&g_real_load_library_w),

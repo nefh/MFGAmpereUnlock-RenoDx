@@ -14,6 +14,13 @@ int main() {
   Check(pf::Find(p.timestamp, p.image_size) == &pf::kProfiles[0], "known metadata discovers profile");
   Check(!pf::Find(p.timestamp + 1, p.image_size), "timestamp mismatch");
   Check(!pf::Find(p.timestamp, p.image_size + 1), "image mismatch");
+  Check(pf::FindExact(p.timestamp, p.image_size, p.file_sha256) == &pf::kProfiles[0],
+        "exact file hash qualifies known profile");
+  Check(!pf::FindExact(p.timestamp, p.image_size,
+                       "0f6e90eb78b827927dff5b4ecc6b1c870c2e9bca29ed9f48c7d348cc9e170b82"),
+        "same metadata with different full-file hash is not exact-qualified");
+  Check(pf::IndexOf(&pf::kProfiles[0]) == 1 && pf::IndexOf(nullptr) == 0,
+        "stable profile index is available for diagnostics");
   for (auto sm : {75u, 86u, 89u}) Check(pf::AllowsTarget(p, sm), "qualified target");
   Check(!pf::AllowsTarget(p, 120), "Blackwell is not an addon retarget target");
   Check(p.retarget_payloads.size() == 70 && p.endpoint_payloads.size() == 39, "exact inventory sizes");

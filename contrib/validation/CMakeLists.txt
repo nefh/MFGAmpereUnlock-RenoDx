@@ -5,7 +5,15 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 include(CTest)
 
-set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+# Assertions are part of the test oracle, including Release/MSVC builds. Never
+# let NDEBUG turn a passing executable into an executable that checks nothing.
+if(MSVC)
+  add_compile_options(/UNDEBUG)
+else()
+  add_compile_options(-UNDEBUG)
+endif()
+
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(TEST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
 # Validation ReShade doubles intentionally omit RESHADE_API_VERSION while
@@ -16,7 +24,7 @@ add_compile_definitions(
   MFGUNLOCK_RESHADE_LOG_STYLE=2
   MFGUNLOCK_RESHADE_CONFIG_STYLE=1)
 
-foreach(test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test output_state_test)
+foreach(test assertions_enabled_test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test output_state_test presentation_observer_test runtime_lifecycle_test advanced_features_test composition_state_test ui_alpha_test ui_submission_test ui_alpha_backend_test)
   add_executable(${test} "${TEST_ROOT}/${test}.cpp")
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
@@ -27,22 +35,39 @@ endforeach()
 if(NOT WIN32)
   set(mock_dir "${CMAKE_CURRENT_BINARY_DIR}/host-mock-include")
   file(MAKE_DIRECTORY "${mock_dir}")
+  file(COPY "${TEST_ROOT}/host_mocks/vulkan" DESTINATION "${mock_dir}")
   file(GLOB mock_headers "${TEST_ROOT}/host_mocks/*.h" "${TEST_ROOT}/host_mocks/*.hpp")
   foreach(header IN LISTS mock_headers)
     get_filename_component(name "${header}" NAME)
     configure_file("${header}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
-  foreach(name architecture.hpp provider_profile.hpp feature_capabilities.hpp streamline_bridge.hpp ngx_bridge.hpp capability_policy.hpp
-               framecount.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp output_state.hpp quality_config.hpp)
+  foreach(name vulkan_contract.hpp vulkan_native.hpp architecture.hpp provider_profile.hpp feature_capabilities.hpp compatibility_foundation.hpp compatibility_runtime.hpp streamline_bridge.hpp ngx_bridge.hpp loadhook.hpp capability_policy.hpp
+               framecount.hpp ui_alpha.hpp ui_alpha_backend.hpp ui_submission.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp output_state.hpp presentation_observer.hpp quality_config.hpp advanced_features.hpp)
     configure_file("${REPO_ROOT}/src/addons/mfgunlock/${name}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/quality_guard.hpp"
                  "${mock_dir}/quality_guard.hpp" COPYONLY)
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/reshade_compat.hpp"
                  "${mock_dir}/reshade_compat.hpp" COPYONLY)
+  add_executable(loadhook_notifications_test "${TEST_ROOT}/loadhook_notifications_test.cpp")
+  target_include_directories(loadhook_notifications_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME loadhook_notifications_test COMMAND loadhook_notifications_test)
+
   add_executable(host_wrappers_test "${TEST_ROOT}/host_wrappers_test.cpp")
   target_include_directories(host_wrappers_test PRIVATE "${mock_dir}")
   add_test(NAME host_wrappers_test COMMAND host_wrappers_test)
+
+  add_executable(ngx_feature_generation_test "${TEST_ROOT}/ngx_feature_generation_test.cpp")
+  target_include_directories(ngx_feature_generation_test PRIVATE "${mock_dir}")
+  add_test(NAME ngx_feature_generation_test COMMAND ngx_feature_generation_test)
+
+  add_executable(vulkan_native_test "${TEST_ROOT}/vulkan_native_test.cpp")
+  target_include_directories(vulkan_native_test PRIVATE "${mock_dir}")
+  add_test(NAME vulkan_native_test COMMAND vulkan_native_test)
+
+  add_executable(vulkan_wrappers_test "${TEST_ROOT}/vulkan_wrappers_test.cpp")
+  target_include_directories(vulkan_wrappers_test PRIVATE "${mock_dir}")
+  add_test(NAME vulkan_wrappers_test COMMAND vulkan_wrappers_test)
 
   add_executable(runtime_settings_test "${TEST_ROOT}/runtime_settings_test.cpp")
   target_include_directories(runtime_settings_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
@@ -98,6 +123,9 @@ target_include_directories(endpoint_backend_test PRIVATE "${TEST_ROOT}/provider_
 add_test(NAME endpoint_backend_test COMMAND endpoint_backend_test)
 
 add_executable(inspect_provider "${CMAKE_CURRENT_SOURCE_DIR}/tools/inspect_provider.cpp")
+add_executable(probe_provider_trial "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_provider_trial.cpp")
+target_include_directories(probe_provider_trial PRIVATE "${TEST_ROOT}/provider_mocks")
+
 
 add_executable(lifecycle_test "${TEST_ROOT}/lifecycle_test.cpp")
 target_include_directories(lifecycle_test PRIVATE "${TEST_ROOT}/provider_mocks")
@@ -164,8 +192,245 @@ add_executable(export_provider_profile "${CMAKE_CURRENT_SOURCE_DIR}/tools/export
 add_executable(provider_profile_test "${TEST_ROOT}/provider_profile_test.cpp")
 add_test(NAME provider_profile_test COMMAND provider_profile_test)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME provider_trial_tool_test
+  COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/provider_trial_tool_test.py"
+          "$<TARGET_FILE:probe_provider_trial>")
+
+# Use the actual plugin scan preflight from addon.cpp, not a second parser.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_image_seam.py")
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_image_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/addon_image_seam.hpp"
+  COMMAND_ERROR_IS_FATAL ANY)
+add_executable(mapped_image_bounds_test "${TEST_ROOT}/mapped_image_bounds_test.cpp")
+target_include_directories(mapped_image_bounds_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/provider_mocks")
+add_test(NAME mapped_image_bounds_test COMMAND mapped_image_bounds_test)
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_maintenance_seam.py")
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_maintenance_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/addon_maintenance_seam.hpp"
+  COMMAND_ERROR_IS_FATAL ANY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_mfg_gate_seam.py")
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_mfg_gate_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/addon_mfg_gate_seam.hpp"
+  COMMAND_ERROR_IS_FATAL ANY)
+add_executable(mfg_gate_entry_test "${TEST_ROOT}/mfg_gate_entry_test.cpp")
+target_include_directories(mfg_gate_entry_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/provider_mocks")
+add_test(NAME mfg_gate_entry_test COMMAND mfg_gate_entry_test)
+
+add_executable(present_maintenance_test "${TEST_ROOT}/present_maintenance_test.cpp")
+target_include_directories(present_maintenance_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/hook_mocks" "${TEST_ROOT}/provider_mocks")
+add_test(NAME present_maintenance_test COMMAND present_maintenance_test)
+
+
 add_test(NAME provider_qualification_test
   COMMAND "${Python3_EXECUTABLE}" "${REPO_ROOT}/tools/qualify_provider.py" --self-test
           --check-registry "$<TARGET_FILE:export_provider_profile>")
 get_property(mfg_tests DIRECTORY PROPERTY TESTS)
 set_tests_properties(${mfg_tests} PROPERTIES TIMEOUT 60)
+
+# Shared evidence foundation and runtime contract tests.
+add_executable(compatibility_foundation_test "${TEST_ROOT}/compatibility_foundation_test.cpp")
+add_test(NAME compatibility_foundation_test COMMAND compatibility_foundation_test)
+add_executable(compatibility_runtime_test "${TEST_ROOT}/compatibility_runtime_test.cpp")
+add_executable(compatibility_contract_probe "${CMAKE_CURRENT_SOURCE_DIR}/tools/compatibility_contract_probe.cpp")
+add_test(NAME compatibility_runtime_test COMMAND compatibility_runtime_test)
+add_test(NAME compatibility_corpus_unit_test
+  COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/compatibility_corpus_test.py")
+set_tests_properties(compatibility_foundation_test compatibility_corpus_unit_test PROPERTIES TIMEOUT 60)
+add_test(NAME compatibility_hardening_test
+  COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/compatibility_hardening_test.py")
+set_tests_properties(compatibility_hardening_test PROPERTIES TIMEOUT 120)
+
+# Local corpus is optional. Never download NVIDIA DLLs as part of the build.
+set(MFG_COMPAT_CORPUS_ROOT "" CACHE PATH "Local corpus with dlss_g, streamline and meta subdirectories")
+if(MFG_COMPAT_CORPUS_ROOT)
+  add_test(NAME compatibility_full_corpus_test
+    COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/compatibility_corpus_test.py"
+            --dlssg-root "${MFG_COMPAT_CORPUS_ROOT}/dlss_g"
+            --streamline-root "${MFG_COMPAT_CORPUS_ROOT}/streamline"
+            --streamline-meta "${MFG_COMPAT_CORPUS_ROOT}/meta"
+            --probe "$<TARGET_FILE:compatibility_foundation_test>")
+  set_tests_properties(compatibility_full_corpus_test PROPERTIES TIMEOUT 600)
+endif()
+
+add_test(NAME compatibility_local_tool_test
+  COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/compatibility_local_tool_test.py"
+          --probe "$<TARGET_FILE:compatibility_contract_probe>")
+set_tests_properties(compatibility_local_tool_test PROPERTIES TIMEOUT 120)
+
+add_executable(probe_native_cubin "${TEST_ROOT}/../tools/probe_native_cubin.cpp")
+target_include_directories(probe_native_cubin PRIVATE "${TEST_ROOT}/provider_mocks")
+add_executable(cubin_trial_test "${TEST_ROOT}/cubin_trial_test.cpp")
+target_include_directories(cubin_trial_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME cubin_trial_test COMMAND cubin_trial_test)
+set_tests_properties(cubin_trial_test PROPERTIES TIMEOUT 60)
+
+# C1 evidence-only provider capability profiler. This target consumes a privately
+# mapped PE copy and never loads or calls NVIDIA provider code.
+add_executable(probe_provider_capability "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_provider_capability.cpp")
+target_include_directories(probe_provider_capability PRIVATE "${TEST_ROOT}/provider_mocks")
+
+add_executable(endpoint_structural_test "${TEST_ROOT}/endpoint_structural_test.cpp")
+add_test(NAME endpoint_structural_test COMMAND endpoint_structural_test)
+set_tests_properties(endpoint_structural_test PROPERTIES TIMEOUT 60)
+
+# Optional local reference input exercises the extended relocation/endpoint/
+# quality transaction, not just the default no-DLL unit-test entry point.
+set(MFG_SM75_REFERENCE_PROVIDER "" CACHE FILEPATH "Local reference provider for extended SM75 tests")
+if(MFG_SM75_REFERENCE_PROVIDER)
+  add_test(NAME endpoint_reference_provider_test
+    COMMAND endpoint_backend_test "${MFG_SM75_REFERENCE_PROVIDER}")
+  set_tests_properties(endpoint_reference_provider_test PROPERTIES TIMEOUT 180)
+endif()
+
+# Bind corpus-probe output to the exact compiled production headers and doubles.
+file(GLOB_RECURSE mfg_probe_sources CONFIGURE_DEPENDS
+  "${REPO_ROOT}/src/addons/mfgunlock/*.hpp"
+  "${TEST_ROOT}/provider_mocks/*.h" "${TEST_ROOT}/provider_mocks/*.hpp")
+list(APPEND mfg_probe_sources
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_provider_capability.cpp"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/mapped_provider_image.hpp")
+list(SORT mfg_probe_sources)
+set(mfg_probe_manifest "")
+foreach(input IN LISTS mfg_probe_sources)
+  file(SHA256 "${input}" digest)
+  file(RELATIVE_PATH relative "${REPO_ROOT}" "${input}")
+  string(APPEND mfg_probe_manifest "${relative}|${digest}\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+endforeach()
+string(SHA256 mfg_probe_digest "${mfg_probe_manifest}")
+target_compile_definitions(probe_provider_capability PRIVATE MFG_PROBE_SOURCE_ID="${mfg_probe_digest}")
+add_test(NAME sm75_tool_test COMMAND "${Python3_EXECUTABLE}"
+  "${TEST_ROOT}/sm75_tool_test.py" --probe "$<TARGET_FILE:probe_provider_capability>")
+set_tests_properties(sm75_tool_test PROPERTIES TIMEOUT 60)
+
+add_executable(sm75_storage_test "${TEST_ROOT}/sm75_storage_test.cpp")
+target_include_directories(sm75_storage_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME sm75_storage_test COMMAND sm75_storage_test)
+set_tests_properties(sm75_storage_test PROPERTIES TIMEOUT 60)
+
+# Fused FP16 ReLU lowering and exhaustive post-FMA lane semantics.
+add_executable(sm75_relu_test "${TEST_ROOT}/sm75_relu_test.cpp")
+add_test(NAME sm75_relu_test COMMAND sm75_relu_test)
+set_tests_properties(sm75_relu_test PROPERTIES TIMEOUT 60)
+
+# MG1: exercise production structural host-gate discovery and transaction.
+add_executable(mfg_gate_test "${TEST_ROOT}/mfg_gate_test.cpp")
+target_include_directories(mfg_gate_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME mfg_gate_test COMMAND mfg_gate_test)
+add_executable(probe_mfg_gate "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_mfg_gate.cpp")
+target_include_directories(probe_mfg_gate PRIVATE "${TEST_ROOT}/provider_mocks")
+# Bind this independent host probe to every source and API double it compiles.
+set(mfg_gate_sources ${mfg_probe_sources})
+list(REMOVE_ITEM mfg_gate_sources "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_provider_capability.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/tools/mapped_provider_image.hpp")
+list(APPEND mfg_gate_sources "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_mfg_gate.cpp")
+list(SORT mfg_gate_sources)
+set(mfg_gate_manifest "")
+foreach(input IN LISTS mfg_gate_sources)
+  file(SHA256 "${input}" digest)
+  file(RELATIVE_PATH relative "${REPO_ROOT}" "${input}")
+  string(APPEND mfg_gate_manifest "${relative}|${digest}\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+endforeach()
+string(SHA256 mfg_gate_digest "${mfg_gate_manifest}")
+target_compile_definitions(probe_mfg_gate PRIVATE MFG_GATE_SOURCE_ID="${mfg_gate_digest}")
+add_test(NAME mfg_gate_tool_test COMMAND "${Python3_EXECUTABLE}"
+  "${TEST_ROOT}/mfg_gate_tool_test.py" --probe "$<TARGET_FILE:probe_mfg_gate>"
+  --fixture "$<TARGET_FILE:mfg_gate_test>")
+set_tests_properties(mfg_gate_tool_test PROPERTIES TIMEOUT 120)
+
+# F1 evidence collection/projection: no vendor execution and explicit coverage.
+add_test(NAME f1_evidence_test COMMAND "${Python3_EXECUTABLE}"
+  "${TEST_ROOT}/f1_evidence_test.py")
+set_tests_properties(f1_evidence_test PROPERTIES TIMEOUT 60)
+
+# Legacy flat-network contract and the real provider transaction.
+add_executable(endpoint_flat_test "${TEST_ROOT}/endpoint_flat_test.cpp")
+target_include_directories(endpoint_flat_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME endpoint_flat_test COMMAND endpoint_flat_test)
+add_executable(sm75_source_format_test "${TEST_ROOT}/sm75_source_format_test.cpp")
+add_test(NAME sm75_source_format_test COMMAND sm75_source_format_test)
+
+# F2: execute the exact production alpha callbacks against explicit API doubles.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_ui_alpha_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${REPO_ROOT}/src/addons/mfgunlock/framecount.hpp")
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_ui_alpha_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${REPO_ROOT}/src/addons/mfgunlock/framecount.hpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/ui_alpha_production_seam.hpp"
+  COMMAND_ERROR_IS_FATAL ANY)
+add_executable(ui_alpha_gpu_test "${TEST_ROOT}/ui_alpha_gpu_test.cpp")
+target_include_directories(ui_alpha_gpu_test PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+add_test(NAME ui_alpha_gpu_test COMMAND ui_alpha_gpu_test)
+set_tests_properties(ui_alpha_gpu_test PROPERTIES TIMEOUT 60)
+
+add_executable(passive_metrics_test "${TEST_ROOT}/passive_metrics_test.cpp")
+add_test(NAME passive_metrics_test COMMAND passive_metrics_test)
+set_tests_properties(passive_metrics_test PROPERTIES TIMEOUT 60)
+if(NOT WIN32)
+  add_executable(ui_native_precedence_test "${TEST_ROOT}/ui_native_precedence_test.cpp")
+  target_include_directories(ui_native_precedence_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME ui_native_precedence_test COMMAND ui_native_precedence_test)
+  set_tests_properties(ui_native_precedence_test PROPERTIES TIMEOUT 60)
+endif()
+
+add_executable(vulkan_format_test "${TEST_ROOT}/vulkan_format_test.cpp")
+add_test(NAME vulkan_format_test COMMAND vulkan_format_test)
+
+if(NOT WIN32)
+  add_executable(vulkan_ui_test "${TEST_ROOT}/vulkan_ui_test.cpp")
+  target_include_directories(vulkan_ui_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME vulkan_ui_test COMMAND vulkan_ui_test)
+endif()
+
+# Native compile probe uses REAL headers. Enable explicitly; missing SDK files
+# are an error, not a silent fall back to the portable API doubles.
+option(MFG_NATIVE_VULKAN_ABI_TEST "Compile against real Vulkan/NGX headers" OFF)
+if(MFG_NATIVE_VULKAN_ABI_TEST)
+  if(NOT WIN32)
+    message(FATAL_ERROR "Native ABI probe targets the Windows NGX addon ABI")
+  endif()
+  set(MFG_VULKAN_INCLUDE "${REPO_ROOT}/external/Vulkan-Headers/include" CACHE PATH "Vulkan headers")
+  set(MFG_NGX_INCLUDE "${REPO_ROOT}/external/RenoDX/external/DLSS/include" CACHE PATH "NGX headers")
+  foreach(header "${MFG_VULKAN_INCLUDE}/vulkan/vulkan_core.h" "${MFG_NGX_INCLUDE}/nvsdk_ngx_vk.h")
+    if(NOT EXISTS "${header}")
+      message(FATAL_ERROR "Required native header missing: ${header}")
+    endif()
+  endforeach()
+  add_executable(vulkan_sdk_abi_test "${TEST_ROOT}/vulkan_sdk_abi_test.cpp")
+  target_include_directories(vulkan_sdk_abi_test PRIVATE "${MFG_VULKAN_INCLUDE}" "${MFG_NGX_INCLUDE}")
+  add_test(NAME vulkan_sdk_abi_test COMMAND vulkan_sdk_abi_test)
+endif()
+if(NOT WIN32)
+  add_executable(vulkan_count_test "${TEST_ROOT}/vulkan_count_test.cpp")
+  target_include_directories(vulkan_count_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME vulkan_count_test COMMAND vulkan_count_test)
+endif()
+
+add_test(NAME f3_runtime_collector_test COMMAND "${Python3_EXECUTABLE}"
+  "${TEST_ROOT}/f3_runtime_collector_test.py")
+set_tests_properties(f3_runtime_collector_test PROPERTIES TIMEOUT 60)
+
+# F4: production snapshot/oracle/C1 comparisons and evidence qualification.
+# C1 remains test-only until its separate patch is explicitly applied.
+add_executable(f4_passive_read_test "${TEST_ROOT}/f4_passive_read_test.cpp")
+add_test(NAME f4_passive_read_test COMMAND f4_passive_read_test)
+set_tests_properties(f4_passive_read_test PROPERTIES TIMEOUT 60)
+add_test(NAME f4_tools_test COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/f4_tools_test.py")
+set_tests_properties(f4_tools_test PROPERTIES TIMEOUT 60)

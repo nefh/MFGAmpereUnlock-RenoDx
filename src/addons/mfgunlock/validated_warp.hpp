@@ -736,15 +736,9 @@ inline bool IsSupportedProvider(HMODULE module, std::string& version,
     return false;
   }
   const auto* profile = internal::MatchProvider(identity);
-  if (profile == nullptr) {
-    std::ostringstream stream;
-    stream << "unsupported provider metadata (timestamp=0x" << std::hex
-           << identity.timestamp << std::dec
-           << ", image-size=" << identity.image_bytes << ')';
-    why = stream.str();
-    return false;
-  }
-  version = profile->version;
+  // The image identity is diagnostic only. LocateUniqueFatbin and the
+  // descriptor/kernel checks below decide whether this operation can run.
+  version = profile ? profile->version : "unlisted image (structural trial)";
   return true;
 }
 

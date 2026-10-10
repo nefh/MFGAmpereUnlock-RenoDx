@@ -20,7 +20,7 @@ void Check(bool value, const char* name) {
 }  // namespace
 
 int main() {
-  constexpr std::array<features::Feature, 12> kFeatures = {
+  constexpr std::array<features::Feature, 18> kFeatures = {
       features::Feature::kFixedMfg,
       features::Feature::kDynamicMfg,
       features::Feature::kAutoMfg,
@@ -33,6 +33,12 @@ int main() {
       features::Feature::kVsyncSupport,
       features::Feature::kDynamicResolution,
       features::Feature::kQueueParallelism,
+      features::Feature::kMotionValidation,
+      features::Feature::kHistoryValidation,
+      features::Feature::kOcclusionDisocclusion,
+      features::Feature::kThinGeometryStability,
+      features::Feature::kConfidencePropagation,
+      features::Feature::kFallbackSelection,
   };
 
   for (const auto* profile : {&architecture::kAda, &architecture::kAmpere,
@@ -61,11 +67,37 @@ int main() {
             features::BackendSupports(&architecture::kAda, features::Feature::kQueueParallelism),
         "Ada shared integration paths remain available");
 
-  for (const auto* profile : {&architecture::kAmpere, &architecture::kTuring}) {
-    for (const auto feature : kFeatures) {
+  constexpr std::array<features::Feature, 17> kVerifiedBackendFeatures = {
+      features::Feature::kFixedMfg,
+      features::Feature::kDynamicMfg,
+      features::Feature::kAutoMfg,
+      features::Feature::kTemporalFramework,
+      features::Feature::kIntermediateScatter,
+      features::Feature::kBoundaryMitigation,
+      features::Feature::kValidatedWarp,
+      features::Feature::kUiRecomposition,
+      features::Feature::kHdrPaths,
+      features::Feature::kVsyncSupport,
+      features::Feature::kDynamicResolution,
+      features::Feature::kQueueParallelism,
+      features::Feature::kMotionValidation,
+      features::Feature::kHistoryValidation,
+      features::Feature::kOcclusionDisocclusion,
+      features::Feature::kThinGeometryStability,
+      features::Feature::kFallbackSelection,
+  };
+
+  for (const auto* profile : {&architecture::kAda, &architecture::kAmpere,
+                              &architecture::kTuring}) {
+    for (const auto feature : kVerifiedBackendFeatures) {
       Check(features::BackendSupports(profile, feature),
-            "retargeted backends keep the current backend feature set");
+            "verified architecture backend capability remains explicit");
     }
+    Check(!features::BackendSupports(profile, features::Feature::kConfidencePropagation),
+          "confidence propagation stays unavailable without a verified backend");
+  }
+
+  for (const auto* profile : {&architecture::kAmpere, &architecture::kTuring}) {
     Check(features::HasRetargetedQualityBackend(profile),
           "retargeted quality backend remains available");
   }

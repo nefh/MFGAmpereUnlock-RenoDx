@@ -16,6 +16,13 @@ void Check(bool condition, const char* reason) {
 
 int main() {
   namespace ic = mfgunlock::integration;
+  Check(static_cast<uint32_t>(ic::ResourceRole::kHudLess) == 3 &&
+            static_cast<uint32_t>(ic::ResourceRole::kOutputDisableInterpolation) == 9,
+        "legacy resource-role mask values remain ABI-stable");
+  Check(static_cast<uint32_t>(ic::ResourceRole::kColorInput) == 10 &&
+            static_cast<uint32_t>(ic::ResourceRole::kColorOutput) == 11 &&
+            static_cast<uint32_t>(ic::ResourceRole::kExposure) == 12,
+        "new resource roles are appended after the legacy diagnostic mask range");
   ic::Reset();
   Check(ic::Read().frame_index == ic::Verdict::kUnknown, "frame contract starts unknown");
   Check(ic::Read().resources == ic::Verdict::kUnknown, "resource contract starts unknown");
@@ -34,10 +41,47 @@ int main() {
   ic::ObserveTag(3, ic::ResourceRole::kMotionVectors, true, true, 1, true, 0, 0,
                  1280, 720, true, 4, true, 16, 0x2000);
   Check(ic::Read().resources == ic::Verdict::kValid, "depth and motion vectors validate required resource evidence");
+  ic::ObserveTag(3, ic::ResourceRole::kColorInput, true, true, 1, true, 0, 0,
+                 1280, 720, true, 4, true, 28, 0x3000, true, 42);
+  ic::ObserveTag(3, ic::ResourceRole::kColorOutput, true, true, 1, true, 0, 0,
+                 1920, 1080, true, 4, true, 28, 0x4000, true, 42);
+  ic::ObserveTag(3, ic::ResourceRole::kExposure, true, true, 1, true, 0, 0,
+                 1, 1, true, 4, true, 10, 0x5000, true, 42);
+  auto tagged = ic::Read();
+  const auto& tagged_depth = tagged.resource[static_cast<size_t>(ic::ResourceRole::kDepth)];
+  const auto& color_input = tagged.resource[static_cast<size_t>(ic::ResourceRole::kColorInput)];
+  const auto& color_output = tagged.resource[static_cast<size_t>(ic::ResourceRole::kColorOutput)];
+  const auto& exposure = tagged.resource[static_cast<size_t>(ic::ResourceRole::kExposure)];
+  Check(tagged_depth.provenance == ic::ResourceProvenance::kStreamline,
+        "Streamline tags retain provenance without taking resource ownership");
+  Check(color_input.active && color_output.active && exposure.active,
+        "optional color and exposure tags remain observable evidence");
+  Check(color_input.frame_known && color_input.frame == 42 &&
+            color_output.frame_known && color_output.frame == 42 &&
+            exposure.frame_known && exposure.frame == 42,
+        "set-tag-for-frame evidence preserves resource frame association");
+
+  ic::ObserveTag(3, ic::ResourceRole::kDepth, true, true, 1, true, 0, 0, 1280, 720,
+                 true, 4, true, 45, 0x6000, true, 43);
+  auto replaced = ic::Read().resource[static_cast<size_t>(ic::ResourceRole::kDepth)];
+  Check(replaced.replacements == 1 && replaced.object == 0x6000 && replaced.frame == 43,
+        "resource replacement updates current evidence and increments replacement count");
   ic::ObserveTag(3, ic::ResourceRole::kDepth, false, true, 1, false, 0, 0, 0, 0,
                  false, 0, false, 0, 0);
   auto resource = ic::Read().resource[static_cast<size_t>(ic::ResourceRole::kDepth)];
   Check(resource.seen && !resource.active && resource.clears == 1, "null resource tag is preserved as clear evidence");
+  Check(ic::Read().resources == ic::Verdict::kInvalid,
+        "clearing a required resource invalidates current resource evidence");
+
+  ic::ObserveHistory(true, false, true, true);
+  auto history = ic::Read();
+  Check(history.history_reset_known && !history.history_reset &&
+            history.rendering_game_frames_known && history.rendering_game_frames,
+        "history reset and game-frame evidence remain independent and explicit");
+  ic::ObserveHistory(true, true, true, false);
+  history = ic::Read();
+  Check(history.history_reset && !history.rendering_game_frames,
+        "history reset and menu/video evidence update deterministically");
 
   ic::Reset();
   ic::ObserveSetOptions(5, ic::kDynamicResolutionFlag, 1280, 0, 1280, 720, 2560, 1440,
@@ -54,8 +98,8 @@ int main() {
   Check(ic::Read().queue_contract == ic::Verdict::kObserved,
         "no-client-queue mode without fence remains observed, not fabricated valid");
   ic::ObserveState(1, 0, true, true, true, 0x1234, 99);
-  Check(ic::Read().queue_contract == ic::Verdict::kValid,
-        "queue mode with completion fence evidence validates");
+  Check(ic::Read().queue_contract == ic::Verdict::kObserved,
+        "seeing a fence does not prove the presenting queue waited for it");
 
   ic::Reset();
   ic::ObserveSwapchainInit(0x10, 3, false);
@@ -91,12 +135,44 @@ int main() {
         "cross-viewport ownership mismatch is explicit");
 
   ic::Reset();
-  ic::ObserveNgxResource(ic::ResourceRole::kOutputReal, true, 0x5555, 1920, 1080, 28);
+  ic::ObserveNgxResource(ic::ResourceRole::kOutputReal, true, 0x5555, 1920, 1080, 28,
+                         true, 100);
   auto ngx = ic::Read();
   Check(ngx.viewport_ownership == ic::Verdict::kUnknown,
         "NGX resource evidence does not invent a Streamline viewport");
-  Check(ngx.resource[static_cast<size_t>(ic::ResourceRole::kOutputReal)].active,
+  const auto& ngx_output = ngx.resource[static_cast<size_t>(ic::ResourceRole::kOutputReal)];
+  Check(ngx_output.active && ngx_output.provenance == ic::ResourceProvenance::kNgx &&
+            ngx_output.frame_known && ngx_output.frame == 100,
         "NGX output resource is observable without retaining ownership");
+  ic::ObserveNgxResource(ic::ResourceRole::kOutputReal, true, 0x7777, 1920, 1080, 28,
+                         true, 101);
+  ngx = ic::Read();
+  const auto& ngx_replaced = ngx.resource[static_cast<size_t>(ic::ResourceRole::kOutputReal)];
+  Check(ngx_replaced.replacements == 1 && ngx_replaced.object == 0x7777 &&
+            ngx_replaced.frame == 101,
+        "NGX replacement evidence does not retain a stale resource identity");
+
+  ic::ObserveHistory(true, false, true, true);
+  ic::ObserveHistory(false, false, false, false);
+  Check(!ic::Read().history_reset_known && !ic::Read().rendering_game_frames_known,
+        "missing current history evidence must not reuse an older sample");
+  Check(ic::InvalidateResource(0x7777), "resource destruction invalidates observed identity");
+  const auto invalid = ic::Read().resource[static_cast<size_t>(ic::ResourceRole::kOutputReal)];
+  Check(!invalid.active && !invalid.frame_known && !invalid.format_known && invalid.object == 0,
+        "destroyed resources leave no usable metadata");
+  ic::ObserveNgxResource(ic::ResourceRole::kOutputReal, true, 0x7777, 1920, 1080, 28, true, 102);
+  ic::ObserveNgxResource(ic::ResourceRole::kOutputReal, false, 0, 0, 0, 0, false, 0);
+  Check(!ic::Read().resource[static_cast<size_t>(ic::ResourceRole::kOutputReal)].active,
+        "unavailable NGX parameters clear previous submitted resources");
+  ic::ObserveConstants(103, 1);
+  ic::ObserveHistory(true, false, true, true);
+  ic::ObserveTag(1, ic::ResourceRole::kDepth, true, true, 1, true, 0, 0, 32, 32,
+                 true, 4, true, 45, 0x10, true, 103);
+  ic::InvalidateFrameEvidence();
+  const auto cleared = ic::Read();
+  Check(!cleared.constants_frame_known && !cleared.history_reset_known &&
+        !cleared.resource[static_cast<size_t>(ic::ResourceRole::kDepth)].active,
+        "lifecycle/failure boundary invalidates frame, history and resource together");
 
   std::cout << "integration_contract_test: " << g_checks << " checks PASS\n";
   return 0;

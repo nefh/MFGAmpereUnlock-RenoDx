@@ -26,6 +26,10 @@
 #define GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS 4u
 #define GET_MODULE_HANDLE_EX_FLAG_PIN 1u
 #define LOAD_LIBRARY_SEARCH_SYSTEM32 0x800u
+#define DONT_RESOLVE_DLL_REFERENCES 0x1u
+#define LOAD_LIBRARY_AS_DATAFILE 0x2u
+#define LOAD_LIBRARY_AS_IMAGE_RESOURCE 0x20u
+#define LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE 0x40u
 #define VS_VERSION_INFO 1
 
 using DWORD = uint32_t;
@@ -68,8 +72,24 @@ struct LUID {
 };
 
 struct MEMORY_BASIC_INFORMATION {
+  void* BaseAddress = nullptr;
+  size_t RegionSize = 0;
   void* AllocationBase = nullptr;
+  DWORD State = 0x1000;
+  DWORD Type = 0x1000000;
+  DWORD Protect = 0x20;
 };
+inline constexpr DWORD MEM_COMMIT = 0x1000;
+inline constexpr DWORD MEM_IMAGE = 0x1000000;
+inline constexpr DWORD PAGE_READONLY = 0x02;
+inline constexpr DWORD PAGE_READWRITE = 0x04;
+inline constexpr DWORD PAGE_WRITECOPY = 0x08;
+inline constexpr DWORD PAGE_GUARD = 0x100;
+inline constexpr DWORD PAGE_NOACCESS = 0x01;
+inline constexpr DWORD PAGE_EXECUTE = 0x10;
+inline constexpr DWORD PAGE_EXECUTE_READ = 0x20;
+inline constexpr DWORD PAGE_EXECUTE_READWRITE = 0x40;
+inline constexpr DWORD PAGE_EXECUTE_WRITECOPY = 0x80;
 
 struct VS_FIXEDFILEINFO {
   DWORD dwSignature = 0;
@@ -93,6 +113,7 @@ inline std::map<HMODULE, std::wstring> paths;
 inline std::map<std::pair<HMODULE, std::string>, FARPROC> exports;
 inline std::map<HMODULE, std::vector<unsigned char>> resources;
 inline std::map<const void*, HMODULE> allocation;
+inline std::map<uintptr_t, size_t> readable_regions;
 inline std::map<HMODULE, bool> module_current;
 inline bool pin_ok = true;
 inline bool install_ok = true;
@@ -139,6 +160,15 @@ inline DWORD GetModuleFileNameA(HMODULE module, char* output, DWORD size) {
 }
 
 inline size_t VirtualQuery(const void* address, MEMORY_BASIC_INFORMATION* memory, size_t size) {
+  const auto at = reinterpret_cast<uintptr_t>(address);
+  for (const auto& [base, bytes] : mock::readable_regions) {
+    if (at >= base && at - base < bytes) {
+      memory->BaseAddress = reinterpret_cast<void*>(base);
+      memory->RegionSize = bytes;
+      memory->AllocationBase = reinterpret_cast<void*>(base);
+      return size;
+    }
+  }
   auto iterator = mock::allocation.find(address);
   if (iterator == mock::allocation.end()) return 0;
   memory->AllocationBase = iterator->second;
@@ -283,6 +313,7 @@ struct NVSDK_NGX_FeatureRequirement {
 struct NVSDK_NGX_Parameter {
   std::map<std::string, uint32_t> values;
   std::map<std::string, ID3D12Resource*> resources;
+  std::map<std::string, void*> vk_resources;
   unsigned int writes = 0;
   bool writable = true;
 
@@ -313,6 +344,12 @@ struct NVSDK_NGX_Parameter {
     if (found == values.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
     *output = static_cast<int>(found->second);
     return NVSDK_NGX_Result_Success;
+  }
+  NVSDK_NGX_Result Get(const char* name, void** output) const {
+    if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    const auto it = vk_resources.find(name);
+    if (it == vk_resources.end()) return NVSDK_NGX_Result_FAIL_InvalidParameter;
+    *output = it->second; return NVSDK_NGX_Result_Success;
   }
   NVSDK_NGX_Result Get(const char* name, ID3D12Resource** output) const {
     if (!name || !output) return NVSDK_NGX_Result_FAIL_InvalidParameter;
@@ -375,7 +412,9 @@ enum class PreferenceFlags : uint32_t {
   eLoadDownloadedPlugins = 1u << 6,
 };
 constexpr uint32_t kStructVersion1 = 1;
+enum class RenderAPI { eD3D11, eD3D12, eVulkan };
 struct Preferences {
+  RenderAPI renderAPI = RenderAPI::eD3D12;
   static constexpr uint32_t s_structType = 0x70726566;
   uint32_t structType = s_structType;
   uint32_t structVersion = kStructVersion1;

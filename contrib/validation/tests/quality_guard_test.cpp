@@ -18,6 +18,7 @@ void Check(bool value, const char* name) {
 }
 sl::Resource MakeResource(uint32_t width, uint32_t height, uint32_t format) {
   sl::Resource resource{};
+  resource.native = reinterpret_cast<void*>(0x1234);
   resource.width = width;
   resource.height = height;
   resource.nativeFormat = format;
@@ -90,16 +91,16 @@ int main() {
   };
   const auto ui_assessment = guard::AssessTags(ui_only.data(), ui_only.size(), sdr);
   Check(guard::ResolveSuppression(ui_assessment, ui_assessment, sdr, false) ==
-            guard::SuppressionPolicy::kUiOnly,
-        "UI-only input is withheld until HUD-less exists");
+            guard::SuppressionPolicy::kNone,
+        "valid native UI-only batch is preserved for later HUD-less submission");
 
   auto accumulated_pair = hudless_assessment;
   accumulated_pair.has_ui_color_or_alpha = true;
   accumulated_pair.has_ui_color_alpha = true;
   accumulated_pair.ui_encoding = guard::NativeUiEncoding(accumulated_pair);
   Check(guard::ResolveSuppression(ui_assessment, accumulated_pair, sdr, false) ==
-            guard::SuppressionPolicy::kUiOnly,
-        "first split UI transition is withheld");
+            guard::SuppressionPolicy::kNone,
+        "first split UI transition is forwarded, not just remembered locally");
   Check(guard::ResolveSuppression(ui_assessment, accumulated_pair, sdr, true) ==
             guard::SuppressionPolicy::kNone,
         "subsequent split UI submission is forwarded");

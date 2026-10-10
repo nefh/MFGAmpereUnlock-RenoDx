@@ -28,9 +28,13 @@ class InvalidImage(ValueError):
 
 
 class Image:
-    def __init__(self, data: bytes):
+    def __init__(self, data: bytes, *, max_file_bytes: int = MAX_FILE):
+        # Offline readers may opt into larger sidecar DLLs; legacy callers retain
+        # the original 64 MiB ceiling. This does not affect runtime C++ gates.
+        if not 256 <= max_file_bytes <= 512 * 1024 * 1024:
+            raise InvalidImage("invalid_file_budget")
         self.data = data
-        if not 256 <= len(data) <= MAX_FILE:
+        if not 256 <= len(data) <= max_file_bytes:
             raise InvalidImage('file_size_out_of_range')
         if self.take(0, 2) != b'MZ':
             raise InvalidImage('missing_dos_signature')
@@ -46,7 +50,7 @@ class Image:
         self.base = self.u64(opt + 24)
         self.size = self.u32(opt + 56)
         self.headers = self.u32(opt + 60)
-        if not self.headers <= self.size <= MAX_FILE or self.headers > len(data):
+        if not self.headers <= self.size <= max_file_bytes or self.headers > len(data):
             raise InvalidImage('invalid_image_dimensions')
         table = opt + opt_size
         if table + count * 40 > self.headers:

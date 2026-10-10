@@ -85,6 +85,16 @@ int main() {
   Check(output::Reset(), "reset should invalidate a known output");
   Check(!output::Read().known, "reset output should be unknown");
 
+  Check(output::DetectedUiEncoding(output::FormatKind::kRgba8Unorm) == output::UiEncoding::kUnknown,
+        "UNORM storage does not establish UI transfer function");
+  Check(output::DetectedUiEncoding(output::FormatKind::kRgba8Srgb) == output::UiEncoding::kSdrSrgb,
+        "explicit sRGB view supplies declared transfer evidence");
+  Check(!output::IsUiEncodingCompatible(sdr, output::UiEncoding::kSdrLinear, false),
+        "linear UI cannot be treated as encoded sRGB without conversion");
+  Check(!output::Classify(output::FormatKind::kUnknown, 0, false,
+                         output::kColorSpaceSrgbNonlinear, true).dlssg_supported,
+        "SDR color-space label alone does not qualify an unknown format");
+
   std::cout << "output_state_test=PASS\n";
   return 0;
 }

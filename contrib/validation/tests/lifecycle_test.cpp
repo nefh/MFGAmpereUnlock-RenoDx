@@ -140,7 +140,7 @@ int main() {
     }
     Reset();
     {
-      std::array<uint8_t, 512> bytes{};
+      alignas(8) std::array<uint8_t, 512> bytes{};
       mock::regions.push_back({bytes.data(), bytes.size()});
       auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
       dos->e_magic = IMAGE_DOS_SIGNATURE;

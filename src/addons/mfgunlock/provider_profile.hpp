@@ -279,6 +279,28 @@ inline const ProviderProfile* Find(uint32_t timestamp, uint32_t image_size,
     if (profile.timestamp == timestamp && profile.image_size == image_size) return &profile;
   return nullptr;
 }
+inline const ProviderProfile* FindExact(uint32_t timestamp, uint32_t image_size,
+                                       std::string_view sha256,
+                                       std::span<const ProviderProfile> profiles = kProfiles) {
+  const auto* profile = Find(timestamp, image_size, profiles);
+  return profile && sha256 == profile->file_sha256 ? profile : nullptr;
+}
+inline uint32_t IndexOf(const ProviderProfile* profile,
+                        std::span<const ProviderProfile> profiles = kProfiles) {
+  if (!profile) return 0;
+  for (size_t i = 0; i < profiles.size(); ++i)
+    if (&profiles[i] == profile) return static_cast<uint32_t>(i + 1);
+  return 0;
+}
+inline const KernelProfile* FindQualityKernel(const ProviderProfile& profile,
+                                              std::string_view role) {
+  for (const auto& kernel : profile.quality_kernels)
+    if (role == kernel.role) return &kernel;
+  return nullptr;
+}
+inline bool HasQualityKernel(const ProviderProfile& profile, std::string_view role) {
+  return FindQualityKernel(profile, role) != nullptr;
+}
 inline bool AllowsTarget(const ProviderProfile& profile, uint32_t sm) {
   return std::find(profile.backend_sms.begin(), profile.backend_sms.end(), sm) != profile.backend_sms.end();
 }

@@ -11,8 +11,14 @@ Ampere, and Turing** GPUs through a ReShade/RenoDX addon.
   </a>
 </p>
 
-Patches are applied to mapped process memory and reverted on unload. **No NVIDIA
-binaries are redistributed.**
+Patches are process-local. Orderly rollback is attempted during teardown; live
+addon unload is **not** qualified. Close the game before replacing the addon.
+**No NVIDIA binaries are redistributed.**
+
+This tree is a universal-compatibility **Stage 3 runtime candidate**. Portable
+validation is separate from Windows/MSVC builds and game validation. The game
+results below are historical references, not a claim that this candidate passed
+those games. See `docs/UNIVERSAL_COMPATIBILITY.md`.
 
 ## Usage
 
@@ -21,22 +27,26 @@ binaries are redistributed.**
 2. Download the [latest release](../../releases/latest).
 3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the game.
    When updating, close the game before replacing the existing addon file.
-4. Append the following to `ReShade.ini`:
+4. Default loading retries attachment to already-loaded modules. For additional
+   startup observation, early loading remains optional:
 
    ```ini
    [ADDON]
    LoadFromDllMain=renodx-mfgunlock.addon64
    ```
 
-   **If omitted, MFG Unlock will append itself automatically; restart the game
-   once afterwards for MFG to be detected.**
-5. For the full feature set in this release, use **DLSS-G 310.9.1**. NVIDIA
-   binaries are not included in this repository.
-6. For Dynamic MFG, replace the game's Streamline files with
-   [Streamline 2.14.1 with DLSS-G 310.9.1](https://www.nexusmods.com/site/mods/1282?tab=files)
-   only in games known to accept a Streamline update. This replacement works, for
-   example, in **Cyberpunk 2077**. Do not use it with legacy Streamline 1.x titles
-   such as **A Plague Tale: Requiem**.
+   The existing early-load helper can append this setting; a newly written
+   setting takes effect after a restart. Missing startup events are not replayed.
+5. Start with the game's supplied libraries. **DLSS-G 310.9.1 is an optional
+   known-good configuration for the currently qualified private provider
+   patches**, not a global requirement for the addon. Unqualified layouts keep
+   dependent unsafe features closed while independent diagnostics/admission/UI
+   remain available where their own contracts permit.
+6. Dynamic MFG uses the typed Streamline contract, current hooks, prepared target
+   and observed Options/State support, not an exact DLL version pair.
+   Streamline 2.14.1 / DLSS-G 310.9.1 is a historical known-good configuration,
+   not a mandatory update. Do not replace a legacy Streamline integration with
+   modern DLLs. There is no DLL downloader or automatic replacement.
 7. Use the game's multiplier selector when available. Otherwise use **Force frame
    multiplier** in the ReShade **MFG Unlock** panel.
 
@@ -89,8 +99,9 @@ binaries are redistributed.**
 
 ## Game compatibility
 
-*Results include current and earlier compatible builds. Game, Streamline, driver
-and provider updates can change behavior.*
+*Historical results from earlier project builds. They are regression targets,
+not Stage 3 runtime validation. Game, Streamline, driver and provider updates
+can change behavior.*
 
 | Game | Ampere | Turing | Ada | Comment |
 | --- | --- | --- | --- | --- |

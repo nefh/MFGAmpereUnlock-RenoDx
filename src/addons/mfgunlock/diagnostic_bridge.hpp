@@ -18,7 +18,7 @@ inline constexpr uint32_t kStateVersion = 3;
 inline constexpr uint32_t kUnknown32 = UINT32_MAX;
 inline constexpr uint64_t kUnknown64 = UINT64_MAX;
 
-enum class Backend : uint32_t { kNgxD3D12 = 0 };
+enum class Backend : uint32_t { kNgxD3D12 = 0, kNgxVulkan = 1 };
 enum class EvaluatePhase : uint32_t { kBegin = 0, kEnd = 1 };
 enum class ResourceKey : uint32_t {
   kBackbuffer = 0,

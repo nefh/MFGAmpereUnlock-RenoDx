@@ -22,7 +22,10 @@ constexpr DWORD GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS=4;
 #define ARRAYSIZE(a) (sizeof(a)/sizeof((a)[0]))
 struct IMAGE_DOS_HEADER {WORD e_magic;unsigned char reserved[58];int32_t e_lfanew;};
 struct IMAGE_FILE_HEADER {WORD Machine,NumberOfSections;DWORD TimeDateStamp,PointerToSymbolTable,NumberOfSymbols;WORD SizeOfOptionalHeader,Characteristics;};
-struct IMAGE_OPTIONAL_HEADER64 {WORD Magic;unsigned char reserved[54];DWORD SizeOfImage,SizeOfHeaders;unsigned char rest[176];};
+constexpr DWORD IMAGE_DIRECTORY_ENTRY_EXPORT = 0;
+struct IMAGE_DATA_DIRECTORY {DWORD VirtualAddress, Size;};
+struct IMAGE_EXPORT_DIRECTORY {DWORD Characteristics,TimeDateStamp;WORD MajorVersion,MinorVersion;DWORD Name,Base,NumberOfFunctions,NumberOfNames,AddressOfFunctions,AddressOfNames,AddressOfNameOrdinals;};
+struct IMAGE_OPTIONAL_HEADER64 {WORD Magic;unsigned char reserved[54];DWORD SizeOfImage,SizeOfHeaders;unsigned char rest[44];DWORD NumberOfRvaAndSizes;IMAGE_DATA_DIRECTORY DataDirectory[16];};
 struct IMAGE_NT_HEADERS64 {DWORD Signature;IMAGE_FILE_HEADER FileHeader;IMAGE_OPTIONAL_HEADER64 OptionalHeader;};
 struct IMAGE_SECTION_HEADER {unsigned char Name[8];union {DWORD PhysicalAddress;DWORD VirtualSize;} Misc;DWORD VirtualAddress,SizeOfRawData,PointerToRawData,PointerToRelocations,PointerToLinenumbers;WORD NumberOfRelocations,NumberOfLinenumbers;DWORD Characteristics;};
 static_assert(sizeof(IMAGE_DOS_HEADER)==64&&sizeof(IMAGE_NT_HEADERS64)==264&&sizeof(IMAGE_SECTION_HEADER)==40);
@@ -38,6 +41,7 @@ inline bool retain_ok=true,force_lock_busy=false;
 inline unsigned protection_calls=0,fail_protection_call=0,retains=0;
 inline std::set<unsigned> fail_protection_calls;
 inline std::set<void*> allocations;
+inline unsigned flush_calls=0,fail_flush_call=0,corrupt_flush_call=0;
 inline unsigned frees = 0;
 inline bool fail_free = false;
 }
@@ -62,7 +66,12 @@ inline BOOL VirtualProtect(void* pointer,size_t,DWORD desired,DWORD* old){
  return 0;
 }
 inline HANDLE GetCurrentProcess(){return nullptr;}
-inline BOOL FlushInstructionCache(HANDLE,const void*,size_t){return 1;}
+inline BOOL FlushInstructionCache(HANDLE,const void* address,size_t bytes){
+ ++provider_mock::flush_calls;
+ if(bytes && provider_mock::flush_calls==provider_mock::corrupt_flush_call)
+   *const_cast<unsigned char*>(static_cast<const unsigned char*>(address)) ^= 1;
+ return provider_mock::flush_calls!=provider_mock::fail_flush_call;
+}
 inline FARPROC GetProcAddress(HMODULE module,const char* name){auto it=provider_mock::exports.find({module,name});return it==provider_mock::exports.end()?nullptr:it->second;}
 inline BOOL GetModuleHandleExW(DWORD,LPCWSTR address,HMODULE* module){
  if(!provider_mock::retain_ok)return 0;

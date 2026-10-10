@@ -1,9 +1,9 @@
 /*
- * PTX retargeting for known DLSS-G fatbin layouts.
+ * Structural PTX retargeting for bounded DLSS-G fatbin layouts.
  * SPDX-License-Identifier: MIT
  *
  * Ordinary target changes edit independent LZ4 literals and verify the decoded
- * bytes. Fingerprinted SM89 compatibility programs use strict SM75 lowerings;
+ * bytes. SM89 programs use operand-checked SM75 compatibility lowerings;
  * rebuilt single-image PTX is recompressed only when it fits its exact container.
  */
 #pragma once
@@ -29,6 +29,7 @@ struct Plan {
   size_t ptx_offset = 0;
   size_t ptx_bytes = 0;
   size_t hidden_cubins = 0;
+  bool requires_external_storage = false;
 };
 
 inline std::string_view Trim(std::string_view value) {
@@ -109,10 +110,15 @@ inline bool FindTargetDigits(std::span<const unsigned char> raw, uint32_t target
       digit = static_cast<size_t>(target.data() - text.data()) + 3;
     } else if (is_directive(".version")) {
       const auto version = Trim(line.substr(8));
-      if (version.size() != 3 || version[0] != '8' || version[1] != '.' ||
-          version[2] < '0' || version[2] > '7' || ++versions != 1) {
-        return false;
-      }
+      const auto dot = version.find('.');
+      const auto digits = [](std::string_view value) {
+        return !value.empty() && std::all_of(value.begin(), value.end(),
+            [](char c) { return c >= '0' && c <= '9'; });
+      };
+      if (dot == version.npos || !digits(version.substr(0, dot)) ||
+          !digits(version.substr(dot + 1)) || ++versions != 1) return false;
+      // Keep the declared ISA version unchanged. An unfamiliar number alone
+      // does not veto a trial; actual syntax/instructions and the driver do.
     } else if (is_directive(".address_size")) {
       if (Trim(line.substr(13)) != "64" || ++addresses != 1) return false;
     }
@@ -135,10 +141,11 @@ inline bool FindTargetDigits(std::span<const unsigned char> raw, uint32_t target
   }
 
   if (target_sm == 75) {
+    if (HasTuringHalfMinMax(text)) return false;
     // PTX features introduced with Ampere cannot be enabled by changing .target.
     constexpr std::string_view kSm80Instructions[] = {
         "cp.async", "mbarrier.", "redux.sync", "mma.sp.", ".bf16", ".tf32",
-        ".f16x2.f32", "max.f16", "min.f16",
+        ".f16x2.f32", "max.f16", "min.f16", ".relu",
         "mma.sync.aligned.m16n8k16", "mma.sync.aligned.m16n8k32",
         "mma.sync.aligned.m16n8k64", "mma.sync.aligned.m8n8k128",
         "mma.sync.aligned.m16n8k128", "mma.sync.aligned.m16n8k256",
@@ -152,83 +159,6 @@ inline bool FindTargetDigits(std::span<const unsigned char> raw, uint32_t target
          text.find(".entry") != text.npos;
 }
 
-
-struct PackedHalfProfile {
-  size_t bytes;
-  uint64_t fingerprint;
-  size_t conversions;
-};
-
-// The only inspected SM89 packed-half programs in DLSS-G 310.9.1.
-inline constexpr PackedHalfProfile kPackedHalfProfiles[] = {
-    {42029, 0x9b5219cdd66e0969ull, 20},  // BlendCandidatesFused
-    {10036, 0x87e83571b0c08cbeull, 1},   // DL1Net_Input
-    {30175, 0x6578876be2b5fbe2ull, 8},   // OutputPull
-    {11165, 0x1d6ba2d7fd03152eull, 8},   // OutputPullMiddle
-    {52834, 0x62a7b5ee15c6f3e1ull, 2},   // OutputPush
-};
-
-inline size_t PackedHalfCount(std::string_view source) {
-  const auto hash = SourceFingerprint(source);
-  for (const auto& profile : kPackedHalfProfiles) {
-    if (source.size() == profile.bytes && hash == profile.fingerprint)
-      return profile.conversions;
-  }
-  return 0;
-}
-
-
-struct TuringMmaProfile {
-  size_t bytes;
-  uint64_t fingerprint;
-  size_t instructions;
-  HalfMinMaxCounts half_minmax;
-};
-
-// Exact single-image SM89 programs in DLSS-G 310.9.1 that use the Ampere
-// m16n8k16 f16 MMA shape. Unknown programs remain rejected.
-inline constexpr TuringMmaProfile kTuringMmaProfiles[] = {
-    {20437, 0xce2c5c3f5d55cd81ull, 18, {4, 4, 0, 0}},
-    {11638, 0x75fe3a8642b3e477ull, 9, {0, 0, 4, 2}},
-    {16101, 0xd932cb22dd83419eull, 18, {0, 0, 4, 2}},
-    {15662, 0x6702b594af03caecull, 18, {0, 0, 4, 2}},
-    {16341, 0x8eb26063a973182cull, 12, {0, 0, 4, 2}},
-    {13231, 0xbc841338134753c6ull, 12, {0, 0, 4, 2}},
-    {14603, 0xdde1c125651eb889ull, 9, {0, 0, 4, 2}},
-    {11750, 0xfdfe9b7351889bfdull, 9, {0, 0, 4, 2}},
-    {14684, 0xc83bdce19a1a249full, 18, {0, 0, 4, 2}},
-    {14693, 0x400b19b43610cce1ull, 18, {0, 0, 4, 2}},
-    {17609, 0xe0ba6d48fb005cc1ull, 9, {4, 4, 0, 0}},
-    {33114, 0xa582db83fc911fe0ull, 32, {8, 0, 0, 0}},
-    {16453, 0xfb821a89f2997eceull, 16, {16, 0, 0, 0}},
-    {32740, 0x802242e77fae47cbull, 36, {16, 0, 0, 0}},
-    {12511, 0xe52f68bf382c1392ull, 8, {16, 0, 0, 0}},
-    {9881, 0xdba2cda2f6af70a5ull, 4, {0, 0, 0, 0}},
-    {56261, 0x80fccb8da5f37636ull, 108, {48, 0, 0, 0}},
-    {12754, 0xe1fd0775658c8dd3ull, 8, {16, 0, 0, 0}},
-    {59794, 0x58f45c0876b5b7c5ull, 64, {8, 0, 0, 0}},
-    {33295, 0x3e454577f62ecf8full, 36, {16, 0, 0, 0}},
-    {43831, 0x6e407251363cf2a5ull, 48, {8, 0, 0, 0}},
-    {33114, 0x625ec319e7d0a5c9ull, 32, {8, 0, 0, 0}},
-    {33114, 0xe5fa510399d45224ull, 32, {8, 0, 0, 0}},
-    {20153, 0xdef932bb960c28d0ull, 16, {8, 0, 0, 0}},
-    {24116, 0x5702cf69c73d6af4ull, 32, {16, 0, 0, 0}},
-    {24206, 0xdc473e258540ef53ull, 32, {16, 0, 0, 0}},
-    {16214, 0x92f1a598e2b2254cull, 16, {16, 0, 0, 0}},
-};
-
-inline const TuringMmaProfile* FindTuringMmaProfile(std::string_view source) {
-  const auto hash = SourceFingerprint(source);
-  for (const auto& profile : kTuringMmaProfiles) {
-    if (source.size() == profile.bytes && hash == profile.fingerprint) return &profile;
-  }
-  return nullptr;
-}
-
-inline size_t TuringMmaCount(std::string_view source) {
-  const auto* profile = FindTuringMmaProfile(source);
-  return profile == nullptr ? 0 : profile->instructions;
-}
 
 // The lowered program fits inside the original complete container, but not
 // necessarily its compressed PTX slot. Publish one uncompressed SM75 image;
@@ -268,11 +198,22 @@ inline bool RebuildLoweredProvider(std::span<const unsigned char> bytes,
 }
 
 
+inline bool ReviewedInPlacePtxLayout(const fatbin::Entry& source,
+                                    const ArchitectureProfile& profile) {
+  if (source.compressed_bytes == 0 || source.unpacked_bytes == 0) return false;
+  if (source.flags == 0x2041) return true;
+  // Observed newer legacy-network form: still a bounded LZ4 PTX entry, but
+  // with a 120-byte header and 0x2011 flags. Both targets keep the complete
+  // entry header and require decoded-byte verification after any rebuild.
+  return (profile.target_sm == 86 || profile.target_sm == 75) &&
+         source.flags == 0x2011 && source.header_bytes == 120;
+}
+
 inline bool RebuildCompressedProvider(std::span<const unsigned char> bytes,
                                       const fatbin::Entry& source,
                                       const std::string& text,
                                       std::vector<unsigned char>& replacement) {
-  if (source.flags != 0x2041 || source.compressed_bytes == 0 ||
+  if (!ReviewedInPlacePtxLayout(source, architecture::kTuring) ||
       text.size() + 1 > fatbin::kMaxPtxBytes || source.PayloadOffset() > bytes.size() ||
       source.payload_bytes > bytes.size() - source.PayloadOffset()) return false;
 
@@ -308,9 +249,89 @@ inline bool RebuildCompressedProvider(std::span<const unsigned char> bytes,
 }
 
 
+// Reclaim the complete bounded container for one compressed target image.
+// Called only after the established in-place encodings failed. Other embedded
+// architectures cannot serve SM75, and no byte beyond the original container
+// is borrowed. Header extensions are preserved from the selected entry.
+inline bool RepackCompressedProvider(std::span<const unsigned char> bytes,
+                                    const fatbin::Entry& source, const std::string& text,
+                                    std::vector<unsigned char>& replacement) {
+  if (source.offset>bytes.size() || source.header_bytes>bytes.size()-source.offset ||
+      bytes.size()<fatbin::kHeaderBytes+source.header_bytes ||
+      !ReviewedInPlacePtxLayout(source,architecture::kTuring) ||
+      text.size()+1>fatbin::kMaxPtxBytes) return false;
+  std::string raw=text; raw.push_back(0);
+  const size_t capacity=(bytes.size()-fatbin::kHeaderBytes-source.header_bytes)&~size_t{7};
+  std::vector<unsigned char> compressed;
+  if (!fatbin::Lz4BlockCompress(raw,capacity,compressed) &&
+      !fatbin::Lz4BlockCompressHigh(raw,capacity,compressed)) return false;
+  const size_t stored=(compressed.size()+7)&~size_t{7};
+  replacement.assign(bytes.begin(),bytes.end());
+  auto* entry=replacement.data()+fatbin::kHeaderBytes;
+  std::memmove(entry,bytes.data()+source.offset,source.header_bytes);
+  // Retain the original physical extent: trailing former entries become
+  // padding of this entry, not new containers on a subsequent image scan.
+  const uint64_t outer=source.header_bytes+capacity, payload=capacity, unpacked=raw.size();
+  const uint32_t size=static_cast<uint32_t>(compressed.size()), target=75;
+  std::memcpy(replacement.data()+8,&outer,8);
+  std::memcpy(entry+8,&payload,8); std::memcpy(entry+16,&size,4);
+  std::memcpy(entry+28,&target,4); std::memcpy(entry+56,&unpacked,8);
+  std::memset(entry+source.header_bytes,0,stored);
+  std::memcpy(entry+source.header_bytes,compressed.data(),compressed.size());
+  std::vector<fatbin::Entry> entries; size_t end=0;
+  if(!fatbin::Parse(replacement,entries,end) || entries.size()!=1 ||
+      entries[0].architecture!=75 || end!=fatbin::kHeaderBytes+outer) return false;
+  std::vector<unsigned char> decoded(raw.size());
+  return fatbin::Lz4BlockDecompress(replacement.data()+entries[0].PayloadOffset(),size,
+      decoded.data(),decoded.size()) && std::equal(decoded.begin(),decoded.end(),
+      reinterpret_cast<const unsigned char*>(raw.data()));
+}
+
+// A plan can outgrow its slot, but cannot publish itself. The provider must
+// subsequently prove every supported host loadsite and retain the allocation
+// with its rollback state. This helper only builds bytes in private memory.
+inline bool BuildExternalProvider(std::span<const unsigned char> bytes,
+                                 const fatbin::Entry& source, const std::string& text,
+                                 std::vector<unsigned char>& replacement) {
+  if(text.size()+1>fatbin::kMaxPtxBytes) return false;
+  const size_t total=fatbin::kHeaderBytes+source.header_bytes+((text.size()+1+7)&~size_t{7});
+  if(total<=bytes.size() || total>fatbin::kMaxFatbinBytes) return false;
+  std::vector<unsigned char> storage(bytes.begin(),bytes.end());storage.resize(total);
+  return RebuildLoweredProvider(storage,source,text,replacement);
+}
+
+
+// A fatbin kind-1 record is not necessarily readable PTX. Some valid LZ4
+// records decode to an opaque image. Classify the source BEFORE invoking text
+// lowerings; random binary quote bytes must not be reported as PTX syntax.
+// This only selects a parser. FindTargetDigits and the lowering validators
+// still authorize every text transformation, with no ISA-version whitelist.
+inline bool HasTextPtxPrefix(std::span<const unsigned char> raw) {
+  const auto nul=std::find(raw.begin(),raw.end(),0);
+  if(nul==raw.end())return false;
+  const std::string_view text(reinterpret_cast<const char*>(raw.data()),static_cast<size_t>(nul-raw.begin()));
+  size_t at=0;
+  for(;;) {
+    while(at<text.size()&&(text[at]==' '||text[at]=='\t'||text[at]=='\r'||text[at]=='\n'))++at;
+    if(text.substr(at,2)=="//") {
+      const auto end=text.find('\n',at+2);if(end==text.npos)return false;at=end+1;
+    } else if(text.substr(at,2)=="/*") {
+      const auto end=text.find("*/",at+2);if(end==text.npos)return false;at=end+2;
+    } else break;
+  }
+  if(!text.substr(at).starts_with(".version")||at+8>=text.size()||
+      (text[at+8]!=' '&&text[at+8]!='\t'))return false;
+  // UTF-8 in quoted filenames/comments is not an ISA restriction. Only
+  // binary control bytes (other than ordinary text whitespace) disqualify.
+  return std::none_of(text.begin(),text.end(),[](unsigned char c){
+    return (c<32&&c!='\n'&&c!='\r'&&c!='\t')||c==127;
+  });
+}
+
 inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::string& reason,
                         const ArchitectureProfile& profile = architecture::kAmpere) {
   reason.clear();
+  plan.requires_external_storage = false;
 
   std::vector<fatbin::Entry> entries;
   size_t end = 0;
@@ -337,19 +358,27 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
     return Result::kUnchanged;
   }
 
-  // Only these two entry orders have been inspected and regression-tested. A
-  // new provider layout must be reviewed as a complete selectable image set.
+  // Preserve the established byte layout for the two common forms. Other
+  // bounded entry orders use the unique SM89 PTX, compacted to one visible
+  // entry; do not let an unrelated image take precedence over that trial.
   const bool single = entries.size() == 1 && entries[0].kind == 1 &&
                       entries[0].architecture == 89;
   const bool mixed = entries.size() == 3 && entries[0].kind == 1 &&
                      entries[0].architecture == 120 && entries[1].kind == 1 &&
                      entries[1].architecture == 89 && entries[2].kind == 2 &&
                      entries[2].architecture == 89;
-  if (!single && !mixed) return reject("unreviewed fatbin image ordering");
-
-  const auto& entry = entries[mixed ? 1 : 0];
-  if (entry.flags != 0x2041 || entry.compressed_bytes == 0 || entry.unpacked_bytes == 0) {
-    return reject("unreviewed PTX compression flags");
+  const fatbin::Entry* selected = nullptr;
+  size_t cubins = 0;
+  for (const auto& candidate : entries) {
+    if (candidate.kind == 2) ++cubins;
+    if (candidate.kind != 1 || candidate.architecture != 89) continue;
+    if (selected) return reject("ambiguous SM89 PTX entries");
+    selected = &candidate;
+  }
+  if (!selected) return reject("SM89 image has no retargetable PTX entry");
+  const auto& entry = *selected;
+  if (!ReviewedInPlacePtxLayout(entry, profile)) {
+    return reject("unreviewed PTX compression flags/layout");
   }
 
   std::vector<unsigned char> raw(entry.unpacked_bytes);
@@ -360,52 +389,43 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
   }
 
   if (profile.target_sm == 75) {
+    if(!HasTextPtxPrefix(raw))
+      return reject("SM75 opaque/unsupported SM89 source encoding: decoded kind-1 image is not textual PTX");
     const auto nul = std::find(raw.begin(), raw.end(), 0);
     if (nul == raw.end()) return reject("PTX terminator missing");
     std::string text(raw.begin(), nul);
     std::erase(text, '\r');
-    size_t original_digit = 0;
-    if (HasPackedHalfConversion(text) && !FindTargetDigits(raw, 75, original_digit)) {
-      const size_t count = PackedHalfCount(text);
-      if (!mixed || count == 0) return reject("unqualified SM75 packed-half source");
-      if (!LowerPackedHalf(text, 75, count, reason)) { plan = {}; return Result::kRejected; }
+    Sm75LoweringCounts counts;
+    if (!LowerSm75Structurally(text, counts, reason)) { plan = {}; return Result::kRejected; }
+    if (counts.Total()) {
+      // Preserve the established layout of the physically tested reference:
+      // packed-half mixed containers use the reclaimed whole-container space;
+      // network programs stay compressed. This choice is by layout, not hash.
+      if ((counts.mma || counts.half_minmax.Total() || counts.fma_relu) && !CompactProviderPtx(text, reason)) {
+        plan = {}; return Result::kRejected;
+      }
       std::vector<unsigned char> lowered(text.begin(), text.end());
       lowered.push_back(0);
       size_t digit = 0;
       if (!FindTargetDigits(lowered, 75, digit))
         return reject("lowered PTX has unsupported header/instructions");
       text.replace(digit, 2, "75");
-      if (!RebuildLoweredProvider(bytes.first(end), entry, text, plan.replacement))
-        return reject("lowered SM75 program exceeds original provider container");
-      plan.ptx_offset = fatbin::kHeaderBytes + entry.header_bytes;
-      plan.ptx_bytes = text.size() + 1;
-      plan.hidden_cubins = 1;
-      return Result::kRetargeted;
-    }
-
-    if (HasTuringMma16816(text)) {
-      const auto* turing = FindTuringMmaProfile(text);
-      if (!single || turing == nullptr) return reject("unqualified SM75 m16n8k16 source");
-      if (!LowerTuringMma16816(text, 75, turing->instructions, reason) ||
-          !LowerTuringHalfMinMax(text, 75, turing->half_minmax, reason)) {
-        plan = {};
-        return Result::kRejected;
+      bool rebuilt = false;
+      if (single) rebuilt = RebuildCompressedProvider(bytes.first(end), entry, text, plan.replacement);
+      if (!rebuilt) rebuilt = RebuildLoweredProvider(bytes.first(end), entry, text, plan.replacement);
+      if (!rebuilt) rebuilt = RepackCompressedProvider(bytes.first(end),entry,text,plan.replacement);
+      if (!rebuilt) {
+        rebuilt = BuildExternalProvider(bytes.first(end),entry,text,plan.replacement);
+        plan.requires_external_storage = rebuilt;
       }
-      if (!CompactProviderPtx(text, reason)) {
-        plan = {};
-        return Result::kRejected;
-      }
-      std::vector<unsigned char> lowered(text.begin(), text.end());
-      lowered.push_back(0);
-      size_t digit = 0;
-      if (!FindTargetDigits(lowered, 75, digit))
-        return reject("lowered MMA PTX has unsupported header/instructions");
-      text.replace(digit, 2, "75");
-      if (!RebuildCompressedProvider(bytes.first(end), entry, text, plan.replacement))
-        return reject("lowered SM75 MMA program does not fit its compressed provider container");
-      plan.ptx_offset = entry.PayloadOffset();
+      if (!rebuilt) return reject("lowered SM75 storage rebuild failed");
+      std::vector<fatbin::Entry> verified;
+      size_t rebuilt_end = 0;
+      if (!fatbin::Parse(plan.replacement, verified, rebuilt_end) || verified.size() != 1)
+        return reject("lowered SM75 rebuild verification failed");
+      plan.ptx_offset = verified.front().PayloadOffset();
       plan.ptx_bytes = text.size() + 1;
-      plan.hidden_cubins = 0;
+      plan.hidden_cubins = cubins;
       return Result::kRetargeted;
     }
   }
@@ -443,10 +463,19 @@ inline Result Retarget(std::span<const unsigned char> bytes, Plan& plan, std::st
               sizeof(profile.target_sm));
   std::memcpy(replacement.data() + 8, &visible_bytes, sizeof(visible_bytes));
 
+  size_t ptx_offset = entry.PayloadOffset();
+  if (!single && !mixed) {
+    const size_t entry_bytes = entry.End() - entry.offset;
+    std::memmove(replacement.data() + fatbin::kHeaderBytes,
+                 replacement.data() + entry.offset, entry_bytes);
+    const uint64_t compact_visible = entry_bytes;
+    std::memcpy(replacement.data() + 8, &compact_visible, sizeof(compact_visible));
+    ptx_offset = fatbin::kHeaderBytes + entry.header_bytes;
+  }
   plan.replacement = std::move(replacement);
-  plan.ptx_offset = entry.PayloadOffset();
+  plan.ptx_offset = ptx_offset;
   plan.ptx_bytes = entry.unpacked_bytes;
-  plan.hidden_cubins = mixed ? 1 : 0;
+  plan.hidden_cubins = cubins;
   return Result::kRetargeted;
 }
 

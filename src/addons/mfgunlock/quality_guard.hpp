@@ -27,6 +27,8 @@ enum Issue : uint32_t {
   kOutputEncodingUnknown = 1u << 6,
   kOutputEncodingUnsupported = 1u << 7,
   kUiEncodingMismatch = 1u << 8,
+  kDuplicateOptionalTag = 1u << 9,
+  kVulkanResourceMetadataUnknown = 1u << 10,
 };
 
 enum class SuppressionPolicy : uint32_t {
@@ -46,6 +48,8 @@ struct OutputDescription {
 
 struct Assessment {
   uint32_t issues = kNone;
+  uint32_t vulkan_metadata_touched = 0;
+  uint32_t vulkan_metadata_unknown = 0;
   bool has_hud_separation = false;
   bool has_hudless_color = false;
   bool has_ui_color_or_alpha = false;
@@ -75,7 +79,7 @@ inline bool HasStructuralIssues(const Assessment& assessment) {
   constexpr uint32_t kStructuralIssues =
       kInvalidOptionalResource | kHudlessExtentMismatch |
       kHudlessFormatMismatch | kUiExtentMismatch |
-      kUiColorAlphaLowPrecision;
+      kUiColorAlphaLowPrecision | kDuplicateOptionalTag;
   return (assessment.issues & kStructuralIssues) != 0;
 }
 
@@ -145,7 +149,14 @@ inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count,
     if (!IsHudSeparationType(tag.type)) continue;
 
     result.has_hud_separation = true;
-    if (tag.resource == nullptr) {
+    const uint32_t metadata_role = tag.type == sl::kBufferTypeHUDLessColor ? 1u :
+        tag.type == sl::kBufferTypeUIColorAndAlpha ? 2u : 4u;
+    result.vulkan_metadata_touched |= metadata_role;
+    for (uint32_t previous = 0; previous < index; ++previous)
+      if (tags[previous].type == tag.type) result.issues |= kDuplicateOptionalTag;
+    if (tag.structType != sl::ResourceTag::s_structType ||
+        tag.structVersion != sl::kStructVersion1) result.issues |= kInvalidOptionalResource;
+    if (tag.resource == nullptr || tag.resource->native == nullptr) {
       result.clears_hudless_color |= tag.type == sl::kBufferTypeHUDLessColor;
       result.clears_ui_color_alpha |= tag.type == sl::kBufferTypeUIColorAndAlpha;
       result.clears_ui_alpha |= tag.type == sl::kBufferTypeUIAlpha;
@@ -162,6 +173,23 @@ inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count,
     bool valid = false;
     const auto resource = Describe(tag, &valid);
     if (!valid) result.issues |= kInvalidOptionalResource;
+    if (outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan) {
+      const auto kind = vulkancontract::ClassifyFormat(resource.format);
+      // Vulkan has no COM retention and state is a VkImageLayout, not a D3D12
+      // usage mask. Unknown metadata blocks only OUR recomposition request;
+      // native tags, including extension layouts, are still forwarded unchanged.
+      if (!tag.resource->view || !vulkancontract::DefinedLayout(tag.resource->state) ||
+          !resource.HasDimensions() || !resource.HasFormat() ||
+          (tag.type == sl::kBufferTypeUIColorAndAlpha &&
+           kind != vulkancontract::FormatKind::kRgba8 &&
+           kind != vulkancontract::FormatKind::kBgra8 &&
+           kind != vulkancontract::FormatKind::kRgba16Float &&
+           kind != vulkancontract::FormatKind::kRgb10A2)) {
+        result.issues |= kVulkanResourceMetadataUnknown;
+        result.vulkan_metadata_unknown |= metadata_role;
+      }
+    }
+
     if (resource.HasDimensions() && output.HasDimensions() &&
         (resource.width != output.width || resource.height != output.height)) {
       result.issues |= tag.type == sl::kBufferTypeHUDLessColor
@@ -172,9 +200,9 @@ inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count,
         output.HasFormat() && resource.format != output.format) {
       result.issues |= kHudlessFormatMismatch;
     }
-    // DXGI_FORMAT_R10G10B10A2_UNORM has only two alpha bits and is not a
+    // RGB10A2 has two alpha bits in both APIs (different enum values) and is not a
     // sufficiently precise UI Color & Alpha separation mask.
-    if (tag.type == sl::kBufferTypeUIColorAndAlpha && resource.format == 24) {
+    if (tag.type == sl::kBufferTypeUIColorAndAlpha && outputstate::LowPrecisionUiAlpha(resource.format)) {
       result.issues |= kUiColorAlphaLowPrecision;
     }
   }
@@ -229,7 +257,8 @@ inline bool IsStructurallyValidForUiRecomposition(const Assessment& assessment) 
 
 inline bool CanAutomaticallyUseUiRecomposition(
     const Assessment& assessment, const outputstate::State& output_state) {
-  return outputstate::SupportsHudSeparation(output_state) &&
+  return !(assessment.issues & kVulkanResourceMetadataUnknown) &&
+         outputstate::SupportsHudSeparation(output_state) &&
          IsStructurallyValidForUiRecomposition(assessment) &&
          outputstate::IsUiEncodingCompatible(
              output_state, NativeUiEncoding(assessment), true);
@@ -247,20 +276,13 @@ inline SuppressionPolicy ResolveSuppression(
   if (!outputstate::SupportsHudSeparation(output_state))
     return SuppressionPolicy::kNone;
 
-  const bool eligible =
-      CanAutomaticallyUseUiRecomposition(accumulated, output_state);
-  const bool complete_current_pair =
-      current.has_hudless_color && current.has_ui_color_or_alpha;
-  if (eligible) {
-    if (!was_recomposition_eligible && !complete_current_pair &&
-        current.has_ui_color_or_alpha) {
-      return SuppressionPolicy::kUiOnly;
-    }
-    return SuppressionPolicy::kNone;
-  }
-
-  return current.has_ui_color_or_alpha ? SuppressionPolicy::kUiOnly
-                                       : SuppressionPolicy::kNone;
+  // A native application may deliver UI and HUDless in separate calls and
+  // in either order before Present. Withholding the first valid UI tag makes
+  // the accumulated model claim a pair that the provider never received.
+  // Keep readiness conservative, but do not rewrite native intent merely
+  // because the pair is temporarily incomplete on the CPU.
+  (void)was_recomposition_eligible;
+  return SuppressionPolicy::kNone;
 }
 
 inline bool ShouldRequestAutomaticUiPath(const outputstate::State& output_state) {

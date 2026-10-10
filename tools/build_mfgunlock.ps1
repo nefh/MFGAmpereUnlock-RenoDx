@@ -267,6 +267,14 @@ Set-PinnedCheckout `
   -Ref $NvapiRef `
   -Name "NVAPI"
 
+# Header-only compile dependency. Never loads/replaces the game's Vulkan loader.
+$VulkanHeadersRoot = Join-Path $RepoRoot "external\Vulkan-Headers"
+Set-PinnedCheckout -Path $VulkanHeadersRoot `
+  -Url ([string]$Dependencies.vulkan_headers.url) `
+  -Ref ([string]$Dependencies.vulkan_headers.ref) -Name "Vulkan-Headers"
+$VulkanInclude = Join-Path $VulkanHeadersRoot "include"
+Write-Host "Vulkan headers HEAD: $(Get-GitHead -Path $VulkanHeadersRoot)"
+
 $SetupDevEnv = Join-Path $RenoDx "scripts\setup-dev-env.ps1"
 if (-not (Test-Path $SetupDevEnv)) {
   throw "RenoDX setup helper not found: $SetupDevEnv"
@@ -692,6 +700,7 @@ try {
 
     $ClOptions = @(
       "/I`"$NvapiRoot`"",
+      "/I`"$VulkanInclude`"",
       "/I`"$ImGuiInclude`"",
       "/I`"$ReShadeInclude`"",
       "/DMFGUNLOCK_RESHADE_HEADER_OVERRIDE=1",

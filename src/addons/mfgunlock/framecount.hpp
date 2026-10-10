@@ -37,10 +37,13 @@
 #include "./count_observer.hpp"
 #include "./diagnostic_bridge.hpp"
 #include "./integration_contract.hpp"
+#include "./presentation_observer.hpp"
 #include "./output_state.hpp"
 #include <optional>
 #include "./quality_guard.hpp"
 #include "./ui_candidate.hpp"
+#include "./ui_alpha.hpp"
+#include "./ui_submission.hpp"
 
 namespace mfgunlock::framecount {
 
@@ -111,9 +114,11 @@ inline std::atomic_bool g_streamline_plugin_seen{false};
 inline std::atomic<unsigned int> g_streamline_max_generated{0};
 inline std::atomic_bool g_capacity_advertised{false};
 inline std::atomic<unsigned int> g_runtime_max_generated{0};
+inline std::atomic<uint64_t> g_vulkan_native_state_epoch{0};
+inline std::atomic<uint32_t> g_vulkan_native_state_viewport{UINT32_MAX};
 
 // NVIDIA Dynamic MFG is opt-in and only submitted after the current D3D12
-// runtime reports the v4 capability on the validated 2.14.1 / 310.9.1 stack.
+// runtime reports the v4 capability on a typed, qualified runtime stack.
 // The game-owned options structure is never extended or modified in place.
 inline std::atomic_bool g_dynamic_mfg_enabled{false};
 inline std::atomic<unsigned int> g_dynamic_target_fps{0};
@@ -154,6 +159,8 @@ inline std::atomic_bool g_ui_candidate_injection_enabled{true};
 inline std::atomic_bool g_ui_candidate_active{false};
 inline std::atomic_bool g_ui_candidate_ready{false};
 inline std::atomic<uint32_t> g_ui_candidate_format{0};
+inline std::atomic<uint32_t> g_ui_candidate_path{
+    static_cast<uint32_t>(uisubmission::Path::kUnavailable)};
 inline std::atomic_bool g_ui_candidate_options_synced{false};
 inline std::atomic_bool g_ui_candidate_runtime_declined{false};
 inline std::atomic<uint32_t> g_ui_candidate_retry_frames{0};
@@ -178,15 +185,39 @@ struct UiCandidateSnapshot {
   uint32_t rtv_binds_after_clear = 0;
   uint32_t reject_reasons = uicandidate::kStale;
   uint32_t late_writes = 0;
+  uint32_t alpha_convention = 0;
+  uint32_t alpha_draws = 0;
+  uint32_t alpha_unproven_draws = 0;
   uint64_t clear_serial = 0;
+  uint64_t output_revision = 0;
+  uint64_t submission_queue = 0;
+  uint32_t submission_thread = 0;
   bool state_known = false;
+  bool source_submitted = false;
   bool recent = false;
+};
+
+struct UiAlphaCandidateSnapshot {
+  // Native D3D12 command list on which extraction is already recorded.
+  // Only the optional volatile alpha tag may be submitted on this list.
+  sl::CommandBuffer* copy_commands = nullptr;
+  uint64_t ticket = 0;
+  uint32_t slot = UINT32_MAX;
+  uint64_t native_resource = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t format = 0;
+  uint32_t state = 0;
 };
 
 inline void (*g_observe_streamline_ui_tags)(const sl::ResourceTag*, uint32_t) = nullptr;
 inline bool (*g_observe_ui_candidate)(UiCandidateSnapshot*) = nullptr;
 inline bool (*g_acquire_ui_candidate)(const UiCandidateSnapshot*) = nullptr;
 inline void (*g_release_ui_candidate)(const UiCandidateSnapshot*, bool, sl::Result) = nullptr;
+inline bool (*g_prepare_ui_alpha_candidate)(const UiCandidateSnapshot*, sl::CommandBuffer*,
+                                             UiAlphaCandidateSnapshot*) = nullptr;
+inline bool (*g_finish_ui_alpha_candidate)(const UiCandidateSnapshot*,
+    const UiAlphaCandidateSnapshot*, bool, sl::Result) = nullptr;
 
 // The game owns Streamline runtime selection by default. Explicit overrides
 // only change NVIDIA's documented OTA flags for the slInit call.
@@ -206,10 +237,18 @@ inline bool (*g_pacing_ready)() = nullptr;
 // Readiness of provider retargeting, the temporal program and MFG arch gates.
 // Pacing remains owned by g_ensure_pacing below.
 inline bool (*g_multi_frame_ready)() = nullptr;
+inline unsigned int (*g_provider_mfg_ceiling)() = nullptr;
+// Local options/UI policy bound, not evidence about any provider version.
+inline constexpr unsigned int kPolicyGeneratedCeiling = 5;
+inline unsigned int ProviderMfgCeiling() {
+  return g_provider_mfg_ceiling ? g_provider_mfg_ceiling() : kPolicyGeneratedCeiling;
+}
 inline std::atomic_bool g_declined_backend{false};
 inline sl::Result (*g_on_init)(const sl::Preferences&, uint64_t,
     sl::Result (*)(const sl::Preferences&, uint64_t)) = nullptr;
 inline bool (*g_init_compatible)(HMODULE) = nullptr;
+inline bool (*g_interposer_contract_ready)(HMODULE) = nullptr;
+inline hook::ModuleIdentity g_interposer_hook_identity{};
 namespace internal {
 
 using SetOptionsFn = sl::Result (*)(const sl::ViewportHandle&, const sl::DLSSGOptions&);
@@ -258,7 +297,7 @@ inline std::atomic_bool g_ui_hooks_installed{false};
 inline bool KnownOptionsAbi(const sl::DLSSGOptions& options) {
   return options.structType == sl::DLSSGOptions::s_structType &&
          options.structVersion >= sl::kStructVersion1 &&
-         options.structVersion <= profiles::kDlssg31091.options_version;
+         options.structVersion <= sl::kStructVersion5;
 }
 
 inline bool SetFixedOverrideState(FixedOverrideStatus status, unsigned int requested,
@@ -283,7 +322,8 @@ inline bool DynamicStackReady() {
 
 inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result) {
   if (result != sl::Result::eOk || !DynamicStackReady() ||
-      state.structVersion < profiles::kDlssg31091.state_version) {
+      state.structType != sl::DLSSGState::s_structType ||
+      state.structVersion != sl::kStructVersion4) {
     return false;
   }
   if (state.bIsDynamicMFGSupported != sl::Boolean::eTrue &&
@@ -307,6 +347,8 @@ inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result
 constexpr uint32_t kUnusedViewport = (std::numeric_limits<uint32_t>::max)();
 
 struct UiViewportState {
+  // Guarded by lock; unknown Vulkan UI metadata survives split tag batches.
+  uint32_t vulkan_metadata_unknown = 0;
   // Only SetOptions calls are serialized here, never provider maintenance or
   // Evaluate. Automatic submission uses try_lock on the observed native thread.
   std::recursive_mutex options_lock;
@@ -337,6 +379,15 @@ struct UiViewportState {
   std::atomic_bool ui_color_or_alpha_seen{false};
   std::atomic_bool ui_color_alpha_seen{false};
   std::atomic_bool ui_alpha_seen{false};
+  // Native intent is independent from helper-produced tags, including an
+  // explicit null UI tag. Frame-based intent expires with its source token.
+  std::atomic_bool native_ui_owner{false};
+  uint64_t native_tag_frame = UINT64_MAX;
+  bool native_tag_frame_based = false;
+  std::atomic<uint32_t> automatic_ui_tag_type{0};
+  std::atomic<uint32_t> automatic_ui_frame_type{0};
+  std::atomic_bool automatic_ui_tag_global{false};
+  std::atomic_bool automatic_ui_clear_pending{false};
   std::atomic_bool ui_recomposition_invalid{false};
   std::atomic_bool ui_recomposition_eligible{false};
   std::atomic<uint64_t> reset_requested{0};
@@ -390,12 +441,152 @@ inline void ForgetUiOutputs() {
     state.ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
     state.ui_color_alpha_seen.store(false, std::memory_order_relaxed);
     state.ui_alpha_seen.store(false, std::memory_order_relaxed);
+    state.vulkan_metadata_unknown = 0;
+    state.native_ui_owner.store(false, std::memory_order_relaxed);
+    state.native_tag_frame = UINT64_MAX;
+    state.native_tag_frame_based = false;
+    state.automatic_ui_frame_type.store(0, std::memory_order_relaxed);
     state.ui_recomposition_invalid.store(false, std::memory_order_relaxed);
     state.ui_recomposition_eligible.store(false, std::memory_order_relaxed);
     ReleaseSRWLockExclusive(&state.lock);
   }
   g_ui_pair_eligible.store(false, std::memory_order_relaxed);
   g_ui_native_hudless_fallback.store(false, std::memory_order_relaxed);
+}
+
+inline void ClearAutomaticUiTagState(UiViewportState* state) {
+  if (state == nullptr) return;
+  state->automatic_ui_tag_type.store(0, std::memory_order_release);
+  state->automatic_ui_frame_type.store(0, std::memory_order_release);
+  state->automatic_ui_tag_global.store(false, std::memory_order_release);
+  state->automatic_ui_clear_pending.store(false, std::memory_order_release);
+}
+
+inline void MarkAutomaticUiTag(UiViewportState* state, sl::BufferType type,
+                               bool frame_based) {
+  if (state == nullptr) return;
+  if (frame_based) {
+    ClearAutomaticUiTagState(state);
+    // A later native ColorAlpha tag in the SAME source frame must not be
+    // shadowed by our earlier preferred UIAlpha tag. No global ownership.
+    state->automatic_ui_frame_type.store(static_cast<uint32_t>(type), std::memory_order_release);
+    return;
+  }
+  state->automatic_ui_tag_type.store(static_cast<uint32_t>(type),
+                                     std::memory_order_release);
+  state->automatic_ui_tag_global.store(true, std::memory_order_release);
+  state->automatic_ui_clear_pending.store(false, std::memory_order_release);
+}
+
+inline void RequestGlobalAutomaticUiTagRelease() {
+  for (auto& state : g_ui_viewports) {
+    if (state.key.load(std::memory_order_acquire) == kUnusedViewport ||
+        !state.automatic_ui_tag_global.load(std::memory_order_acquire) ||
+        state.automatic_ui_tag_type.load(std::memory_order_acquire) == 0) {
+      continue;
+    }
+    state.automatic_ui_clear_pending.store(true, std::memory_order_release);
+  }
+}
+
+inline bool ReleaseGlobalAutomaticUiTag(UiViewportState* state) {
+  if (state == nullptr ||
+      !state->automatic_ui_tag_global.load(std::memory_order_acquire)) {
+    return true;
+  }
+  const uint32_t key = state->key.load(std::memory_order_acquire);
+  const auto type = static_cast<sl::BufferType>(
+      state->automatic_ui_tag_type.load(std::memory_order_acquire));
+  if (key == kUnusedViewport || type == 0 || g_real_set_tag == nullptr) return false;
+
+  const sl::ResourceTag clear_tag(
+      nullptr, type, sl::ResourceLifecycle::eValidUntilPresent);
+  const sl::Result result = presentation::passive::CallNative([&] {
+    return g_real_set_tag(sl::ViewportHandle(key), &clear_tag, 1, nullptr);
+  });
+  if (result != sl::Result::eOk) return false;
+  ClearAutomaticUiTagState(state);
+  return true;
+}
+
+inline bool BatchContainsTagType(const sl::ResourceTag* tags, uint32_t count,
+                                 sl::BufferType type) {
+  if (tags == nullptr) return false;
+  for (uint32_t index = 0; index < count; ++index) {
+    if (tags[index].type == type) return true;
+  }
+  return false;
+}
+
+template <typename Forward>
+inline sl::Result ForwardWithAutomaticUiRelease(
+    UiViewportState* state, const sl::ResourceTag* tags, uint32_t count,
+    bool frame_based, Forward&& forward) {
+  if (state == nullptr) return forward(tags, count);
+  if (frame_based) {
+    if (state->automatic_ui_tag_global.load(std::memory_order_acquire))
+      ReleaseGlobalAutomaticUiTag(state);
+    const auto owned = static_cast<sl::BufferType>(state->automatic_ui_frame_type.load());
+    bool native_ui = false;
+    if (tags && count <= 64) {
+      for (uint32_t index = 0; index < count; ++index) {
+        if (tags[index].structType != sl::ResourceTag::s_structType ||
+            tags[index].structVersion != sl::kStructVersion1) return forward(tags, count);
+        native_ui |= qualityguard::IsUiColorOrAlphaType(tags[index].type);
+      }
+    }
+    if (!owned || !native_ui) return forward(tags, count);
+    if (BatchContainsTagType(tags, count, owned)) {
+      const auto result = forward(tags, count);
+      if (result == sl::Result::eOk) state->automatic_ui_frame_type.store(0);
+      return result;
+    }
+    alignas(sl::ResourceTag) std::array<std::byte, sizeof(sl::ResourceTag) * 65> storage{};
+    std::memcpy(storage.data(), tags, sizeof(sl::ResourceTag) * count);
+    const sl::ResourceTag clear(nullptr, owned, sl::ResourceLifecycle::eOnlyValidNow);
+    std::memcpy(storage.data() + sizeof(sl::ResourceTag) * count, &clear, sizeof(clear));
+    const auto result = forward(reinterpret_cast<const sl::ResourceTag*>(storage.data()), count + 1);
+    if (result == sl::Result::eOk) state->automatic_ui_frame_type.store(0);
+    return result;
+  }
+  if (!state->automatic_ui_tag_global.load(std::memory_order_acquire) ||
+      !state->automatic_ui_clear_pending.load(std::memory_order_acquire)) {
+    return forward(tags, count);
+  }
+
+  const auto type = static_cast<sl::BufferType>(
+      state->automatic_ui_tag_type.load(std::memory_order_acquire));
+  if (type == 0) {
+    ClearAutomaticUiTagState(state);
+    return forward(tags, count);
+  }
+  if (count >= 65) {
+    ReleaseGlobalAutomaticUiTag(state);
+    return forward(tags, count);
+  }
+  if (BatchContainsTagType(tags, count, type)) {
+    const sl::Result result = forward(tags, count);
+    if (result == sl::Result::eOk) ClearAutomaticUiTagState(state);
+    return result;
+  }
+
+  static_assert(std::is_trivially_copyable_v<sl::ResourceTag>);
+  alignas(sl::ResourceTag)
+      std::array<std::byte, sizeof(sl::ResourceTag) * 65> storage{};
+  if (tags != nullptr && count != 0)
+    std::memcpy(storage.data(), tags, sizeof(sl::ResourceTag) * count);
+  const sl::ResourceTag clear_tag(
+      nullptr, type, sl::ResourceLifecycle::eValidUntilPresent);
+  std::memcpy(storage.data() + sizeof(sl::ResourceTag) * count,
+              &clear_tag, sizeof(clear_tag));
+  const auto* forwarded = reinterpret_cast<const sl::ResourceTag*>(storage.data());
+  const sl::Result result = forward(forwarded, count + 1);
+  if (result == sl::Result::eOk) ClearAutomaticUiTagState(state);
+  return result;
+}
+
+inline void ReleaseGlobalAutomaticUiTags() {
+  for (auto& state : g_ui_viewports) ReleaseGlobalAutomaticUiTag(&state);
 }
 
 inline void ObserveUiOptionsTransition(const sl::ViewportHandle& viewport,
@@ -445,20 +636,32 @@ inline qualityguard::OutputDescription ExpectedUiOutput(const UiViewportState* s
   return result;
 }
 
-inline void UpdateUiCandidateFormat(uint32_t format) {
-  if (format == 0) return;
+inline void UpdateUiCandidate(uisubmission::Path path, uint32_t format = 0) {
+  if (path == uisubmission::Path::kUnavailable) return;
+  if (path == uisubmission::Path::kColorAndAlpha && format == 0) return;
   const bool was_ready = g_ui_candidate_ready.exchange(true, std::memory_order_acq_rel);
-  const uint32_t previous = g_ui_candidate_format.exchange(
-      format, std::memory_order_acq_rel);
-  if (!was_ready || previous != format) {
+  const uint32_t options_format = path == uisubmission::Path::kColorAndAlpha ? format : 0;
+  const uint32_t previous_format = g_ui_candidate_format.exchange(
+      options_format, std::memory_order_acq_rel);
+  const uint32_t previous_path = g_ui_candidate_path.exchange(
+      static_cast<uint32_t>(path), std::memory_order_acq_rel);
+  if (!was_ready || previous_format != options_format ||
+      previous_path != static_cast<uint32_t>(path)) {
     g_ui_candidate_options_synced.store(false, std::memory_order_release);
     NotifyLiveOptionsChanged();
   }
 }
 
+inline void UpdateUiCandidateFormat(uint32_t format) {
+  UpdateUiCandidate(uisubmission::Path::kColorAndAlpha, format);
+}
+
 inline void NotifyUiCandidateUnavailable() {
+  RequestGlobalAutomaticUiTagRelease();
   g_ui_candidate_ready.store(false, std::memory_order_release);
   g_ui_candidate_format.store(0, std::memory_order_release);
+  g_ui_candidate_path.store(static_cast<uint32_t>(uisubmission::Path::kUnavailable),
+                            std::memory_order_release);
   g_ui_candidate_active.store(false, std::memory_order_relaxed);
   g_ui_candidate_options_synced.store(false, std::memory_order_release);
 }
@@ -466,6 +669,21 @@ inline void NotifyUiCandidateUnavailable() {
 inline bool CandidateInjectionRequested() {
   return g_ui_candidate_injection_enabled.load(std::memory_order_relaxed) &&
          !g_ui_candidate_runtime_declined.load(std::memory_order_acquire);
+}
+
+inline bool CandidateColorAlphaProven(const UiCandidateSnapshot& candidate) {
+  return static_cast<uialpha::AlphaConvention>(candidate.alpha_convention) ==
+      uialpha::AlphaConvention::kPremultiplied;
+}
+
+inline uisubmission::Path CandidateSubmissionPath(
+    const UiCandidateSnapshot& candidate) {
+  return uisubmission::Select(
+      outputstate::Read(),
+      {static_cast<outputstate::UiEncoding>(candidate.ui_encoding),
+       static_cast<uialpha::AlphaConvention>(candidate.alpha_convention),
+       candidate.format},
+      g_prepare_ui_alpha_candidate != nullptr && g_finish_ui_alpha_candidate != nullptr);
 }
 
 inline bool ConsumeCandidateRetryFrame() {
@@ -525,6 +743,26 @@ inline bool BuildUiCompositionOptions(const sl::DLSSGOptions& source,
   return true;
 }
 
+inline bool CandidateOptionsSynchronized(const sl::DLSSGOptions& forwarded) {
+  if (!CandidateInjectionRequested() ||
+      !g_ui_candidate_ready.load(std::memory_order_acquire)) {
+    return false;
+  }
+
+  const auto path = static_cast<uisubmission::Path>(
+      g_ui_candidate_path.load(std::memory_order_acquire));
+  if (path == uisubmission::Path::kAlphaOnly) {
+    // UI Alpha carries coverage only. It does not use DLSSGOptions::uiBufferFormat,
+    // so an accepted UIR options submission is sufficient to synchronize it.
+    return true;
+  }
+  if (path != uisubmission::Path::kColorAndAlpha) return false;
+
+  const uint32_t candidate_format =
+      g_ui_candidate_format.load(std::memory_order_acquire);
+  return candidate_format != 0 && forwarded.uiBufferFormat == candidate_format;
+}
+
 inline uint32_t SuppressHudSeparationResources(sl::ResourceTag* tags, uint32_t count) {
   if (tags == nullptr) return 0;
   uint32_t suppressed = 0;
@@ -555,6 +793,16 @@ inline bool ShouldRequestUiComposition(const sl::DLSSGOptions& options) {
 
 using ModeObserver = void (*)(uint32_t, uint32_t, uint32_t);
 inline std::atomic<ModeObserver> g_mode_observer{nullptr};
+
+inline presentation::ProviderMode PresentationMode(sl::DLSSGMode mode) {
+  switch (mode) {
+    case sl::DLSSGMode::eOff: return presentation::ProviderMode::kOff;
+    case sl::DLSSGMode::eOn: return presentation::ProviderMode::kFixed;
+    case sl::DLSSGMode::eAuto: return presentation::ProviderMode::kAuto;
+    case sl::DLSSGMode::eDynamic: return presentation::ProviderMode::kDynamic;
+    default: return presentation::ProviderMode::kUnknown;
+  }
+}
 
 inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
                                  const sl::DLSSGOptions& options,
@@ -607,14 +855,20 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
             : integration::kUnknown32,
         GetCurrentThreadId());
   }
-  const auto result = real(viewport, options);
+  const auto result = presentation::passive::CallNative([&] { return real(viewport, options); });
   if (result == sl::Result::eOk && KnownOptionsAbi(options)) {
     g_last_accepted_mode.store(static_cast<uint32_t>(options.mode),
                                std::memory_order_relaxed);
     g_last_accepted_generated.store(
         options.mode == sl::DLSSGMode::eOff ? 0u : options.numFramesToGenerate,
         std::memory_order_relaxed);
+    const auto presentation_mode = PresentationMode(options.mode);
+    presentation::ObserveProviderOptions(
+        presentation_mode,
+        presentation_mode == presentation::ProviderMode::kFixed
+            ? options.numFramesToGenerate + 1u : 0u, static_cast<uint32_t>(viewport));
   } else {
+    presentation::ObserveProviderUnavailable();
     g_last_accepted_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
     g_last_accepted_generated.store(diagnostic::kUnknown32,
                                     std::memory_order_relaxed);
@@ -692,12 +946,8 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
                                 std::memory_order_relaxed);
   if (result == sl::Result::eOk) {
     ObserveUiOptionsTransition(viewport, forwarded);
-    const uint32_t candidate_format =
-        g_ui_candidate_format.load(std::memory_order_acquire);
-    const bool candidate_synced = CandidateInjectionRequested() &&
-        g_ui_candidate_ready.load(std::memory_order_acquire) &&
-        candidate_format != 0 && forwarded.uiBufferFormat == candidate_format;
-    g_ui_candidate_options_synced.store(candidate_synced, std::memory_order_release);
+    g_ui_candidate_options_synced.store(
+        CandidateOptionsSynchronized(forwarded), std::memory_order_release);
     g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
     if (!g_ui_composition_applied.exchange(true, std::memory_order_relaxed)) {
       reshade::log::message(
@@ -799,15 +1049,26 @@ inline sl::Result InitWithPreferences(const sl::Preferences& pref, uint64_t sdk_
 }
 
 inline sl::Result HookedInit(const sl::Preferences& pref, uint64_t sdk_version) {
-  return g_on_init ? g_on_init(pref, sdk_version, InitWithPreferences)
-                   : InitWithPreferences(pref, sdk_version);
+  const auto previous = outputstate::GetResourceApi();
+  if (pref.structType == sl::Preferences::s_structType && pref.structVersion == sl::kStructVersion1) {
+    if (pref.renderAPI == sl::RenderAPI::eVulkan)
+      outputstate::SetResourceApi(outputstate::ResourceApi::kVulkan);
+    else if (pref.renderAPI == sl::RenderAPI::eD3D12)
+      outputstate::SetResourceApi(outputstate::ResourceApi::kD3D12);
+  }
+  const auto result = g_on_init ? g_on_init(pref, sdk_version, InitWithPreferences)
+                               : InitWithPreferences(pref, sdk_version);
+  if (result != sl::Result::eOk) outputstate::SetResourceApi(previous);
+  return result;
 }
 
 inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
                                   const sl::DLSSGOptions& options, uint64_t caller,
                                   bool automatic = false) {
+  presentation::passive::CpuScope timing(presentation::passive::CpuKind::kSetOptions);
   if (RealSetOptions() == nullptr) return sl::Result::eErrorNotInitialized;
   const bool known = KnownOptionsAbi(options);
+  const bool vulkan = outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan;
   if (known) {
     g_last_requested_mode.store(static_cast<uint32_t>(options.mode),
                                 std::memory_order_relaxed);
@@ -934,11 +1195,11 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
   if (profile->RequiresProviderRetarget() && g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
       options.numFramesToGenerate > 1) {
     bool ready = g_multi_frame_ready();
-    if (ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
+    if (!vulkan && ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
         g_ensure_pacing != nullptr && !automatic) {
       g_ensure_pacing();
     }
-    if (ready && g_pacing_ready != nullptr) ready = g_pacing_ready();
+    if (!vulkan && ready && g_pacing_ready != nullptr) ready = g_pacing_ready();
     if (!ready) {
       if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
         reshade::log::message(
@@ -971,7 +1232,7 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
   // Dynamic MFG returns above and leaves pacing to the current NVIDIA runtime.
   if (desired > 1) {
     unsigned int ceiling = (std::min)(g_streamline_max_generated.load(std::memory_order_acquire),
-                                      profiles::kDlssg31091.validated_generated_ceiling);
+                                      ProviderMfgCeiling());
     if (ceiling != 0 && desired > ceiling) {
       if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
         std::stringstream message;
@@ -984,11 +1245,22 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
           viewport, options, FixedOverrideStatus::kBlockedStructuralCeiling);
     }
 
-    if (g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr && !automatic) {
+    // Vulkan owns a native queue-present path, not the D3D flip-meter patch.
+    // An addon-generated fixed override additionally needs the current native
+    // GetState maximum. Do not fabricate a larger public maximum for Vulkan.
+    if (vulkan && (g_vulkan_native_state_epoch.load(std::memory_order_acquire) !=
+                       g_options_cache_epoch.load(std::memory_order_acquire) ||
+        g_vulkan_native_state_viewport.load(std::memory_order_relaxed) != static_cast<uint32_t>(viewport) ||
+        !g_state_seen.load(std::memory_order_acquire) ||
+        g_dlssg_status.load(std::memory_order_relaxed) != 0 ||
+        g_runtime_max_generated.load(std::memory_order_relaxed) < desired)) {
+      return ForwardFixedNative(viewport, options, FixedOverrideStatus::kBlockedBackend);
+    }
+    if (!vulkan && g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr && !automatic) {
       g_ensure_pacing();
     }
     ceiling = (std::min)(g_streamline_max_generated.load(std::memory_order_acquire),
-                         profiles::kDlssg31091.validated_generated_ceiling);
+                         ProviderMfgCeiling());
     if (ceiling != 0 && desired > ceiling) {
       if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
         std::stringstream message;
@@ -1010,7 +1282,7 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
       return ForwardFixedNative(
           viewport, options, FixedOverrideStatus::kUnknownStructuralCeiling);
     }
-    if (g_pacing_ready != nullptr && !g_pacing_ready()) {
+    if (!vulkan && g_pacing_ready != nullptr && !g_pacing_ready()) {
       if (!g_declined_no_pacing.exchange(true, std::memory_order_relaxed)) {
         reshade::log::message(
             reshade::log::level::warning,
@@ -1149,18 +1421,33 @@ inline void InvalidateLiveOptions() {
   g_present_thread.store(0, std::memory_order_release);
 }
 
-inline void MarkInjectedUiPair(UiViewportState* state) {
+inline void MarkInjectedUiPair(UiViewportState* state, bool alpha_only,
+                               bool frame_based) {
   if (state == nullptr) return;
   AcquireSRWLockExclusive(&state->lock);
   const bool was_eligible =
       state->ui_recomposition_eligible.exchange(true, std::memory_order_acq_rel);
   state->hudless_color_seen.store(true, std::memory_order_release);
   state->ui_color_or_alpha_seen.store(true, std::memory_order_release);
-  state->ui_color_alpha_seen.store(true, std::memory_order_release);
+  if (alpha_only)
+    state->ui_alpha_seen.store(true, std::memory_order_release);
+  else
+    state->ui_color_alpha_seen.store(true, std::memory_order_release);
   state->ui_recomposition_invalid.store(false, std::memory_order_release);
   state->hud_separation_suppressed.store(false, std::memory_order_release);
   if (!was_eligible) RequestUiReset(state);
   ReleaseSRWLockExclusive(&state->lock);
+
+  if (alpha_only) {
+    MarkAutomaticUiTag(state, sl::kBufferTypeUIAlpha, frame_based);
+  } else if (frame_based) {
+    MarkAutomaticUiTag(state, sl::kBufferTypeUIColorAndAlpha, true);
+  } else if (state != nullptr) {
+    // Color+Alpha keeps the pre-Phase-6 eOnlyValidNow semantics. SL owns any
+    // copy it needs after slSetTag returns, so do not create persistent legacy
+    // ownership that would later be null-tagged between frames.
+    ClearAutomaticUiTagState(state);
+  }
 
   g_ui_pair_eligible.store(true, std::memory_order_relaxed);
   g_ui_native_hudless_fallback.store(false, std::memory_order_relaxed);
@@ -1171,39 +1458,138 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
                                       const UiCandidateSnapshot& candidate,
                                       const sl::ResourceTag* tags, uint32_t count,
                                       sl::CommandBuffer* command_buffer,
+                                      bool frame_based,
                                       Forward&& forward) {
   g_ui_candidate_active.store(false, std::memory_order_relaxed);
+  if (frame_based && state != nullptr &&
+      state->automatic_ui_tag_global.load(std::memory_order_acquire) &&
+      !ReleaseGlobalAutomaticUiTag(state)) {
+    return forward(tags, count);
+  }
   const bool injection_requested = CandidateInjectionRequested();
   const bool options_synced =
       g_ui_candidate_options_synced.load(std::memory_order_acquire);
-  const auto output = outputstate::Read();
-  const auto ui_encoding =
-      static_cast<outputstate::UiEncoding>(candidate.ui_encoding);
-  const bool encoding_compatible =
-      outputstate::IsUiEncodingCompatible(output, ui_encoding, false);
-  const bool can_inject = encoding_compatible && uicandidate::CanInject(
-      candidate.reject_reasons, candidate.stable_frames, command_buffer != nullptr,
-      options_synced, injection_requested);
+  const auto path = CandidateSubmissionPath(candidate);
+  const bool viewport_enabled = state == nullptr ||
+      (state->options_seen.load(std::memory_order_acquire) &&
+       state->mode.load(std::memory_order_relaxed) != static_cast<uint32_t>(sl::DLSSGMode::eOff));
+  const bool can_inject = viewport_enabled && path != uisubmission::Path::kUnavailable &&
+      uicandidate::CanInject(candidate.reject_reasons, candidate.stable_frames,
+                            command_buffer != nullptr, options_synced,
+                            injection_requested);
   if (can_inject && count >= 64) {
+    if (state && state->automatic_ui_tag_global.load()) state->automatic_ui_clear_pending.store(true);
     g_ui_candidate_full_batches.fetch_add(1, std::memory_order_relaxed);
-    return forward(tags, count);
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
   }
   if (!can_inject) {
+    if (state && state->automatic_ui_tag_global.load(std::memory_order_acquire))
+      state->automatic_ui_clear_pending.store(true, std::memory_order_release);
     if (injection_requested && options_synced &&
         candidate.reject_reasons == uicandidate::kAccept &&
         uicandidate::IsStable(candidate.stable_frames) && command_buffer == nullptr) {
       g_ui_candidate_missing_command_buffer.fetch_add(1, std::memory_order_relaxed);
     }
-    return forward(tags, count);
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
   }
-  if (ConsumeCandidateRetryFrame()) return forward(tags, count);
+  if (ConsumeCandidateRetryFrame()) {
+    if (state && state->automatic_ui_tag_global.load()) state->automatic_ui_clear_pending.store(true);
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
+  }
+  const bool alpha_only = path == uisubmission::Path::kAlphaOnly;
+  UiAlphaCandidateSnapshot alpha_candidate{};
+  if (alpha_only) {
+    // Forward the game's complete batch ONCE, on its original command list.
+    // Moving volatile host tags to our list would read them before host work.
+    const sl::Result host_result = forward(tags, count);
+    if (host_result != sl::Result::eOk) return host_result;
+    const auto clear_owned = [&]() {
+      if (state == nullptr || !state->automatic_ui_tag_global.load()) return;
+      state->automatic_ui_clear_pending.store(true, std::memory_order_release);
+      ForwardWithAutomaticUiRelease(state, nullptr, 0, frame_based, forward);
+    };
+    if constexpr (!std::is_invocable_r_v<sl::Result, Forward,
+        const sl::ResourceTag*, uint32_t, sl::CommandBuffer*>) {
+      // An alpha producer without an explicit copy-list contract cannot be used.
+      clear_owned();
+      return host_result;
+    } else {
+      if (g_prepare_ui_alpha_candidate == nullptr || g_finish_ui_alpha_candidate == nullptr ||
+          !g_prepare_ui_alpha_candidate(&candidate, command_buffer, &alpha_candidate)) {
+        clear_owned();
+        return host_result;
+      }
+      if (!alpha_candidate.copy_commands || alpha_candidate.native_resource == 0 ||
+          alpha_candidate.width != candidate.width || alpha_candidate.height != candidate.height ||
+          alpha_candidate.format == 0) {
+        g_finish_ui_alpha_candidate(&candidate, &alpha_candidate, false, sl::Result::eOk);
+        clear_owned();
+        return host_result;
+      }
+      sl::Resource alpha_resource(sl::ResourceType::eTex2d,
+          reinterpret_cast<void*>(static_cast<uintptr_t>(alpha_candidate.native_resource)),
+          alpha_candidate.state);
+      alpha_resource.width = candidate.width;
+      alpha_resource.height = candidate.height;
+      alpha_resource.nativeFormat = alpha_candidate.format;
+      sl::Extent extent{}; extent.width = candidate.width; extent.height = candidate.height;
+      // SL owns the Present-time clone. The helper fence only protects our
+      // extraction/copy source. CPU Present must NEVER release a live slot.
+      const sl::ResourceTag alpha_tag(&alpha_resource, sl::kBufferTypeUIAlpha,
+          sl::ResourceLifecycle::eOnlyValidNow, &extent);
+      const sl::Result tag_result = forward(&alpha_tag, 1, alpha_candidate.copy_commands);
+      const bool accepted = g_finish_ui_alpha_candidate(
+          &candidate, &alpha_candidate, tag_result == sl::Result::eOk, tag_result);
+      g_ui_candidate_last_result.store(static_cast<uint32_t>(tag_result));
+      if (accepted) {
+        g_ui_candidate_consecutive_failures.store(0);
+        g_ui_candidate_retry_frames.store(0);
+        g_ui_candidate_last_failed_resource.store(0);
+        g_ui_candidate_tags_injected.fetch_add(1);
+        g_ui_candidate_active.store(true);
+        MarkInjectedUiPair(state, true, frame_based);
+      } else {
+        // Even a rejected call can have partially installed a tag or recorded
+        // GPU commands. Finish sealed that work; now retire our optional tag.
+        if (state != nullptr) MarkAutomaticUiTag(state, sl::kBufferTypeUIAlpha, frame_based);
+        if (frame_based) {
+          const sl::ResourceTag clear(nullptr, sl::kBufferTypeUIAlpha,
+                                      sl::ResourceLifecycle::eOnlyValidNow);
+          if (forward(&clear, 1) == sl::Result::eOk && state != nullptr)
+            state->automatic_ui_frame_type.store(0, std::memory_order_release);
+        } else {
+          clear_owned();
+        }
+        g_ui_candidate_injection_failures.fetch_add(1);
+        g_ui_candidate_native_fallbacks.fetch_add(1);
+        g_ui_candidate_retry_frames.store(uicandidate::kRetryCooldownFrames);
+      }
+      // Optional helper failure must not change an accepted native submission
+      // into an application error, nor re-submit the game's volatile batch.
+      return host_result;
+    }
+  }
   if (g_acquire_ui_candidate == nullptr || g_release_ui_candidate == nullptr ||
       !g_acquire_ui_candidate(&candidate)) {
-    return forward(tags, count);
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
   }
 
-  sl::Resource ui_resource(
-      sl::ResourceType::eTex2d,
+  // Preserve the SDR ColorAlpha resource/encoding policy, but isolate its
+  // optional call too: SL batches are not transactional. Replaying the game's
+  // volatile HUDless tags after an optional rejection can enqueue a second copy.
+  if (state && state->automatic_ui_tag_global.load(std::memory_order_acquire))
+    state->automatic_ui_clear_pending.store(true, std::memory_order_release);
+  const auto host_result = ForwardWithAutomaticUiRelease(
+      state, tags, count, frame_based, forward);
+  if (host_result != sl::Result::eOk) {
+    g_release_ui_candidate(&candidate, false, host_result);
+    return host_result;
+  }
+  sl::Resource ui_resource(sl::ResourceType::eTex2d,
       reinterpret_cast<void*>(static_cast<uintptr_t>(candidate.native_resource)),
       candidate.state);
   ui_resource.width = candidate.width;
@@ -1212,17 +1598,9 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
   sl::Extent ui_extent{};
   ui_extent.width = candidate.width;
   ui_extent.height = candidate.height;
-  sl::ResourceTag ui_tag(&ui_resource, sl::kBufferTypeUIColorAndAlpha,
-                         sl::ResourceLifecycle::eOnlyValidNow, &ui_extent);
-
-  static_assert(std::is_trivially_copyable_v<sl::ResourceTag>);
-  alignas(sl::ResourceTag)
-      std::array<std::byte, sizeof(sl::ResourceTag) * 65> storage{};
-  std::memcpy(storage.data(), tags, sizeof(sl::ResourceTag) * count);
-  std::memcpy(storage.data() + sizeof(sl::ResourceTag) * count,
-              &ui_tag, sizeof(ui_tag));
-  const auto* forwarded = reinterpret_cast<const sl::ResourceTag*>(storage.data());
-  const sl::Result result = forward(forwarded, count + 1);
+  const sl::ResourceTag ui_tag(&ui_resource, sl::kBufferTypeUIColorAndAlpha,
+      sl::ResourceLifecycle::eOnlyValidNow, &ui_extent);
+  const sl::Result result = forward(&ui_tag, 1);
   g_ui_candidate_last_result.store(static_cast<unsigned int>(result),
                                    std::memory_order_relaxed);
   g_release_ui_candidate(&candidate, true, result);
@@ -1236,7 +1614,7 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
       g_ui_candidate_recoveries.fetch_add(1, std::memory_order_relaxed);
     g_ui_candidate_tags_injected.fetch_add(1, std::memory_order_relaxed);
     g_ui_candidate_active.store(true, std::memory_order_relaxed);
-    MarkInjectedUiPair(state);
+    MarkInjectedUiPair(state, alpha_only, frame_based);
     return result;
   }
 
@@ -1258,7 +1636,8 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
     g_ui_candidate_runtime_declined.store(true, std::memory_order_release);
     g_ui_candidate_options_synced.store(false, std::memory_order_release);
     std::stringstream message;
-    message << "mfgunlock: detected UI Color+Alpha tag failed " << failure_streak
+    message << "mfgunlock: detected " << uisubmission::PathName(path)
+            << " tag failed " << failure_streak
             << " consecutive times on resource 0x" << std::hex
             << candidate.native_resource << std::dec << " (sl::Result "
             << static_cast<unsigned int>(result)
@@ -1266,23 +1645,43 @@ inline sl::Result TryInjectUiCandidate(UiViewportState* state,
     reshade::log::message(reshade::log::level::warning, message.str().c_str());
   } else if (failure_streak == 1) {
     std::stringstream message;
-    message << "mfgunlock: detected UI Color+Alpha tag was transiently rejected with "
+    message << "mfgunlock: detected " << uisubmission::PathName(path)
+            << " tag was transiently rejected with "
             << "sl::Result " << static_cast<unsigned int>(result)
             << "; preserving native HUD-less and retrying after candidate revalidation.";
     reshade::log::message(reshade::log::level::warning, message.str().c_str());
   }
-  return forward(tags, count);
+  // Retire only the optional UI we attempted; never replay native inputs.
+  MarkAutomaticUiTag(state, sl::kBufferTypeUIColorAndAlpha, frame_based);
+  if (frame_based) {
+    const sl::ResourceTag clear(nullptr, sl::kBufferTypeUIColorAndAlpha,
+                                sl::ResourceLifecycle::eOnlyValidNow);
+    if (forward(&clear, 1) == sl::Result::eOk && state)
+      state->automatic_ui_frame_type.store(0);
+  } else if (state) {
+    state->automatic_ui_clear_pending.store(true, std::memory_order_release);
+    ForwardWithAutomaticUiRelease(state, nullptr, 0, false, forward);
+  } else {
+    const sl::ResourceTag clear(nullptr, sl::kBufferTypeUIColorAndAlpha,
+                                sl::ResourceLifecycle::eOnlyValidNow);
+    forward(&clear, 1);
+  }
+  return host_result;
 }
 
 template <typename Forward>
 inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
                                const sl::ResourceTag* tags, uint32_t count,
                                sl::CommandBuffer* command_buffer,
-                               Forward&& forward) {
-  if (!g_enabled.load(std::memory_order_relaxed) ||
-      !g_ui_composition_enabled.load(std::memory_order_relaxed) ||
-      tags == nullptr || count == 0) {
+                               bool frame_based,
+                               Forward&& forward, uint64_t source_frame = UINT64_MAX) {
+  UiViewportState* state = GetUiState(viewport);
+  if (tags == nullptr || count == 0)
     return forward(tags, count);
+  if (!g_enabled.load(std::memory_order_relaxed) ||
+      !g_ui_composition_enabled.load(std::memory_order_relaxed)) {
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
   }
 
   if (count > 64) {
@@ -1292,9 +1691,27 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
           "mfgunlock: UI Composition received more than 64 Streamline tags in one call; "
           "the oversized batch is forwarded unchanged.");
     }
-    return forward(tags, count);
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
   }
 
+  for (uint32_t index = 0; index < count; ++index) {
+    const auto& tag = tags[index];
+    if (tag.structType != sl::ResourceTag::s_structType || tag.structVersion != sl::kStructVersion1 ||
+        (tag.resource && (tag.resource->structType != sl::Resource::s_structType ||
+                          tag.resource->structVersion != sl::kStructVersion1))) {
+      if (state) {
+        state->native_ui_owner.store(true, std::memory_order_release);
+        ReleaseGlobalAutomaticUiTag(state);
+        const auto owned = static_cast<sl::BufferType>(state->automatic_ui_frame_type.load());
+        if (frame_based && owned) {
+          const sl::ResourceTag clear(nullptr, owned, sl::ResourceLifecycle::eOnlyValidNow);
+          if (forward(&clear, 1) == sl::Result::eOk) state->automatic_ui_frame_type.store(0);
+        }
+      }
+      return forward(tags, count);
+    }
+  }
   for (uint32_t index = 0; index < count; ++index) {
     if (tags[index].resource == nullptr) continue;
     if (tags[index].type == sl::kBufferTypeHUDLessColor) {
@@ -1309,7 +1726,6 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
   if (g_observe_streamline_ui_tags != nullptr)
     g_observe_streamline_ui_tags(tags, count);
 
-  UiViewportState* state = GetUiState(viewport);
   const auto output_state = outputstate::Read();
   qualityguard::OutputDescription expected{};
   if (state != nullptr) {
@@ -1318,6 +1734,42 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
     ReleaseSRWLockShared(&state->lock);
   }
 
+  bool native_ui_in_batch = false;
+  for (uint32_t index = 0; index < count; ++index)
+    native_ui_in_batch |= qualityguard::IsUiColorOrAlphaType(tags[index].type);
+  if (state != nullptr) {
+    AcquireSRWLockExclusive(&state->lock);
+    if (frame_based && (!state->native_tag_frame_based || state->native_tag_frame != source_frame)) {
+      state->native_ui_owner.store(false, std::memory_order_relaxed);
+      state->automatic_ui_frame_type.store(0, std::memory_order_relaxed);
+      state->hudless_color_seen.store(false, std::memory_order_relaxed);
+      state->ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
+      state->ui_color_alpha_seen.store(false, std::memory_order_relaxed);
+      state->ui_alpha_seen.store(false, std::memory_order_relaxed);
+      state->vulkan_metadata_unknown = 0;
+      state->ui_recomposition_invalid.store(false, std::memory_order_relaxed);
+      state->ui_recomposition_eligible.store(false, std::memory_order_relaxed);
+    }
+    state->native_tag_frame_based = frame_based;
+    state->native_tag_frame = frame_based ? source_frame : UINT64_MAX;
+    if (native_ui_in_batch) {
+      g_ui_candidate_active.store(false, std::memory_order_relaxed);
+      const auto helper_type = frame_based
+          ? state->automatic_ui_frame_type.load(std::memory_order_relaxed)
+          : (state->automatic_ui_tag_global.load(std::memory_order_relaxed)
+              ? state->automatic_ui_tag_type.load(std::memory_order_relaxed) : 0);
+      if (helper_type == sl::kBufferTypeUIAlpha &&
+          !BatchContainsTagType(tags, count, sl::kBufferTypeUIAlpha))
+        state->ui_alpha_seen.store(false, std::memory_order_relaxed);
+      if (helper_type == sl::kBufferTypeUIColorAndAlpha &&
+          !BatchContainsTagType(tags, count, sl::kBufferTypeUIColorAndAlpha))
+        state->ui_color_alpha_seen.store(false, std::memory_order_relaxed);
+      state->native_ui_owner.store(true, std::memory_order_release);
+      if (state->automatic_ui_tag_global.load(std::memory_order_acquire))
+        state->automatic_ui_clear_pending.store(true, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&state->lock);
+  }
   const auto assessment =
       qualityguard::AssessTags(tags, count, output_state, expected);
   bool eligible = false;
@@ -1348,10 +1800,12 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
     }
 
     if (output_changed) {
+      state->native_ui_owner.store(native_ui_in_batch, std::memory_order_relaxed);
       state->hudless_color_seen.store(false, std::memory_order_relaxed);
       state->ui_color_or_alpha_seen.store(false, std::memory_order_relaxed);
       state->ui_color_alpha_seen.store(false, std::memory_order_relaxed);
       state->ui_alpha_seen.store(false, std::memory_order_relaxed);
+      state->vulkan_metadata_unknown = 0;
       state->ui_recomposition_invalid.store(false, std::memory_order_relaxed);
       state->ui_recomposition_eligible.store(false, std::memory_order_relaxed);
       RequestUiReset(state);
@@ -1391,7 +1845,12 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
         state->ui_recomposition_invalid.store(true, std::memory_order_release);
       }
 
+      state->vulkan_metadata_unknown =
+          (state->vulkan_metadata_unknown & ~assessment.vulkan_metadata_touched) |
+          assessment.vulkan_metadata_unknown;
       auto accumulated = assessment;
+      if (state->vulkan_metadata_unknown)
+        accumulated.issues |= qualityguard::kVulkanResourceMetadataUnknown;
       accumulated.has_hudless_color =
           state->hudless_color_seen.load(std::memory_order_acquire);
       accumulated.has_ui_color_or_alpha =
@@ -1437,6 +1896,7 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
 
   const bool native_hudless_only = state != nullptr &&
       assessment.has_hudless_color && !assessment.has_ui_color_or_alpha &&
+      !state->native_ui_owner.load(std::memory_order_acquire) &&
       !qualityguard::HasStructuralIssues(assessment) &&
       suppression == qualityguard::SuppressionPolicy::kNone;
   if (native_hudless_only &&
@@ -1448,13 +1908,45 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
   if (native_hudless_only && g_observe_ui_candidate != nullptr) {
     UiCandidateSnapshot candidate{};
     if (g_observe_ui_candidate(&candidate)) {
-      UpdateUiCandidateFormat(candidate.format);
+      bool paired = false;
+      for (uint32_t index = 0; index < count; ++index) {
+        if (tags[index].type != sl::kBufferTypeHUDLessColor || !tags[index].resource) continue;
+        bool valid = false;
+        const auto extent = qualityguard::Describe(tags[index], &valid);
+        paired = valid && extent.width == candidate.width && extent.height == candidate.height &&
+                 tags[index].extent.left == 0 && tags[index].extent.top == 0;
+      }
+      // One globally discovered candidate has no proven association with a
+      // second active viewport. Native per-viewport tags remain untouched.
+      unsigned int active_viewports = 0;
+      for (const auto& other : g_ui_viewports)
+        if (other.options_seen.load(std::memory_order_acquire) &&
+            other.mode.load(std::memory_order_relaxed) != static_cast<uint32_t>(sl::DLSSGMode::eOff))
+          ++active_viewports;
+      if (!paired || active_viewports > 1) {
+        if (state->automatic_ui_tag_global.load(std::memory_order_acquire))
+          state->automatic_ui_clear_pending.store(true, std::memory_order_release);
+        return ForwardWithAutomaticUiRelease(state, tags, count, frame_based, forward);
+      }
+      const auto path = CandidateSubmissionPath(candidate);
+      if (path == uisubmission::Path::kColorAndAlpha)
+        UpdateUiCandidate(path, candidate.format);
+      else if (path == uisubmission::Path::kAlphaOnly)
+        UpdateUiCandidate(path);
+      else
+        NotifyUiCandidateUnavailable();
       return TryInjectUiCandidate(
-          state, candidate, tags, count, command_buffer, std::forward<Forward>(forward));
+          state, candidate, tags, count, command_buffer, frame_based,
+          std::forward<Forward>(forward));
     }
   }
 
-  if (suppression == qualityguard::SuppressionPolicy::kNone) return forward(tags, count);
+  if (native_hudless_only && state->automatic_ui_tag_global.load(std::memory_order_acquire))
+    state->automatic_ui_clear_pending.store(true, std::memory_order_release);
+  if (suppression == qualityguard::SuppressionPolicy::kNone) {
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
+  }
 
   static_assert(std::is_trivially_copyable_v<sl::ResourceTag>);
   alignas(sl::ResourceTag)
@@ -1465,7 +1957,10 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
       suppression == qualityguard::SuppressionPolicy::kAllHudSeparation
           ? SuppressHudSeparationResources(forwarded, count)
           : SuppressUiResources(forwarded, count);
-  if (suppressed == 0) return forward(tags, count);
+  if (suppressed == 0) {
+    return ForwardWithAutomaticUiRelease(
+        state, tags, count, frame_based, std::forward<Forward>(forward));
+  }
 
   g_ui_optional_tags_suppressed.fetch_add(suppressed, std::memory_order_relaxed);
   const uint32_t previous_issues =
@@ -1483,13 +1978,17 @@ inline sl::Result FilterUiTags(const sl::ViewportHandle& viewport,
             << "; using the safest available HUD-less/final-color fallback for this submission.";
     reshade::log::message(reshade::log::level::info, message.str().c_str());
   }
-  return forward(forwarded, count);
+  return ForwardWithAutomaticUiRelease(
+      state, forwarded, count, frame_based, std::forward<Forward>(forward));
 }
 
 inline bool ContractResourceRole(sl::BufferType type, integration::ResourceRole& role) {
   if (type == sl::kBufferTypeBackbuffer) role = integration::ResourceRole::kBackbuffer;
   else if (type == sl::kBufferTypeDepth) role = integration::ResourceRole::kDepth;
   else if (type == sl::kBufferTypeMotionVectors) role = integration::ResourceRole::kMotionVectors;
+  else if (type == sl::kBufferTypeScalingInputColor) role = integration::ResourceRole::kColorInput;
+  else if (type == sl::kBufferTypeScalingOutputColor) role = integration::ResourceRole::kColorOutput;
+  else if (type == sl::kBufferTypeExposure) role = integration::ResourceRole::kExposure;
   else if (type == sl::kBufferTypeHUDLessColor) role = integration::ResourceRole::kHudLess;
   else if (type == sl::kBufferTypeUIColorAndAlpha) role = integration::ResourceRole::kUiColorAndAlpha;
   else if (type == sl::kBufferTypeUIAlpha) role = integration::ResourceRole::kUiAlpha;
@@ -1500,12 +1999,27 @@ inline bool ContractResourceRole(sl::BufferType type, integration::ResourceRole&
 }
 
 inline void ObserveContractTags(const sl::ViewportHandle& viewport,
-                                const sl::ResourceTag* tags, uint32_t count) {
-  if (tags == nullptr) return;
+                                const sl::ResourceTag* tags, uint32_t count,
+                                bool frame_known = false, uint64_t frame = 0) {
+  if (tags == nullptr || count > 65) {
+    integration::InvalidateFrameEvidence();
+    return;
+  }
   for (uint32_t index = 0; index < count; ++index) {
+    if (tags[index].structType != sl::ResourceTag::s_structType ||
+        tags[index].structVersion != sl::kStructVersion1) {
+      integration::InvalidateFrameEvidence();
+      return;
+    }
     integration::ResourceRole role{};
     if (!ContractResourceRole(tags[index].type, role)) continue;
     const sl::Resource* resource = tags[index].resource;
+    if (resource != nullptr &&
+        (resource->structType != sl::Resource::s_structType ||
+         resource->structVersion != sl::kStructVersion1)) {
+      integration::InvalidateFrameEvidence();
+      return;
+    }
     const bool present = resource != nullptr && resource->native != nullptr;
     const bool extent_known = tags[index].extent.width != 0 && tags[index].extent.height != 0;
     integration::ObserveTag(
@@ -1517,29 +2031,44 @@ inline void ObserveContractTags(const sl::ViewportHandle& viewport,
         present ? resource->state : 0,
         present && resource->nativeFormat != 0,
         present ? resource->nativeFormat : 0,
-        present ? reinterpret_cast<uint64_t>(resource->native) : 0);
+        present ? reinterpret_cast<uint64_t>(resource->native) : 0,
+        frame_known, frame);
   }
 }
 
 inline sl::Result HookedPclSetMarker(sl::PCLMarker marker, const sl::FrameToken& frame) {
   if (g_real_pcl_set_marker == nullptr) return sl::Result::eErrorNotInitialized;
-  if (marker == sl::PCLMarker::ePresentStart)
-    integration::ObservePresentMarker(true, static_cast<uint32_t>(frame));
-  else if (marker == sl::PCLMarker::ePresentEnd)
-    integration::ObservePresentMarker(false, static_cast<uint32_t>(frame));
-  // Observation only: never synthesize or suppress application markers.
-  return g_real_pcl_set_marker(marker, frame);
+  const auto result = g_real_pcl_set_marker(marker, frame);
+  if (result == sl::Result::eOk) {
+    if (marker == sl::PCLMarker::ePresentStart)
+      integration::ObservePresentMarker(true, static_cast<uint32_t>(frame));
+    else if (marker == sl::PCLMarker::ePresentEnd)
+      integration::ObservePresentMarker(false, static_cast<uint32_t>(frame));
+  }
+  return result;
 }
 
 inline sl::Result HookedSetTag(const sl::ViewportHandle& viewport,
                                const sl::ResourceTag* tags, uint32_t count,
                                sl::CommandBuffer* command_buffer) {
+  presentation::passive::CpuScope timing(presentation::passive::CpuKind::kTag);
   if (g_real_set_tag == nullptr) return sl::Result::eErrorNotInitialized;
-  ObserveContractTags(viewport, tags, count);
   return FilterUiTags(
-      viewport, tags, count, command_buffer,
-      [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count) {
-        return g_real_set_tag(viewport, forwarded, forwarded_count, command_buffer);
+      viewport, tags, count, command_buffer, false,
+      [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count,
+          sl::CommandBuffer* copy_commands = nullptr) {
+        const auto result = presentation::passive::CallNative([&] {
+          return g_real_set_tag(viewport, forwarded, forwarded_count,
+                                copy_commands ? copy_commands : command_buffer);
+        });
+        if (result == sl::Result::eOk)
+          ObserveContractTags(viewport, forwarded, forwarded_count);
+        else {
+          integration::InvalidateFrameEvidence();
+          ForgetUiOutputs();
+          g_ui_candidate_options_synced.store(false, std::memory_order_release);
+        }
+        return result;
       });
 }
 
@@ -1547,40 +2076,94 @@ inline sl::Result HookedSetTagForFrame(const sl::FrameToken& frame,
                                        const sl::ViewportHandle& viewport,
                                        const sl::ResourceTag* tags, uint32_t count,
                                        sl::CommandBuffer* command_buffer) {
+  presentation::passive::CpuScope timing(presentation::passive::CpuKind::kTag);
   if (g_real_set_tag_for_frame == nullptr) return sl::Result::eErrorNotInitialized;
-  ObserveContractTags(viewport, tags, count);
   return FilterUiTags(
-      viewport, tags, count, command_buffer,
-      [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count) {
-        return g_real_set_tag_for_frame(
-            frame, viewport, forwarded, forwarded_count, command_buffer);
-      });
+      viewport, tags, count, command_buffer, true,
+      [&](const sl::ResourceTag* forwarded, uint32_t forwarded_count,
+          sl::CommandBuffer* copy_commands = nullptr) {
+        const auto result = presentation::passive::CallNative([&] {
+          return g_real_set_tag_for_frame(frame, viewport, forwarded, forwarded_count,
+                                         copy_commands ? copy_commands : command_buffer);
+        });
+        if (result == sl::Result::eOk)
+          ObserveContractTags(viewport, forwarded, forwarded_count, true,
+                              static_cast<uint64_t>(frame));
+        else {
+          integration::InvalidateFrameEvidence();
+          ForgetUiOutputs();
+          g_ui_candidate_options_synced.store(false, std::memory_order_release);
+        }
+        return result;
+      }, static_cast<uint64_t>(frame));
+}
+
+template <typename ConstantsT>
+inline void ObserveStreamlineHistory(const ConstantsT& values) {
+  const bool reset_known =
+      values.reset == sl::Boolean::eTrue || values.reset == sl::Boolean::eFalse;
+  bool rendering_known = false;
+  bool rendering = false;
+
+  // The guide and SDK revisions do not always expose the same optional fields.
+  // Only inspect a member declared by these headers, and require at least the
+  // header's default layout version rather than inventing an ABI offset/version.
+  if constexpr (requires(const ConstantsT& constants) { constants.renderingGameFrames; }) {
+    const ConstantsT declared_layout{};
+    if (values.structVersion >= declared_layout.structVersion) {
+      rendering_known = values.renderingGameFrames == sl::Boolean::eTrue ||
+          values.renderingGameFrames == sl::Boolean::eFalse;
+      rendering = values.renderingGameFrames == sl::Boolean::eTrue;
+    }
+  }
+
+  integration::ObserveHistory(
+      reset_known, values.reset == sl::Boolean::eTrue, rendering_known, rendering);
+}
+
+inline sl::Result ForwardObservedConstants(const sl::Constants& values,
+                                           const sl::FrameToken& frame,
+                                           const sl::ViewportHandle& viewport) {
+  const auto result = g_real_set_constants(values, frame, viewport);
+  if (result == sl::Result::eOk && values.structType == sl::Constants::s_structType &&
+      (values.structVersion == sl::kStructVersion1 ||
+       values.structVersion == sl::kStructVersion2)) {
+    integration::ObserveConstants(static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport));
+    ObserveStreamlineHistory(values);
+  } else {
+    integration::InvalidateFrameEvidence();
+  }
+  return result;
 }
 
 inline sl::Result HookedSetConstants(const sl::Constants& values,
                                      const sl::FrameToken& frame,
                                      const sl::ViewportHandle& viewport) {
   if (g_real_set_constants == nullptr) return sl::Result::eErrorNotInitialized;
-  integration::ObserveConstants(static_cast<uint32_t>(frame), static_cast<uint32_t>(viewport));
+  if (values.structType != sl::Constants::s_structType ||
+      (values.structVersion != sl::kStructVersion1 && values.structVersion != sl::kStructVersion2)) {
+    integration::InvalidateFrameEvidence();
+    return g_real_set_constants(values, frame, viewport);
+  }
   ApplyLiveOptions(viewport);
   if (!g_enabled.load(std::memory_order_relaxed) ||
       !g_ui_composition_enabled.load(std::memory_order_relaxed)) {
-    return g_real_set_constants(values, frame, viewport);
+    return ForwardObservedConstants(values, frame, viewport);
   }
 
   UiViewportState* state = GetUiState(viewport);
   if (state == nullptr || !state->options_seen.load(std::memory_order_acquire) ||
       state->mode.load(std::memory_order_relaxed) ==
           static_cast<uint32_t>(sl::DLSSGMode::eOff)) {
-    return g_real_set_constants(values, frame, viewport);
+    return ForwardObservedConstants(values, frame, viewport);
   }
 
   const uint64_t requested = state->reset_requested.load(std::memory_order_acquire);
   if (requested == state->reset_applied.load(std::memory_order_relaxed))
-    return g_real_set_constants(values, frame, viewport);
+    return ForwardObservedConstants(values, frame, viewport);
 
   if (values.reset == sl::Boolean::eTrue) {
-    const sl::Result result = g_real_set_constants(values, frame, viewport);
+    const sl::Result result = ForwardObservedConstants(values, frame, viewport);
     if (result == sl::Result::eOk)
       state->reset_applied.store(requested, std::memory_order_release);
     return result;
@@ -1588,9 +2171,9 @@ inline sl::Result HookedSetConstants(const sl::Constants& values,
 
   alignas(sl::Constants) std::array<std::byte, sizeof(sl::Constants)> storage{};
   if (!qualityguard::CopyConstantsWithReset(values, storage.data(), storage.size()))
-    return g_real_set_constants(values, frame, viewport);
+    return ForwardObservedConstants(values, frame, viewport);
 
-  const sl::Result result = g_real_set_constants(
+  const sl::Result result = ForwardObservedConstants(
       *reinterpret_cast<const sl::Constants*>(storage.data()), frame, viewport);
   if (result == sl::Result::eOk) {
     state->reset_applied.store(requested, std::memory_order_release);
@@ -1601,9 +2184,20 @@ inline sl::Result HookedSetConstants(const sl::Constants& values,
 
 inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
                                  const sl::DLSSGOptions* options) {
+  presentation::passive::CpuScope timing(presentation::passive::CpuKind::kGetState);
+  bool passive_valid = false;
+  struct PassiveStateTap {
+    const sl::DLSSGState& state; const sl::ViewportHandle& viewport; const bool& valid;
+    uint64_t epoch = presentation::passive::g_generation.load(std::memory_order_acquire);
+    ~PassiveStateTap() {
+      if (presentation::passive::g_enabled.load(std::memory_order_relaxed))
+        presentation::passive::NativeReport(presentation::passive::NowNs(),
+            static_cast<uint32_t>(viewport), valid ? state.numFramesActuallyPresented : 0, valid, epoch);
+    }
+  } passive_tap{state, viewport, passive_valid};
   if (RealGetState() == nullptr) return sl::Result::eErrorNotInitialized;
   if (!g_enabled.load() || !architecture::ActiveProfile())
-    return RealGetState()(viewport, state, options);
+    return presentation::passive::CallNative([&] { return RealGetState()(viewport, state, options); });
 
   const uint32_t diag_call =
       g_turing_diag_get_state_calls.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1617,7 +2211,18 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
             << " requested-abi=" << state.structVersion;
     TuringDiagLog(message.str());
   }
-  const sl::Result result = RealGetState()(viewport, state, options);
+  const uint64_t native_epoch = g_options_cache_epoch.load(std::memory_order_acquire);
+  const sl::Result result = presentation::passive::CallNative([&] { return RealGetState()(viewport, state, options); });
+  if (outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan) {
+    g_vulkan_native_state_epoch.store(0, std::memory_order_release);
+    if (result == sl::Result::eOk && state.structType == sl::DLSSGState::s_structType &&
+        state.structVersion >= sl::kStructVersion2 && state.structVersion <= sl::kStructVersion4 &&
+        static_cast<uint32_t>(state.status) == 0 &&
+        native_epoch == g_options_cache_epoch.load(std::memory_order_acquire)) {
+      g_vulkan_native_state_viewport.store(static_cast<uint32_t>(viewport), std::memory_order_relaxed);
+      g_vulkan_native_state_epoch.store(native_epoch, std::memory_order_release);
+    }
+  }
   if (result == sl::Result::eOk &&
       state.structType == sl::DLSSGState::s_structType &&
       state.structVersion >= sl::kStructVersion1 &&
@@ -1680,8 +2285,10 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
     countobserver::Emit(event);
   }
   if (state.structType != sl::DLSSGState::s_structType ||
-      state.structVersion < sl::kStructVersion1 || state.structVersion > sl::kStructVersion4)
+      state.structVersion < sl::kStructVersion1 || state.structVersion > sl::kStructVersion4) {
+    presentation::ClearCorrelation();
     return result;
+  }
   if (result == sl::Result::eOk) {
     ObserveDynamicSupport(state, result);
     if (!g_dynamic_support_seen.load(std::memory_order_acquire) &&
@@ -1693,7 +2300,7 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
       sl::DLSSGState extended{};
       extended.next = nullptr;  // Do not invoke caller-owned extension chains a second time.
       extended.structVersion = sl::kStructVersion4;
-      const sl::Result probe = RealGetState()(viewport, extended, options);
+      const sl::Result probe = presentation::passive::CallNative([&] { return RealGetState()(viewport, extended, options); });
       ObserveDynamicSupport(extended, probe);
       // GetState consumes the presented-frame counter. Account for frames
       // consumed by our one-time probe in the same caller-visible result.
@@ -1705,6 +2312,14 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
       }
     }
 
+    if (static_cast<uint32_t>(state.status) == 0) {
+      passive_valid = true;
+      presentation::ObserveProviderPresentation(
+          state.numFramesActuallyPresented, static_cast<uint32_t>(viewport));
+    } else {
+      presentation::ClearCorrelation();
+    }
+
     const unsigned int status = static_cast<unsigned int>(state.status);
     g_dlssg_status.store(status, std::memory_order_relaxed);
     g_state_seen.store(true, std::memory_order_relaxed);
@@ -1714,7 +2329,11 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
       reshade::log::message(reshade::log::level::warning, message.str().c_str());
     }
   }
-  if (result != sl::Result::eOk || state.structVersion < sl::kStructVersion2) return result;
+  if (result != sl::Result::eOk) {
+    presentation::ClearCorrelation();
+    return result;
+  }
+  if (state.structVersion < sl::kStructVersion2) return result;
 
   const unsigned int reported = state.numFramesToGenerateMax;
   g_runtime_max_generated.store(reported, std::memory_order_relaxed);
@@ -1727,7 +2346,16 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   }
 
   const unsigned int wanted = (std::min)(g_streamline_max_generated.load(std::memory_order_relaxed),
-                                        profiles::kDlssg31091.validated_generated_ceiling);
+                                        ProviderMfgCeiling());
+  if (outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan) {
+    // Native support is authoritative. The structural plan is an upper bound,
+    // never a replacement for Vulkan runtime support/presentation capability.
+    if (wanted != 0) state.numFramesToGenerateMax = (std::min)(reported, wanted);
+    g_effective_max_generated.store(state.numFramesToGenerateMax, std::memory_order_relaxed);
+    g_effective_max_seen.store(true, std::memory_order_release);
+    return result;
+  }
+
   if (wanted == 0 || reported == wanted) {
     g_effective_max_generated.store(state.numFramesToGenerateMax,
                                     std::memory_order_relaxed);
@@ -1865,6 +2493,14 @@ inline UiDebugSnapshot ReadUiDebugSnapshot() {
   return snapshot;
 }
 
+inline void RequestGlobalAutomaticUiTagRelease() {
+  internal::RequestGlobalAutomaticUiTagRelease();
+}
+
+inline void ReleaseGlobalAutomaticUiTags() {
+  internal::ReleaseGlobalAutomaticUiTags();
+}
+
 inline void NotifyOutputStateChanged() {
   internal::ForgetUiOutputs();
   internal::RequestAllUiResets();
@@ -1926,6 +2562,7 @@ inline void ApplyLiveOptionsOnPresent() {
 }
 
 inline void NotifyUiCompositionChanged() {
+  internal::RequestGlobalAutomaticUiTagRelease();
   // Keep the last accepted options evidence while the new request is pending.
   g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
   g_ui_composition_result.store(0, std::memory_order_relaxed);
@@ -1945,6 +2582,7 @@ inline void NotifyUiCompositionChanged() {
 }
 
 inline void NotifyUiCandidateInjectionChanged() {
+  internal::RequestGlobalAutomaticUiTagRelease();
   g_ui_candidate_active.store(false, std::memory_order_relaxed);
   g_ui_candidate_options_synced.store(false, std::memory_order_release);
   g_ui_candidate_runtime_declined.store(false, std::memory_order_release);
@@ -2008,6 +2646,7 @@ inline void NotifyDlssgPluginUnloaded(HMODULE module) {
   g_last_forwarded_generated.store(diagnostic::kUnknown32, std::memory_order_relaxed);
   g_last_accepted_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
   g_last_accepted_generated.store(diagnostic::kUnknown32, std::memory_order_relaxed);
+  presentation::ObserveProviderUnavailable();
   g_dynamic_support_seen.store(false, std::memory_order_release);
   g_dynamic_supported.store(false, std::memory_order_release);
   g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
@@ -2026,18 +2665,46 @@ inline void TryInstall() {
     ~Guard() { installing = false; }
   } guard;
   HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
+
+  // An entry detour disappeared with the old image. Clear every borrowed
+  // trampoline before attempting to bind a replacement image. Do not detach
+  // from an unmapped module, even if its base address is reused.
+  if (g_interposer_hook_identity.module &&
+      !hook::IsCurrent(g_interposer_hook_identity)) {
+    g_feature_function_hooked.store(false, std::memory_order_release);
+    g_init_hooked.store(false, std::memory_order_release);
+    internal::g_ui_hooks_installed.store(false, std::memory_order_release);
+    internal::g_ui_hooks.clear();
+    internal::g_real_get_feature_function = nullptr;
+    internal::g_real_init = nullptr;
+    internal::g_real_set_tag = nullptr;
+    internal::g_real_set_tag_for_frame = nullptr;
+    internal::g_real_set_constants = nullptr;
+    internal::g_real_pcl_set_marker = nullptr;
+    g_interposer_hook_identity = {};
+    internal::InvalidateLiveOptions();
+  }
   if (interposer == nullptr) return;
 
-  if (!g_feature_function_hooked.load(std::memory_order_acquire) &&
-      GetProcAddress(interposer, "slGetFeatureFunction") != nullptr &&
-      hook::Install(interposer, internal::kFeatureFunctionHook, "sl.interposer.dll")) {
-    g_feature_function_hooked.store(true, std::memory_order_release);
+  // slInit must be observed before the game calls it. A current, own-code
+  // major-2 slInit is enough to install that entry hook; the complete runtime
+  // contract can become available later, after sl.common is loaded.
+  const bool compatible_init = g_init_compatible && g_init_compatible(interposer);
+  const bool compatible_runtime =
+      g_interposer_contract_ready && g_interposer_contract_ready(interposer);
+  if (!compatible_init && !compatible_runtime) return;
+  if (!g_interposer_hook_identity.module &&
+      !hook::CaptureModule(interposer, g_interposer_hook_identity)) return;
+
+  if (compatible_runtime) {
+    if (!g_feature_function_hooked.load(std::memory_order_acquire) &&
+        GetProcAddress(interposer, "slGetFeatureFunction") != nullptr &&
+        hook::Install(interposer, internal::kFeatureFunctionHook, "sl.interposer.dll")) {
+      g_feature_function_hooked.store(true, std::memory_order_release);
+    }
+    internal::TryInstallUiHooks(interposer);
   }
 
-  internal::TryInstallUiHooks(interposer);
-
-  const bool compatible_init = g_init_compatible ? g_init_compatible(interposer)
-      : GetProcAddress(interposer, "slGetFeatureFunction") != nullptr;
   const bool observe_init = g_on_init && compatible_init;
   const bool alter_init =
       g_runtime_selection_mode.load(std::memory_order_relaxed) !=
@@ -2051,19 +2718,27 @@ inline void TryInstall() {
 }
 
 inline void Uninstall() {
+  internal::ReleaseGlobalAutomaticUiTags();
   internal::InvalidateLiveOptions();
   internal::g_entry_shutting_down.store(true, std::memory_order_release);
-  if (internal::g_ui_hooks_installed.load(std::memory_order_acquire) &&
+  const bool interposer_current = hook::IsCurrent(g_interposer_hook_identity);
+  if (interposer_current && internal::g_ui_hooks_installed.load(std::memory_order_acquire) &&
       !internal::g_ui_hooks.empty()) {
     hook::Uninstall(internal::g_ui_hooks);
     internal::g_ui_hooks.clear();
     internal::g_ui_hooks_installed.store(false, std::memory_order_release);
   }
-  if (g_init_hooked.load(std::memory_order_acquire)) hook::Uninstall(internal::kInitHook);
-  if (g_feature_function_hooked.load(std::memory_order_acquire))
+  if (interposer_current && g_init_hooked.load(std::memory_order_acquire)) hook::Uninstall(internal::kInitHook);
+  if (interposer_current && g_feature_function_hooked.load(std::memory_order_acquire))
     hook::Uninstall(internal::kFeatureFunctionHook);
   g_init_hooked.store(false, std::memory_order_release);
   g_feature_function_hooked.store(false, std::memory_order_release);
+  internal::g_ui_hooks.clear();
+  internal::g_ui_hooks_installed.store(false, std::memory_order_release);
+  g_interposer_hook_identity = {};
+  internal::g_real_get_feature_function = nullptr;
+  internal::g_real_init = nullptr;
+  internal::g_real_pcl_set_marker = nullptr;
 
   hook::UninstallAddress(internal::g_get_state_entry);
   hook::UninstallAddress(internal::g_set_options_entry);

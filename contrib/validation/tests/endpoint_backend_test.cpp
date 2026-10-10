@@ -4,6 +4,7 @@
 #include "../../../src/addons/mfgunlock/blackwell_temporal.hpp"
 #include "../../../src/addons/mfgunlock/validated_warp.hpp"
 
+#include "../tools/mapped_provider_image.hpp"
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -55,7 +56,7 @@ Bytes MapFile(const char* path) {
   Check(fatbin::ReadU16(optional) == 0x20b, "PE64 required");
   const auto image_bytes = fatbin::ReadU32(optional + 56);
   const auto headers = fatbin::ReadU32(optional + 60);
-  Check(image_bytes == endpoint::kImageBytes && headers <= file.size() &&
+  Check(image_bytes > 0 && image_bytes < 128 * 1024 * 1024 && headers <= file.size() &&
             headers <= image_bytes, "qualified image/header size");
   Bytes image(image_bytes);
   std::copy_n(file.begin(), headers, image.begin());
@@ -72,28 +73,7 @@ Bytes MapFile(const char* path) {
               raw <= file.size() && bytes <= file.size() - raw, "section bounds");
     std::copy_n(file.begin() + raw, bytes, image.begin() + rva);
   }
-  const auto preferred_base = fatbin::ReadU64(optional + 24);
-  const auto delta = reinterpret_cast<uintptr_t>(image.data()) - preferred_base;
-  size_t at = fatbin::ReadU32(optional + 112 + 5 * 8);
-  size_t remaining = fatbin::ReadU32(optional + 112 + 5 * 8 + 4);
-  Check(at <= image.size() && remaining <= image.size() - at, "relocation bounds");
-  while (remaining != 0) {
-    Check(remaining >= 8, "relocation header");
-    const auto page = fatbin::ReadU32(image.data() + at);
-    const auto bytes = fatbin::ReadU32(image.data() + at + 4);
-    Check(bytes >= 8 && bytes <= remaining && bytes % 2 == 0, "relocation block");
-    for (size_t i = 8; i < bytes; i += 2) {
-      const auto entry = fatbin::ReadU16(image.data() + at + i);
-      if (entry >> 12 == 0) continue;
-      Check(entry >> 12 == 10, "DIR64 relocation required");
-      const size_t rva = page + (entry & 0xfff);
-      Check(rva <= image.size() - 8, "relocation target");
-      const uint64_t value = fatbin::ReadU64(image.data() + rva) + delta;
-      std::memcpy(image.data() + rva, &value, sizeof(value));
-    }
-    at += bytes;
-    remaining -= bytes;
-  }
+  mfgunlock::validation::RelocateMappedProvider(image);
   return image;
 }
 
@@ -200,41 +180,50 @@ void FileChecks(const char* path) {
   Check(image == before && provider::PreparedProviderCount() == 0,
         "mid-selector rollback restores full image and never reports ready");
 
-  Reset();
-  image[endpoint::kCode.front().rva] ^= 1;
-  const auto bad_code = image;
-  Check(!provider::PrepareProvider(image.data()) && mock::protection_calls == 0 && image == bad_code,
-        "unknown code makes zero writes");
-  std::copy(before.begin(), before.end(), image.begin());
-
-  Reset();
-  image[endpoint::kPayloads.front().rva + 44] = 75;
-  const auto incomplete = image;
-  Check(!provider::PrepareProvider(image.data()) && mock::protection_calls == 0 && image == incomplete,
-        "missing/unqualified endpoint payload prevents all writes");
-  std::copy(before.begin(), before.end(), image.begin());
-
-  Reset();
-  image[0x64abe8] ^= 1;
-  const auto wrong_loader = image;
-  Check(!provider::PrepareProvider(image.data()) && mock::protection_calls == 0 && image == wrong_loader,
-        "wrong network vtable loader prevents all writes");
-  std::copy(before.begin(), before.end(), image.begin());
-
-  // Every allowed container is a guard, including the 31 non-endpoint entries.
-  for (const auto mode : {mfgunlock::Architecture::kTuring, mfgunlock::Architecture::kAmpere}) {
-    architecture::Configure(mode);
-    for (const auto& region : mfgunlock::profiles::kRetargetPayloads) {
-      Reset();
-      const size_t at = region.rva + region.bytes - 1;
-      image[at] ^= 1;
-      const auto rejected_image = image;
-      Check(!provider::PrepareProvider(image.data()) && mock::protection_calls == 0 &&
-                image == rejected_image,
-            "one unqualified container prevents any write on both retarget backends");
-      image[at] ^= 1;
-    }
+  // A changed whole-function fingerprint no longer vetoes independent PTX
+  // preparation. An unproved private dispatch must remain unmodified.
+  for (const auto at : {size_t{endpoint::kSelectors.front().rva},
+                        size_t{mfgunlock::profiles::kEndpointVtables.front().rva}}) {
+    Reset();
+    image[at] ^= 1;
+    const auto altered = image;
+    endpoint::StructuralPlan structural;
+    std::string reason;
+    Check(!provider::FindTuringEndpointPlan(image.data(), structural, reason),
+          "altered private constructor/factory evidence is not qualified");
+    const bool prepared = provider::PrepareProvider(image.data());
+    for (const auto& state : provider::internal::g_providers)
+      Check(!state.endpoint_selected, "generic preparation must not claim private endpoint selection");
+    for (const auto& site : endpoint::kSelectors)
+      Check(image[site.rva] == altered[site.rva] && image[site.rva+1] == altered[site.rva+1],
+            "unproved endpoint selectors are never patched");
+    Check(prepared, "independent generic preparation is attempted on changed provider");
+    provider::Restore();
+    Check(image == altered, "generic attempt rolls back byte-identically");
+    std::copy(before.begin(), before.end(), image.begin());
   }
+
+  // A real malformed payload, unlike a changed source fingerprint, prevents
+  // the payload/selector transaction from being committed.
+  Reset();
+  const auto bad_at = endpoint::kPayloads.front().rva + 8;
+  const uint64_t invalid_size = ~uint64_t{0};
+  std::memcpy(image.data()+bad_at,&invalid_size,8);
+  const auto invalid = image;
+  Check(!provider::PrepareProvider(image.data()) && mock::protection_calls == 0 && image == invalid,
+        "malformed container prevents all transaction writes");
+  std::copy(before.begin(), before.end(), image.begin());
+
+  // The same relocated contract is valid with different build metadata.
+  Reset();
+  const size_t nt = fatbin::ReadU32(image.data()+0x3c);
+  image[nt+8] ^= 0x55;
+  const auto renamed = image;
+  Check(provider::PrepareProvider(image.data()) && provider::internal::g_providers.front().endpoint_selected,
+        "timestamp does not authorize structural endpoint selection");
+  provider::Restore();
+  Check(image == renamed, "metadata-independent selection rolls back exactly");
+  std::copy(before.begin(), before.end(), image.begin());
 
   Reset();
   architecture::Configure(mfgunlock::Architecture::kAmpere);
@@ -250,10 +239,19 @@ void FileChecks(const char* path) {
   Check(provider::QualifiedNativeInventory(image.data()), "Ada exact original inventory qualifies without retarget");
   std::vector<unsigned char*> comparison_sites;
   Check(provider::FindQualifiedMfgGates(image.data(), comparison_sites) && comparison_sites.size() == 2,
-        "both exact MFG gate contexts qualify");
-  image[mfgunlock::profiles::kMfgGates[0].code.rva] ^= 1;
-  Check(!provider::FindQualifiedMfgGates(image.data(), comparison_sites), "mutated MFG context rejects");
-  image[mfgunlock::profiles::kMfgGates[0].code.rva] ^= 1;
+        "both MFG gates qualify structurally without profile selection");
+  // Expected sites are output oracles only. A changed image identity must not
+  // prevent structural discovery; changing the real comparison must prevent it.
+  Check(comparison_sites[0] == image.data() + mfgunlock::profiles::kMfgGates[0].immediate_rva,
+        "structural advertiser agrees with reference oracle");
+  const auto header = fatbin::ReadU32(image.data() + 0x3c);
+  image[header + 8] ^= 1;
+  Check(provider::FindQualifiedMfgGates(image.data(), comparison_sites),
+        "unknown timestamp still attempts and qualifies current host contract");
+  image[header + 8] ^= 1;
+  image[mfgunlock::profiles::kMfgGates[0].immediate_rva] ^= 1;
+  Check(!provider::FindQualifiedMfgGates(image.data(), comparison_sites), "changed comparison contract rejects");
+  image[mfgunlock::profiles::kMfgGates[0].immediate_rva] ^= 1;
   image[mfgunlock::profiles::kRetargetPayloads[0].rva] ^= 1;
   Check(!provider::QualifiedNativeInventory(image.data()), "Ada partial inventory rejects without writes");
   image[mfgunlock::profiles::kRetargetPayloads[0].rva] ^= 1;

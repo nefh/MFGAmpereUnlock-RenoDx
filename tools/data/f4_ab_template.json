@@ -1,0 +1,17 @@
+{
+  "schema": "mfg_f4_ab_v1",
+  "candidate": "C1_PASSIVE_READ",
+  "benefit_metric": "own_cpu",
+  "thresholds": {
+    "min_median_improvement_percent": 3,
+    "max_p95_regression_percent": 2
+  },
+  "runs": [],
+  "quality_review": {
+    "result": "NOT_RUN",
+    "method": null,
+    "scenes": [],
+    "generated_and_rendered_frames_captured": false,
+    "capture": null
+  }
+}

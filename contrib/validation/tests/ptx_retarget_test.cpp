@@ -2,6 +2,8 @@
 #include "../../../src/addons/mfgunlock/ptx_retarget.hpp"
 #include "../../../src/addons/mfgunlock/ptx_compat.hpp"
 
+#include "sm75_reference_profiles.hpp"
+
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -45,10 +47,12 @@ Bytes LiteralBlock(std::string_view text) {
   return output;
 }
 
-Bytes Container(std::string text, const Bytes* payload = nullptr) {
+Bytes Container(std::string text, const Bytes* payload = nullptr,
+                uint32_t header_bytes = 64, uint64_t flags = 0x2041) {
   if (text.empty() || text.back() != '\0') text.push_back('\0');
   const auto compressed = payload ? *payload : LiteralBlock(text);
-  Bytes fatbin(80 + ((compressed.size() + 7) & ~size_t{7}));
+  const size_t payload_offset = 16 + header_bytes;
+  Bytes fatbin(payload_offset + ((compressed.size() + 7) & ~size_t{7}));
 
   Put<uint32_t>(fatbin, 0, fb::kMagic);
   Put<uint16_t>(fatbin, 4, 1);
@@ -56,13 +60,13 @@ Bytes Container(std::string text, const Bytes* payload = nullptr) {
   Put<uint64_t>(fatbin, 8, fatbin.size() - 16);
   Put<uint16_t>(fatbin, 16, 1);
   Put<uint16_t>(fatbin, 18, 0x101);
-  Put<uint32_t>(fatbin, 20, 64);
-  Put<uint64_t>(fatbin, 24, fatbin.size() - 80);
+  Put<uint32_t>(fatbin, 20, header_bytes);
+  Put<uint64_t>(fatbin, 24, fatbin.size() - payload_offset);
   Put<uint32_t>(fatbin, 32, static_cast<uint32_t>(compressed.size()));
   Put<uint32_t>(fatbin, 44, 89);
-  Put<uint64_t>(fatbin, 56, 0x2041);
+  Put<uint64_t>(fatbin, 56, flags);
   Put<uint64_t>(fatbin, 72, text.size());
-  std::copy(compressed.begin(), compressed.end(), fatbin.begin() + 80);
+  std::copy(compressed.begin(), compressed.end(), fatbin.begin() + payload_offset);
   return fatbin;
 }
 
@@ -279,6 +283,38 @@ void UnitTests() {
 
   Check(ptx::Retarget(plan.replacement, plan, reason) == ptx::Result::kUnchanged);
 
+  // Future ISA numbers are preserved, not used as a blanket version veto.
+  for (const char* version : {"8.8", "9.0", "10.12"}) {
+    auto text = std::string(kPtx);
+    text.replace(text.find("8.7"), 3, version);
+    Check(ptx::Retarget(Container(text), plan, reason) == ptx::Result::kRetargeted);
+    Bytes decoded(plan.ptx_bytes);
+    const auto compressed_bytes = fb::ReadU32(plan.replacement.data() + 32);
+    Check(fb::Lz4BlockDecompress(plan.replacement.data() + plan.ptx_offset,
+        compressed_bytes, decoded.data(), decoded.size()));
+    const std::string after(decoded.begin(), decoded.end());
+    Check(after.find(std::string(".version ") + version) != after.npos);
+    Check(after.find(".target sm_86") != after.npos);
+  }
+  // A cubin before the PTX is selected by structure, not by known entry order.
+  auto reordered = valid;
+  Bytes cubin(72, 0);
+  Put<uint16_t>(cubin, 0, 2); Put<uint16_t>(cubin, 2, 0x101);
+  Put<uint32_t>(cubin, 4, 64); Put<uint64_t>(cubin, 8, 8);
+  Put<uint32_t>(cubin, 28, 89); Put<uint64_t>(cubin, 40, 0x41);
+  reordered.insert(reordered.begin() + 16, cubin.begin(), cubin.end());
+  Put<uint64_t>(reordered, 8, reordered.size() - 16);
+  Check(ptx::Retarget(reordered, plan, reason) == ptx::Result::kRetargeted);
+  Check(plan.replacement.size() == reordered.size() && plan.hidden_cubins == 1);
+  std::vector<fb::Entry> selected; size_t selected_end = 0;
+  Check(fb::Parse(plan.replacement, selected, selected_end));
+  Check(selected.size() == 1 && selected.front().kind == 1 && selected.front().architecture == 86);
+  auto duplicate = valid;
+  duplicate.insert(duplicate.end(), valid.begin() + 16, valid.end());
+  Put<uint64_t>(duplicate, 8, duplicate.size() - 16);
+  Check(ptx::Retarget(duplicate, plan, reason) == ptx::Result::kRejected);
+  Check(reason == "ambiguous SM89 PTX entries" && plan.replacement.empty());
+
   for (size_t bytes : {0u, 1u, 15u, 16u, 63u, 79u}) {
     Check(ptx::Retarget(std::span(valid).first(bytes), plan, reason) ==
           ptx::Result::kRejected);
@@ -311,6 +347,22 @@ void UnitTests() {
   auto bad_flags = valid;
   Put<uint64_t>(bad_flags, 56, 0x2040);
   Check(ptx::Retarget(bad_flags, plan, reason) == ptx::Result::kRejected);
+
+  // 0x2011/120-byte entries are a second observed bounded LZ4 PTX layout.
+  // Both targets accept this bounded envelope; the decoded PTX is still checked.
+  const auto flags2011 = Container(std::string(kPtx), nullptr, 120, 0x2011);
+  Check(ptx::Retarget(flags2011, plan, reason, mfgunlock::architecture::kAmpere) ==
+        ptx::Result::kRetargeted);
+  Check(plan.replacement.size() == flags2011.size());
+  Check(fb::ReadU32(plan.replacement.data() + 44) == 86);
+  Check(fb::ReadU64(plan.replacement.data() + 56) == 0x2011);
+  Check(ptx::Retarget(flags2011, plan, reason, mfgunlock::architecture::kTuring) ==
+        ptx::Result::kRetargeted);
+  Check(fb::ReadU32(plan.replacement.data() + 44) == 75);
+  const auto flags2011_bad_header = Container(std::string(kPtx), nullptr, 112, 0x2011);
+  Check(ptx::Retarget(flags2011_bad_header, plan, reason,
+                      mfgunlock::architecture::kAmpere) == ptx::Result::kRejected);
+  Check(reason == "unreviewed PTX compression flags/layout");
 
   auto overflow = valid;
   Put<uint64_t>(overflow, 24, UINT64_MAX);
@@ -429,6 +481,129 @@ void TuringMmaFragments() {
   }
 }
 
+void StructuralSm75Tests() {
+  const std::string head = ".version 8.2\n.target sm_89\n.address_size 64\n"
+      ".visible .entry arbitrary_network() {\n.reg .b32 %r<32>;\n"
+      ".reg .f32 %f<8>;\n.reg .b16 %rs<8>;\n";
+  const std::string packed = "{ cvt.rn.f16x2.f32 %r1, %f2, %f3; }\n";
+  const std::string mma = "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+      "{%r10,%r11}, {%r0,%r1,%r2,%r3}, {%r4,%r5}, {%r10,%r11};\n";
+  const std::string minmax = "max.f16 %rs0, %rs1, %rs2;\nmin.f16x2 %r0, %r1, %r2;\n";
+  std::string why;
+  for (const auto& ops : {packed, mma, minmax, packed+mma+minmax}) {
+    const auto source = head + ops + "ret;\n}\n";
+    auto text = source;
+    ptx::Sm75LoweringCounts counts;
+    const bool lowered=ptx::LowerSm75Structurally(text,counts,why);
+    if (!lowered) std::cerr << "lower fixture: " << why << "\n";
+    Check(lowered);
+    Check(text != source && counts.Total() > 0);
+    Check(!ptx::HasPackedHalfConversion(text) && !ptx::HasTuringMma16816(text) &&
+          !ptx::HasTuringHalfMinMax(text));
+    auto repeat = text;
+    Check(ptx::LowerSm75Structurally(repeat,counts,why) && repeat == text && counts.Total()==0);
+    // The same semantic program has no need for a whole-source profile even
+    // when its name/comment/register capacities differ from every reference.
+    for (unsigned i=0;i<64;++i) {
+      auto variant = source + "// independent source " + std::to_string(i) + "\n";
+      variant.replace(variant.find("arbitrary_network"),17,"network_"+std::to_string(i));
+      Check(ptx::LowerSm75Structurally(variant,counts,why));
+    }
+    for (const auto flags : {uint64_t{0x2041},uint64_t{0x2011}}) {
+      const unsigned header=flags==0x2011?120:64;
+      auto input=Container(source,nullptr,header,flags);
+      input.resize(input.size()+4096,0);
+      Put<uint64_t>(input,8,input.size()-16);
+      Put<uint64_t>(input,24,input.size()-16-header);
+      const auto before=input;
+      ptx::Plan plan;
+      const auto result=ptx::Retarget(input,plan,why,mfgunlock::architecture::kTuring);
+      if (result!=ptx::Result::kRetargeted) std::cerr << "structural fixture: " << why << " flags=" << flags << "\n";
+      Check(result==ptx::Result::kRetargeted);
+      std::vector<fb::Entry> entries;size_t end=0;
+      Check(fb::Parse(plan.replacement,entries,end) && entries.size()==1 && entries[0].architecture==75);
+      Check(input==before);
+    }
+  }
+  // PTX statements may wrap lines and use TAB indentation. Reuse the exact
+  // arithmetic lowerings; formatting alone must not require source profiles.
+  const std::string multiline =
+      "\tcvt.rn.f16x2.f32\t%r1,\n %f2,\n %f3;\n"
+      "\tmma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 \n"
+      " {%r10, %r11},\n {%r0, %r1, %r2, %r3},\n {%r4, %r5},\n {%r10, %r11};\n"
+      "\tmax.f16\t%rs0, %rs1, %rs2;\n"
+      "\tmin.f16x2\t%r0, %r1, %r2;\n";
+  auto wrapped=head+multiline+"ret;\n}\n";
+  auto canonical=head+packed+mma+minmax+"ret;\n}\n";
+  ptx::Sm75LoweringCounts c1,c2;
+  Check(ptx::LowerSm75Structurally(wrapped,c1,why));
+  Check(ptx::LowerSm75Structurally(canonical,c2,why));
+  Check(c1.Total()==c2.Total() && c1.Total()==4);
+  Check(wrapped==canonical);
+  {
+    auto physical=Container(head+packed+"ret;\n}\n",nullptr,120,0x2011);
+    physical.resize(physical.size()+4096,0);
+    Put<uint64_t>(physical,8,physical.size()-16);
+    Put<uint64_t>(physical,24,physical.size()-16-120);
+    Put<uint32_t>(physical,physical.size()-32,fb::kMagic);
+    std::vector<fb::Entry> entries;size_t end=0;
+    Check(fb::Parse(physical,entries,end));
+    Bytes rebuilt;
+    auto target_text=canonical;
+    target_text.replace(target_text.find(".target sm_89"),13,".target sm_75");
+    Check(ptx::RepackCompressedProvider(physical,entries[0],target_text,rebuilt));
+    Check(rebuilt.size()==physical.size());
+    Check(fb::Parse(rebuilt,entries,end) && entries.size()==1 && end==physical.size());
+    Check(entries[0].architecture==75 && entries[0].flags==0x2011);
+    std::vector<unsigned char> raw(entries[0].unpacked_bytes);
+    Check(fb::Lz4BlockDecompress(rebuilt.data()+entries[0].PayloadOffset(),
+        entries[0].compressed_bytes,raw.data(),raw.size()));
+    Check(raw.size()==target_text.size()+1 && std::equal(target_text.begin(),target_text.end(),raw.begin()));
+  }
+  for (const auto& invalid : {
+      std::string("cvt.rn.f16x2.f32 %r1, %f2, %f3; ret;\n"),
+      std::string("cvt.rn.f16x2.f32 %r1, /* injected */ %f2, %f3;\n"),
+      std::string("@%p0 cvt.rn.f16x2.f32 %r1, %f2, %f3;\n"),
+      std::string("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 \n"
+          "{%r2,%r11}, {%r0,%r1,%r2,%r3}, {%r4,%r5}, {%r10,%r11};\n")}) {
+    auto text=head+invalid+"ret;\n}\n";const auto before=text;
+    Check(!ptx::LowerSm75Structurally(text,c1,why) && text==before);
+  }
+  for (const auto& invalid : {
+      std::string("@%p0 ")+mma,
+      std::string("{ cvt.rz.f16x2.f32 %r1, %f2, %f3; }\n"),
+      std::string("{ cvt.rn.f16x2.f32 %r01, %f2, %f3; }\n"),
+      std::string("{ cvt.rn.f16x2.f32 %r32, %f2, %f3; }\n"),
+      std::string("max.f16 %rs00, %rs1, %rs2;\n"),
+      std::string("max.f16x2 %r0, %r32, %r2;\n")}) {
+    auto text=head+invalid+"ret;\n}\n";const auto original=text;
+    ptx::Sm75LoweringCounts counts;
+    Check(!ptx::LowerSm75Structurally(text,counts,why) && text==original);
+  }
+  for (const auto& replacement : {std::string("{%r2,%r11}"),std::string("{%r10,%r5}"),
+                                  std::string("{%r10,%r10}"),std::string("{%r010,%r11}")}) {
+    auto op=mma;op.replace(op.find("{%r10,%r11}"),std::string("{%r10,%r11}").size(),replacement);
+    auto text=head+op+"ret;\n}\n";const auto original=text;
+    ptx::Sm75LoweringCounts counts;
+    Check(!ptx::LowerSm75Structurally(text,counts,why) && text==original);
+  }
+  for (const auto& suffix : {std::string(".entry second() { ret; }\n"),
+                              std::string(".func helper() { ret; }\n"),std::string("/*")}) {
+    auto text=head+mma+"ret;\n}\n"+suffix;const auto original=text;
+    ptx::Sm75LoweringCounts counts;
+    Check(!ptx::LowerSm75Structurally(text,counts,why) && text==original);
+  }
+  for (const auto& declaration : {std::string(".reg .f32 %f8;\n"),std::string(".reg .b32 %r0;\n")}) {
+    auto text=head+declaration+mma+"ret;\n}\n";const auto original=text;
+    ptx::Sm75LoweringCounts counts;
+    Check(!ptx::LowerSm75Structurally(text,counts,why) && text==original);
+  }
+  auto comment=head+"// mma.sync.aligned.m16n8k16\nret;\n}\n";
+  ptx::Sm75LoweringCounts counts;
+  const auto before=comment;
+  Check(ptx::LowerSm75Structurally(comment,counts,why) && comment==before && !counts.Total());
+}
+
 void Corpus(const std::filesystem::path& path, const std::filesystem::path& output_path) {
   unsigned int accepted = 0;
   std::filesystem::create_directories(output_path);
@@ -460,6 +635,7 @@ int main(int argc, char** argv) {
   try {
     UnitTests();
     TuringMmaFragments();
+    StructuralSm75Tests();
     if (argc == 3) {
       Corpus(argv[1], argv[2]);
     } else if (argc != 1) {

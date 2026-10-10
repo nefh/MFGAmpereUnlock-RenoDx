@@ -73,8 +73,9 @@ inline uint64_t Fingerprint(const unsigned char* bytes, size_t count) {
 
 inline bool MatchesProvider(HMODULE module, bool own_reader = false) {
   provider::internal::ImageIdentity identity;
-  if (!provider::internal::ReadIdentity(module, identity) ||
-      identity.timestamp != 0x6A986031u || identity.image_bytes != 0x737000u) return false;
+  if (!provider::internal::ReadIdentity(module, identity)) return false;
+  // Metadata is not a veto: the complete reader/consumer/observer contexts
+  // below qualify this private layout, including for an unlisted build.
   const auto* base = reinterpret_cast<const unsigned char*>(module);
   if (!provider::internal::IsReadable(base + kReaderRva, kReaderBytes, module) ||
       !provider::internal::IsReadable(base + kSelectionRva, kSelectionBytes, module) ||

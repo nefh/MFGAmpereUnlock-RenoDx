@@ -32,6 +32,18 @@ std::array<countobserver::Event, 32> g_events;
 size_t g_event_count = 0;
 const sl::DLSSGOptions* g_caller_options = nullptr;
 bool g_caller_untouched = true;
+
+struct LegacyConstantsForHistory {
+  uint32_t structVersion = 1;
+  sl::Boolean reset = sl::Boolean::eFalse;
+};
+
+// Synthetic optional future layout, not a field claimed to exist in the SDK.
+struct ModernConstantsForHistory {
+  uint32_t structVersion = 2;
+  sl::Boolean reset = sl::Boolean::eFalse;
+  sl::Boolean renderingGameFrames = sl::Boolean::eFalse;
+};
 void ObserveCount(const countobserver::Event* event) noexcept {
   if (g_event_count < g_events.size()) g_events[g_event_count++] = *event;
 }
@@ -72,9 +84,16 @@ sl::Result ObserveInit(const sl::Preferences& pref, uint64_t sdk,
                        sl::Result (*next)(const sl::Preferences&, uint64_t)) {
   return next(pref, sdk);
 }
+sl::Result SetConstantsForEvidence(const sl::Constants&, const sl::FrameToken&,
+                                     const sl::ViewportHandle&) { return g_result; }
+sl::Result SetTagsForEvidence(const sl::FrameToken&, const sl::ViewportHandle&,
+                              const sl::ResourceTag*, uint32_t, sl::CommandBuffer*) { return g_result; }
+sl::Result SetMarkerForEvidence(sl::PCLMarker, const sl::FrameToken&) { return g_result; }
+
 void Reset(Architecture mode) {
   countobserver::g_callback = nullptr;
   g_event_count = 0;
+  presentation::Reset();
   g_caller_options = nullptr;
   g_caller_untouched = true;
   fc::g_ui_composition_enabled = false;
@@ -104,6 +123,7 @@ void Reset(Architecture mode) {
   fc::g_runtime_max_generated = 0;
   fc::internal::g_real_set_options = SetOptions;
   fc::internal::g_real_get_state = GetState;
+  fc::g_provider_mfg_ceiling = nullptr;
   fc::g_multi_frame_ready = [] { return g_backend_ready; };
   fc::g_dynamic_stack_ready = [] { return true; };
   fc::g_dynamic_d3d12 = false;
@@ -137,6 +157,32 @@ void Reset(Architecture mode) {
 }  // namespace
 
 int main() {
+  integration::Reset();
+  LegacyConstantsForHistory legacy_constants{};
+  legacy_constants.reset = sl::Boolean::eTrue;
+  fc::internal::ObserveStreamlineHistory(legacy_constants);
+  auto history = integration::Read();
+  Check(history.history_reset_known && history.history_reset,
+        "legacy Constants preserves reset evidence");
+  Check(!history.rendering_game_frames_known,
+        "legacy Constants keeps renderingGameFrames unknown");
+
+  integration::Reset();
+  ModernConstantsForHistory modern_constants{};
+  modern_constants.renderingGameFrames = sl::Boolean::eTrue;
+  fc::internal::ObserveStreamlineHistory(modern_constants);
+  history = integration::Read();
+  Check(history.history_reset_known && !history.history_reset &&
+            history.rendering_game_frames_known && history.rendering_game_frames,
+        "modern Constants observes renderingGameFrames");
+
+  modern_constants.structVersion = 1;
+  integration::Reset();
+  fc::internal::ObserveStreamlineHistory(modern_constants);
+  history = integration::Read();
+  Check(!history.rendering_game_frames_known,
+        "older Constants ABI does not read newer renderingGameFrames member");
+
   sl::ViewportHandle viewport{};
   sl::DLSSGOptions options{};
   options.numFramesToGenerate = 3;
@@ -721,6 +767,23 @@ int main() {
   countobserver::g_callback = nullptr;
 
   Reset(Architecture::kAda);
+  g_backend_ready = true;
+  g_result = sl::Result::eOk;
+  options = sl::DLSSGOptions{};
+  options.structVersion = sl::kStructVersion5;
+  options.mode = sl::DLSSGMode::eOn;
+  options.numFramesToGenerate = 3;
+  fc::internal::HookedSetOptions(viewport, options);
+  auto presentation_state = presentation::Read();
+  Check(presentation_state.accepted_mode_known &&
+            presentation_state.accepted_mode == presentation::ProviderMode::kFixed &&
+            presentation_state.accepted_multiplier_known &&
+            presentation_state.accepted_multiplier == 4,
+        "presentation observer records accepted fixed mode without claiming generated output");
+  Check(!presentation_state.generated_multiplier_known,
+        "accepted fixed mode does not fabricate actual generation evidence");
+
+  Reset(Architecture::kAda);
   const auto plugin_module = reinterpret_cast<HMODULE>(0x7777);
   fc::internal::g_set_options_entry.identity.module = plugin_module;
   fc::internal::g_set_options_entry.installed = true;
@@ -751,5 +814,91 @@ int main() {
             !fc::g_dynamic_applied.load(),
         "plugin unload clears structural, accepted-mode and Dynamic runtime observations");
 
+  Reset(Architecture::kAda);
+  integration::Reset();
+  fc::g_ui_composition_enabled = false;
+  fc::internal::g_real_set_constants = SetConstantsForEvidence;
+  fc::internal::g_real_set_tag_for_frame = SetTagsForEvidence;
+  fc::internal::g_real_pcl_set_marker = SetMarkerForEvidence;
+  sl::Constants constants{};
+  constants.reset = sl::Boolean::eFalse;
+  const sl::FrameToken frame = 80;
+  g_result = sl::Result::eOk;
+  fc::internal::HookedSetConstants(constants, frame, viewport);
+  Check(integration::Read().constants_frame_known && integration::Read().history_reset_known &&
+        !integration::Read().rendering_game_frames_known,
+        "successful real-SDK constants record reset without fabricated gameplay field");
+  sl::Resource resource(sl::ResourceType::eTex2d, reinterpret_cast<void*>(0x800), 0x40);
+  resource.nativeFormat = 28;
+  sl::Extent extent{};
+  extent.width = 1920;
+  extent.height = 1080;
+  sl::ResourceTag tag(&resource, sl::kBufferTypeBackbuffer,
+                       sl::ResourceLifecycle::eValidUntilPresent, &extent);
+  fc::internal::HookedSetTagForFrame(frame, viewport, &tag, 1, nullptr);
+  uint32_t bound_viewport = UINT32_MAX;
+  Check(integration::ReadTaggedBackbuffer(bound_viewport) == 0x800 &&
+        bound_viewport == static_cast<uint32_t>(viewport),
+        "only a current successful per-frame tag can bind presentation source");
+  fc::g_ui_pair_eligible = true;
+  fc::g_ui_candidate_options_synced = true;
+  g_result = sl::Result::eErrorNotInitialized;
+  fc::internal::HookedSetTagForFrame(frame, viewport, &tag, 1, nullptr);
+  Check(!integration::Read().resource[0].active &&
+        integration::ReadTaggedBackbuffer(bound_viewport) == 0,
+        "failed tag submission cannot leave a live presentation resource");
+  Check(!fc::g_ui_pair_eligible.load() && !fc::g_ui_candidate_options_synced.load(),
+        "failed native tag submission also invalidates UIR eligibility");
+  integration::ObserveHistory(true, false, true, true);
+  fc::internal::HookedSetConstants(constants, frame, viewport);
+  Check(!integration::Read().history_reset_known && !integration::Read().constants_frame_known,
+        "failed constants invalidate previous history evidence");
+  fc::internal::HookedPclSetMarker(sl::PCLMarker::ePresentStart, frame);
+  Check(!integration::Read().present_start_known, "failed marker is not reported as accepted");
+  g_result = sl::Result::eOk;
+  fc::internal::HookedPclSetMarker(sl::PCLMarker::ePresentStart, frame);
+  Check(integration::Read().present_start_known, "successful marker is observed without rewriting");
+  constants.structVersion = 99;
+  fc::internal::HookedSetConstants(constants, frame, viewport);
+  Check(!integration::Read().constants_frame_known, "unknown Constants ABI passes through but is not decoded");
+  presentation::ObserveProviderOptions(presentation::ProviderMode::kFixed, 4);
+  g_result = sl::Result::eErrorNotInitialized;
+  state = sl::DLSSGState{};
+  fc::internal::HookedGetState(viewport, state, nullptr);
+  Check(!presentation::Read().effective_multiplier_known &&
+        presentation::Read().confidence == presentation::Confidence::kUnknown,
+        "failed native GetState clears current delivery evidence, not last accepted options");
+  // MG1: the active structural provider contract, not kDlssg31091, bounds
+  // the existing policy. Identity and optional quality do not participate.
+  for (auto arch : {Architecture::kAmpere, Architecture::kTuring, Architecture::kAda}) {
+    Reset(arch);
+    g_backend_ready = true;
+    g_software_pacing = true;
+    fc::g_provider_mfg_ceiling = [] { return 3u; };
+    fc::g_force_multiplier = 5;
+    options = sl::DLSSGOptions{};
+    options.mode = sl::DLSSGMode::eOn;
+    options.numFramesToGenerate = 1;
+    fc::internal::HookedSetOptions(viewport, options);
+    Check(g_received == 1 && fc::g_fixed_override_status == fc::FixedOverrideStatus::kBlockedStructuralCeiling,
+          "current provider ceiling rejects oversized request on every architecture");
+    fc::g_force_multiplier = 4;
+    fc::internal::HookedSetOptions(viewport, options);
+    Check(g_received == 3, "current structural ceiling permits fixed MFG within contract");
+    state = sl::DLSSGState{};
+    fc::internal::HookedGetState(viewport, state, nullptr);
+    Check(state.numFramesToGenerateMax == 3 && fc::g_runtime_max_generated == 5,
+          "effective provider bound stays separate from original native observation");
+    fc::g_provider_mfg_ceiling = [] { return 0u; };
+    fc::internal::HookedSetOptions(viewport, options);
+    Check(g_received == 1, "missing provider bound does not fabricate a multiplier");
+  }
+  Reset(Architecture::kAda);
+  g_backend_ready = true; fc::g_dynamic_d3d12 = true;
+  state = sl::DLSSGState{}; state.structVersion = 99;
+  Check(!fc::internal::ObserveDynamicSupport(state, sl::Result::eOk), "future unqualified State never read as v4");
+  state.structVersion = sl::kStructVersion4;
+  state.structType = 0;
+  Check(!fc::internal::ObserveDynamicSupport(state, sl::Result::eOk), "wrong State type never supplies Dynamic proof");
   std::printf("PASS frame-count profiles: %u checks\n", g_checks);
 }

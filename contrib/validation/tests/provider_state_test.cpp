@@ -81,7 +81,7 @@ struct Image {
 
     const unsigned char gate[] = {0xb8, 0x90, 1, 0, 0, 0xc3};
     std::memcpy(bytes.data() + 0x1000, gate, sizeof(gate));
-    if (!valid_gate) bytes[0x1001] = 0xb0;
+    if (!valid_gate) bytes[0x1001] = 0x55;
 
     // One minimal compressed PTX container. This is the same validated layout
     // used by ptx_retarget_test.
@@ -182,10 +182,61 @@ int main() {
     Image renamed(0x6a986031);
     mock::paths[renamed.module] = "X:\\fixture\\renamed-provider.dll";
     Check(provider::IsDlssgProvider(renamed.module), "genuine renamed provider identity accepted");
-    Check(!provider::PrepareProvider(renamed.module) && mock::protection_calls == 0,
-          "production registry rejects unknown image even with valid PTX and exports");
-    Check(PrepareFixture(renamed.module), "explicit exact fixture inventory qualified");
+    const auto renamed_original = renamed.bytes;
+    Check(provider::PrepareProvider(renamed.module) && mock::protection_calls > 0,
+          "unknown production image actually retargeted without a registry fixture");
+    const auto trial = provider::InspectProvider(renamed.module);
+    Check(trial.prepared && !trial.exact_inventory && !trial.profile_known &&
+          trial.profile_index == 0 && provider::PreparedProviderCount() == 1 && Allowed(),
+          "structural trial publishes real readiness, not a fabricated registry match");
+    const auto trial_writes = mock::protection_calls;
+    for (unsigned i = 0; i < 100; ++i)
+      Check(provider::PrepareProvider(renamed.module) && mock::protection_calls == trial_writes,
+            "repeated structural preparation does not rewrite bytes");
     provider::Restore();
+    Check(renamed.bytes == renamed_original, "unknown-image transaction restores byte for byte");
+
+    // A known metadata hint with a stale payload hash is not an authorization
+    // veto either: the generic transform must inspect and try the actual PTX.
+    auto& stale_profile = g_fixture_profiles.at(renamed.module);
+    stale_profile.regions[0].hash ^= 1;
+    Check(PrepareFixture(renamed.module) && !provider::InspectProvider(renamed.module).exact_inventory,
+          "stale registry evidence falls through to the structural transaction");
+    provider::Restore();
+    Check(renamed.bytes == renamed_original, "stale-profile fallback restores exactly");
+
+    // The architecture export is a semantic minimum, not a provider-version
+    // fingerprint. An older provider that already reports Turing is permissive
+    // enough for Ampere and must remain untouched; a future 0x1x0 architecture
+    // constant uses the same contract and is lowered only after payload prep.
+    Reset();
+    Image permissive(0x160001);
+    permissive.bytes[0x1001] = 0x60;
+    const auto permissive_original = permissive.bytes;
+    Check(PrepareFixture(permissive.module), "already-permissive Turing gate accepted on Ampere");
+    Check(permissive.bytes[0x1001] == 0x60, "already-permissive minimum is not rewritten upward");
+    provider::Restore();
+    Check(permissive.bytes == permissive_original, "already-permissive transaction restores exactly");
+
+    Reset();
+    Image future_gate(0x1a0001);
+    future_gate.bytes[0x1001] = 0xa0;
+    const auto future_original = future_gate.bytes;
+    Check(PrepareFixture(future_gate.module), "future architecture-id constant accepted structurally");
+    Check(future_gate.bytes[0x1001] == 0x70, "future minimum lowered to requested Ampere target");
+    provider::Restore();
+    Check(future_gate.bytes == future_original, "future-gate transaction restores exactly");
+
+    Reset();
+    Image context_image(0xDEADBEEF);
+    const unsigned char code[] = {0x48,0x8b,0x41,0x20,0x81,0xf8,0xb0,0x01,0,0,0x75,0x04};
+    std::copy(std::begin(code), std::end(code), context_image.bytes.begin() + 0x1300);
+    std::vector<unsigned char*> context_gates;
+    Check(!provider::FindQualifiedMfgGates(context_image.module, context_gates) && context_gates.empty(),
+          "an arbitrary matching cmp without advertise/execute flow cannot authorize MFG");
+    std::copy(std::begin(code), std::end(code), context_image.bytes.begin() + 0x1500);
+    Check(!provider::FindQualifiedMfgGates(context_image.module, context_gates),
+          "duplicated decoy comparisons cannot authorize MFG");
     Reset();
     Image modern(0x6a986031);
     std::memset(modern.bytes.data() + 0x2f00, 0, 128);
@@ -199,6 +250,14 @@ int main() {
     Image ready(1);
     const auto original = ready.bytes;
     Check(PrepareFixture(ready.module), "initial provider preparation");
+    const auto ready_observation = provider::InspectProvider(ready.module);
+    Check(ready_observation.mapped && ready_observation.dlssg &&
+              ready_observation.profile_known && ready_observation.exact_inventory &&
+              ready_observation.prepared &&
+              ready_observation.qualification == mfgunlock::profiles::Qualification::kPatchable,
+          "prepared provider publishes exact runtime inventory qualification");
+    Check(ready_observation.profile_index == 0 && ready_observation.profile == nullptr,
+          "synthetic provider does not retain a dangling custom profile pointer");
     Check(provider::PreparedProviderCount() == 1 && Allowed(),
           "single prepared provider admitted");
     Check(ready.bytes[0x1001] == 0x70, "minimum arch written last");
@@ -352,13 +411,10 @@ int main() {
       const auto* profile = mfgunlock::architecture::ActiveProfile();
       Image target(100);
       const auto before = target.bytes;
-      if (selected == mfgunlock::Architecture::kTuring) {
-        Check(!PrepareFixture(target.module) && target.bytes == before &&
-                  mock::protection_calls == 0,
-              "unknown Turing network layout rejects before any write");
-        continue;
-      }
-      Check(PrepareFixture(target.module), "explicit profile prepares provider");
+      Check(PrepareFixture(target.module), "actual PTX prepares on the selected architecture");
+      if (selected == mfgunlock::Architecture::kTuring)
+        Check(!provider::internal::g_providers.front().endpoint_selected,
+              "unmatched V4 endpoint is not written; generic PTX trial still runs");
       Check(target.bytes[0x1001] == static_cast<unsigned char>(profile->native_arch),
             "minimum architecture follows profile");
       Check(mfgunlock::fatbin::ReadU32(target.bytes.data() + 0x2000 + 44) == profile->target_sm,
@@ -396,9 +452,8 @@ int main() {
     Check(!PrepareFixture(automatic.module) && automatic.bytes == automatic_before,
           "pending Auto writes nothing");
     mfgunlock::architecture::ResolveAuto(0x10de, 0x160, 2);
-    Check(!PrepareFixture(automatic.module) && automatic.bytes == automatic_before &&
-              mock::protection_calls == 0,
-          "resolved Turing Auto requires an exact network layout");
+    Check(PrepareFixture(automatic.module) && automatic.bytes != automatic_before,
+          "resolved Turing Auto attempts the actual supported PTX without a registry endpoint");
     provider::Restore();
     Check(automatic.bytes == automatic_before, "Auto provider restored");
 

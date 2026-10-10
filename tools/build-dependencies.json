@@ -11,5 +11,9 @@
     "dxc",
     "slang",
     "glslang"
-  ]
+  ],
+  "vulkan_headers": {
+    "url": "https://github.com/KhronosGroup/Vulkan-Headers.git",
+    "ref": "v1.3.290"
+  }
 }
