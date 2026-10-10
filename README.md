@@ -19,19 +19,30 @@ NVIDIA DLLs. Close the game before updating the addon.
 1. Install [ReShade](https://reshade.me/) with addon support, or the appropriate
    [RenoDX](https://github.com/clshortfuse/renodx) mod for the game.
 2. Download the [latest release](../../releases/latest).
-3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the game.
-   When updating, close the game before replacing the existing addon file.
-4. Start with the game's original DLSS-G and Streamline libraries. **You do not
+3. Place `renodx-mfgunlock.addon64` in the ReShade addon location used by the
+   game, commonly next to the game executable. A game-specific RenoDX package
+   may use its own addon folder. Close the game before replacing the addon.
+4. **Append the following to `ReShade.ini`:**
+
+   ```ini
+   [ADDON]
+   LoadFromDllMain=renodx-mfgunlock.addon64
+   ```
+
+   **If omitted, MFG Unlock will append itself automatically on supported
+   ReShade versions; restart the game once afterwards for MFG to be detected.**
+5. Start with the game's original DLSS-G and Streamline libraries. **You do not
    need to replace them with the latest versions for MFG Unlock to work.** Newer
    versions are recommended for advanced features. You can find the
    [latest DLSS-G DLL](https://www.techpowerup.com/download/nvidia-dlss-3-frame-generation-dll/)
    on TechPowerUp.
-5. For native Dynamic MFG and the DLSS-G 310.9.1 quality features,
+6. MFG Unlock supports **Streamline 1.x and 2.x** without requiring a
+   specific Streamline/DLSS-G version pair. For newer NVIDIA features,
    [Streamline 2.14.1 with DLSS-G 310.9.1](https://www.nexusmods.com/site/mods/1282?tab=files)
-   is a known working combination in **Cyberpunk 2077**. Update Streamline only
-   in games that support it. **Do not replace Streamline 1.x with 2.x** in older
-   games such as **A Plague Tale: Requiem**.
-6. Use the game's multiplier selector when available. Otherwise use **Force frame
+   is an optional update where the game supports it, not a requirement.
+   **Do not replace Streamline 1.x with 2.x** in older games such as
+   **A Plague Tale: Requiem**.
+7. Use the game's multiplier selector when available. Otherwise use **Force frame
    multiplier** in the ReShade **MFG Unlock** panel.
 
 ### Dynamic MFG and Validated Warp Blend
@@ -42,6 +53,8 @@ NVIDIA DLLs. Close the game before updating the addon.
 - **Validated Warp Blend** ports the quality improvement from
   [MFGAdaUnlock](https://github.com/mavismmg/MFGAdaUnlock-RenoDx) to compatible
   DLSS-G **310.9.1** setups. Enable it and restart the game.
+- Warp diagnostic modes are available under advanced/debug options; normal use
+  keeps **Validated Warp**.
 
 ### Intermediate Scatter Retention and Boundary Artifact Mitigation
 
@@ -90,7 +103,7 @@ Results may vary with game, driver, Streamline and DLSS-G versions.*
 | Assetto Corsa Rally | Working | |
 | Clair Obscur: Expedition 33 | Working | |
 | Control Resonant | Working | |
-| Cyberpunk 2077 | Working | Dynamic MFG, Validated Warp Blend and Preset B; Streamline 2.14.1 / DLSS-G 310.9.1 |
+| Cyberpunk 2077 | Working | Dynamic MFG, Validated Warp Blend and Preset B (tested with Streamline 2.14.1 / DLSS-G 310.9.1) |
 | Grand Theft Auto V Enhanced | Working | |
 | Hogwarts Legacy | Working | |
 | JDM: Japanese Drift Master | Working | |
@@ -210,17 +223,28 @@ configuration without a boundary setting keeps the previous ISR behavior until
 
 ## How it works
 
-MFGAmpereUnlock uses NVIDIA's own DLSS Frame Generation rather than replacing
-it with a different frame generator.
+MFGAmpereUnlock keeps NVIDIA's native DLSS Frame Generation and adapts it to
+the selected GPU architecture rather than replacing it with another frame
+generator:
 
-1. On **Ada**, NVIDIA's DLSS-G code is already compatible with the GPU. The
-   addon adjusts Frame Generation availability and MFG settings.
-2. On **Ampere** and **Turing**, compatible DLSS-G PTX code is adapted from
-   `sm_89` to `sm_86` or `sm_75` so the NVIDIA driver can compile it for the GPU.
-3. The addon works with the game's Streamline/NGX integration to expose
-   supported multipliers, keeping NVIDIA and the game in control of frame pacing.
-4. **Temporal Fix**, UI Recomposition and optional image-quality features help
-   improve the appearance of generated frames.
+1. `Auto` detects Ada, Ampere or Turing; the architecture can also be selected
+   manually if needed.
+2. On **Ada**, NVIDIA's DLSS-G provider already contains compatible `sm_89`
+   code. The addon adjusts Frame Generation availability and MFG settings.
+3. On **Ampere** and **Turing**, compatible provider PTX is adapted from
+   `sm_89` to `sm_86` or `sm_75` so the NVIDIA driver can JIT-compile it.
+4. The addon examines the loaded provider and its embedded CUDA code before
+   applying changes, rather than requiring a specific hardcoded DLL version.
+5. Streamline/NGX capability checks are adapted for the selected GPU so the
+   game's native Frame Generation path can become available.
+6. At higher multipliers, **Temporal Fix** preserves the intended temporal
+   position of each generated frame.
+7. With compatible Streamline/DLSS-G versions, **Dynamic MFG** uses NVIDIA's
+   native mode and frame pacing.
+8. **Validated Warp Blend** improves later-stage reprojection for compatible
+   DLSS-G 310.9.1 setups.
+9. **UI Recomposition** uses the game's native HUD-less/UI resources where
+   available, with optional D3D12 Color+Alpha injection and fallback.
 
 ## Building from source
 
