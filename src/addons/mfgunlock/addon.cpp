@@ -3347,7 +3347,16 @@ void DrawMfgRuntimeDiagnostics() {
       row << " alpha_prepare=" << g_ui_alpha_prepare_successes.load()
           << " alpha_prepare_fail=" << g_ui_alpha_prepare_failures.load()
           << " alpha_copy_signaled=" << g_ui_alpha_extractions.load()
-          << " alpha_signal_fail=" << g_ui_alpha_extraction_failures.load();
+          << " alpha_signal_fail=" << g_ui_alpha_extraction_failures.load()
+          << " ui_history_policy=NATIVE_CONSTANTS"
+          << " ui_constants_calls_total=" << mfgunlock::framecount::g_ui_constants_calls.load()
+          << " ui_native_reset_true_total=" << mfgunlock::framecount::g_ui_native_resets_seen.load()
+          << " ui_reset_requests_total=" << mfgunlock::framecount::g_ui_resets_requested.load()
+          << " ui_reset_requests_retired_total=" << mfgunlock::framecount::g_ui_reset_requests_retired.load()
+          << " ui_forced_reset_total=" << mfgunlock::framecount::g_ui_resets_injected.load()
+          << " ui_composition_requested=" << mfgunlock::framecount::g_ui_composition_enabled.load()
+          << " ui_composition_applied=" << mfgunlock::framecount::g_ui_composition_applied.load()
+          << " ui_helper_injected_total=" << mfgunlock::framecount::g_ui_candidate_tags_injected.load();
       mfgunlock::provider::Log(row.str());
       const auto vk = mfgunlock::ngx::internal::ReadVulkanObservation();
       auto* current_device = g_primary_device.load(std::memory_order_acquire);

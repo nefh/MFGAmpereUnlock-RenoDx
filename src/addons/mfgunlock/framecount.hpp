@@ -146,6 +146,11 @@ inline std::atomic_bool g_ui_native_hudless_fallback{false};
 inline std::atomic<uint32_t> g_ui_issue_mask{0};
 inline std::atomic<unsigned long long> g_ui_resets_requested{0};
 inline std::atomic<unsigned long long> g_ui_resets_injected{0};
+// Common SL constants are renderer-owned and shared by SR/RR/FG. UI state
+// changes may invalidate our bookkeeping, but must not reset those histories.
+inline std::atomic<unsigned long long> g_ui_constants_calls{0};
+inline std::atomic<unsigned long long> g_ui_native_resets_seen{0};
+inline std::atomic<unsigned long long> g_ui_reset_requests_retired{0};
 inline std::atomic<unsigned long long> g_ui_hudless_tags_seen{0};
 inline std::atomic<unsigned long long> g_ui_color_alpha_tags_seen{0};
 inline std::atomic<unsigned long long> g_ui_alpha_tags_seen{0};
@@ -2146,38 +2151,35 @@ inline sl::Result HookedSetConstants(const sl::Constants& values,
     return g_real_set_constants(values, frame, viewport);
   }
   ApplyLiveOptions(viewport);
-  if (!g_enabled.load(std::memory_order_relaxed) ||
-      !g_ui_composition_enabled.load(std::memory_order_relaxed)) {
-    return ForwardObservedConstants(values, frame, viewport);
-  }
 
-  UiViewportState* state = GetUiState(viewport);
-  if (state == nullptr || !state->options_seen.load(std::memory_order_acquire) ||
-      state->mode.load(std::memory_order_relaxed) ==
-          static_cast<uint32_t>(sl::DLSSGMode::eOff)) {
-    return ForwardObservedConstants(values, frame, viewport);
-  }
+  // slSetConstants is shared with DLSS SR and Ray Reconstruction. In
+  // particular, receiving a fresh HUDless/UI pair is NOT a camera cut.
+  // Keep all caller fields and the original reference, even for UI toggles,
+  // format changes or pending helper invalidations. The renderer remains the
+  // sole owner of the native reset flag (including true/invalid values).
+  g_ui_constants_calls.fetch_add(1, std::memory_order_relaxed);
+  if (values.reset == sl::Boolean::eTrue)
+    g_ui_native_resets_seen.fetch_add(1, std::memory_order_relaxed);
 
-  const uint64_t requested = state->reset_requested.load(std::memory_order_acquire);
-  if (requested == state->reset_applied.load(std::memory_order_relaxed))
-    return ForwardObservedConstants(values, frame, viewport);
-
-  if (values.reset == sl::Boolean::eTrue) {
-    const sl::Result result = ForwardObservedConstants(values, frame, viewport);
-    if (result == sl::Result::eOk)
-      state->reset_applied.store(requested, std::memory_order_release);
-    return result;
-  }
-
-  alignas(sl::Constants) std::array<std::byte, sizeof(sl::Constants)> storage{};
-  if (!qualityguard::CopyConstantsWithReset(values, storage.data(), storage.size()))
-    return ForwardObservedConstants(values, frame, viewport);
-
-  const sl::Result result = ForwardObservedConstants(
-      *reinterpret_cast<const sl::Constants*>(storage.data()), frame, viewport);
-  if (result == sl::Result::eOk) {
-    state->reset_applied.store(requested, std::memory_order_release);
-    g_ui_resets_injected.fetch_add(1, std::memory_order_relaxed);
+  UiViewportState* state = g_enabled.load(std::memory_order_relaxed) &&
+      g_ui_composition_enabled.load(std::memory_order_relaxed)
+      ? GetUiState(viewport) : nullptr;
+  const uint64_t requested = state
+      ? state->reset_requested.load(std::memory_order_acquire) : 0;
+  const sl::Result result = ForwardObservedConstants(values, frame, viewport);
+  if (result == sl::Result::eOk && state != nullptr) {
+    // Retire local invalidations for diagnostics only. No synthetic reset is
+    // submitted to SL. A failed native call leaves the request unacknowledged.
+    uint64_t retired = state->reset_applied.load(std::memory_order_acquire);
+    while (retired < requested) {
+      if (state->reset_applied.compare_exchange_weak(
+              retired, requested, std::memory_order_acq_rel,
+              std::memory_order_acquire)) {
+        g_ui_reset_requests_retired.fetch_add(requested - retired,
+                                               std::memory_order_relaxed);
+        break;
+      }
+    }
   }
   return result;
 }

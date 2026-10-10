@@ -81,6 +81,10 @@ if(NOT WIN32)
   target_include_directories(quality_guard_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
   add_test(NAME quality_guard_test COMMAND quality_guard_test)
 
+  add_executable(ui_history_isolation_test "${TEST_ROOT}/ui_history_isolation_test.cpp")
+  target_include_directories(ui_history_isolation_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME ui_history_isolation_test COMMAND ui_history_isolation_test)
+
   add_executable(ui_candidate_test "${TEST_ROOT}/ui_candidate_test.cpp")
   target_include_directories(ui_candidate_test PRIVATE "${mock_dir}")
   add_test(NAME ui_candidate_test COMMAND ui_candidate_test)
