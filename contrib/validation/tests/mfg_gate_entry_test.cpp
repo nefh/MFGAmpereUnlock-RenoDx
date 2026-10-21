@@ -14,7 +14,7 @@ namespace mfgunlock::runtime {
 bool ready = true;
 bool ProviderReady() { return ready; }
 }
-bool HasTemporalPatch(HMODULE) { return true; }
+bool HasTemporalPatch(HMODULE) { return false; }  // Regression: no optional kernel descriptor.
 #include "addon_mfg_gate_seam.hpp"
 unsigned checks = 0;
 void Check(bool ok, const char* why) { ++checks; if (!ok) throw std::runtime_error(why); }
@@ -48,6 +48,13 @@ int main() { try {
   RestoreDlssgArchGate();
   Check(g_gate_sites.empty() && image.bytes == original && !ProductionMultiFrameReady(),
         "retry restores exact bytes");
+  PatchArchGatesInModule(image.Module());
+  Check(g_gate_sites.empty() && image.bytes == original &&
+        !std::strcmp(g_mfg_gate_status, "MEMORY_TRANSACTION_INCOMPLETE"),
+        "comparison retry cannot clear rollback failures owned by other transactions");
+  provider::Restore();
+  Check(!provider::internal::g_registry_failed.load(),
+        "full restoration releases the transaction failure after checking all owners");
   provider::g_create_seen = true;
   PatchArchGatesInModule(image.Module());
   Check(g_gate_sites.empty() && !std::strcmp(g_mfg_gate_status, "STARTUP_MISSED"),
@@ -59,6 +66,33 @@ int main() { try {
   image.bytes = original; image.Bind();
   PatchArchGatesInModule(image.Module());
   Check(g_gate_patched, "prior unresolved same address does not suppress a fresh structural attempt");
+  RestoreDlssgArchGate();
+  // Prepared-image fixture: the provider transformation is tested elsewhere.
+  // Exercise the actual addon entry and readiness with optional temporal absent.
+  for (auto arch : {Architecture::kAmpere, Architecture::kTuring}) {
+    mfg_gate_fixture::Reset(); image.Bind();
+    architecture::Configure(arch);
+    provider::internal::Provider prepared{};
+    prepared.module = image.Module(); prepared.architecture = arch;
+    prepared.ready = true; prepared.qualification = profiles::Qualification::kPatchable;
+    provider::internal::ReadIdentity(prepared.module, prepared.identity);
+    prepared.patches.push_back({image.bytes.data()+0x7f00,0,0});
+    provider::internal::g_providers = {prepared};
+    Check(provider::PreparedProviderCount() == 1, "fixture has one current prepared provider");
+    Check(!HasTemporalPatch(image.Module()) && !g_midpoint_patched && !g_blackwell_temporal_patched,
+          "optional temporal transform is absent");
+    PatchArchGatesInModule(image.Module());
+    Check(g_gate_patched && ProductionMultiFrameReady(),
+          "missing optional temporal transform does not veto MFG gates or menu capability");
+    RestoreDlssgArchGate();
+    provider::internal::g_providers.clear();
+  }
+  mfg_gate_fixture::Reset(); image.Bind();
+  architecture::Configure(Architecture::kUnknown);
+  PatchArchGatesInModule(image.Module());
+  Check(!g_gate_patched && g_gate_sites.empty() && image.bytes == original &&
+        !std::strcmp(g_mfg_gate_status, "NATIVE_ARCH_VALUE_MISSING"),
+        "byte rewrite does not invent its numeric architecture operand");
   RestoreDlssgArchGate();
   std::cout << "PASS: " << checks << " production MG1 entry/readiness checks\n";
   return 0;

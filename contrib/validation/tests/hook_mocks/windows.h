@@ -22,5 +22,4 @@ inline HANDLE OpenThread(DWORD, BOOL, DWORD id) {
   return reinterpret_cast<HANDLE>(static_cast<uintptr_t>(id));
 }
 inline BOOL CloseHandle(HANDLE) { ++hook_mock::closed; return 1; }
-inline BOOL FreeLibrary(HMODULE) { return 1; }
 inline void SetLastError(DWORD value) { hook_mock::error = value; }

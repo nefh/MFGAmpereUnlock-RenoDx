@@ -7,7 +7,8 @@ param(
   [string]$OutputRoot = "",
   [string]$CacheRoot = "",
   [switch]$RefreshHeaders,
-  [switch]$RefreshDependencies
+  [switch]$RefreshDependencies,
+  [switch]$BuildDiagnostics
 )
 
 $ErrorActionPreference = "Stop"
@@ -682,6 +683,7 @@ if (-not (Test-Path $BuildRoot)) {
 
 $OriginalCl = $env:CL
 $Results = @()
+$DiagnosticsResults = @()
 
 try {
   foreach ($Api in $ReShadeApi) {
@@ -726,11 +728,41 @@ try {
       throw "Build succeeded but artifact was not found: $Artifact"
     }
 
+    $VersionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($Artifact)
+    # Use RenoDX native VERSIONINFO without modifying vendor CMake files.
+    if ([string]::IsNullOrWhiteSpace([string]$VersionInfo.FileVersion)) {
+      throw "Missing native RenoDX VERSIONINFO in: $Artifact"
+    }
+
     $ApiOutput = Join-Path $OutputRoot "reshade-api$Api"
     New-Item -ItemType Directory -Force $ApiOutput | Out-Null
     $OutputArtifact = Join-Path $ApiOutput "renodx-mfgunlock.addon64"
     Copy-Item $Artifact $OutputArtifact -Force
     $Hash = Get-FileHash $OutputArtifact -Algorithm SHA256
+
+    if ($BuildDiagnostics) {
+      # Optional companion target in the *existing* RenoDX tree. Its source
+      # must be synced separately with hash guards before the build starts.
+      $DiagnosticsSource = Join-Path $RenoDx 'src\addons\mfgdiagnostics'
+      if (-not (Test-Path (Join-Path $DiagnosticsSource 'addon.cpp')) -or
+          -not (Test-Path (Join-Path $DiagnosticsSource 'hud_tag_summary.hpp'))) {
+        throw "Existing MFGDiagnostics source missing/not synchronized in: $DiagnosticsSource"
+      }
+      Write-Host "===== BUILD EXISTING MFGDIAGNOSTICS FOR RESHADE API $Api ====="
+      Invoke-Checked cmake --build $BuildRoot --config $Configuration --target mfgdiagnostics
+      $DiagnosticsArtifact = Join-Path $BuildRoot "$Configuration\renodx-mfgdiagnostics.addon64"
+      if (-not (Test-Path $DiagnosticsArtifact)) {
+        throw "MFGDiagnostics build artifact missing: $DiagnosticsArtifact"
+      }
+      $DiagnosticsOutput = Join-Path $ApiOutput 'renodx-mfgdiagnostics.addon64'
+      Copy-Item $DiagnosticsArtifact $DiagnosticsOutput -Force
+      $DiagnosticsHash = Get-FileHash $DiagnosticsOutput -Algorithm SHA256
+      $DiagnosticsResults += [PSCustomObject]@{
+        ReShadeApi = $Api
+        File = $DiagnosticsOutput
+        SHA256 = $DiagnosticsHash.Hash
+      }
+    }
 
     $Results += [PSCustomObject]@{
       ReShadeApi = $Api
@@ -760,6 +792,12 @@ foreach ($Result in $Results) {
   Write-Host "ReShade API $($Result.ReShadeApi)"
   Write-Host "  ReShade ref:    $($Result.ReShadeRef)"
   Write-Host "  ReShade commit: $($Result.ReShadeCommit)"
+  Write-Host "  Binary:         $($Result.File)"
+  Write-Host "  SHA256:         $($Result.SHA256)"
+}
+foreach ($Result in $DiagnosticsResults) {
+  Write-Host ""
+  Write-Host "Existing MFGDiagnostics / ReShade API $($Result.ReShadeApi)"
   Write-Host "  Binary:         $($Result.File)"
   Write-Host "  SHA256:         $($Result.SHA256)"
 }

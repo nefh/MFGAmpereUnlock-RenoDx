@@ -32,7 +32,7 @@ inline bool InstallAddress(AddressHook& entry, void* target, void*, const char*)
   if (!preset_mock::install_ok || preset_mock::installs == preset_mock::fail_install) return false;
   MEMORY_BASIC_INFORMATION memory{};
   if (!VirtualQuery(target, &memory, sizeof(memory))) return false;
-  entry.identity.module = memory.AllocationBase;
+  entry.identity.module = reinterpret_cast<HMODULE>(memory.AllocationBase);
   entry.target = target;
   entry.trampoline = preset_mock::original;
   entry.installed = true;

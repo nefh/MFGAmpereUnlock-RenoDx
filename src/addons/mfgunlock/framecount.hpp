@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "./runtime_controls.hpp"
+
 #include <vector>
 #include <windows.h>
 
@@ -63,11 +65,14 @@ enum class FixedOverrideStatus : unsigned int {
   kFallbackRejected,
 };
 
-// 0 = leave the game's request alone. 2..6 = force that total multiplier.
+// 0 = leave the game's request alone. Any value >= 2 requests that total multiplier.
 inline std::atomic<unsigned int> g_force_multiplier{0};
 inline std::atomic_bool g_feature_function_hooked{false};
 inline std::atomic<uint64_t> g_options_revision{1};
 inline std::atomic<uint64_t> g_options_cache_epoch{1};
+// A new setting or provider lifetime starts a new empirical attempt. Ordinary
+// SetOptions/GetState polling never rearms a request rejected by this runtime.
+inline std::atomic<uint64_t> g_request_retry_revision{1};
 inline std::atomic<uint32_t> g_present_thread{0};
 inline void NotifyLiveOptionsChanged() {
   g_options_revision.fetch_add(1, std::memory_order_release);
@@ -114,14 +119,16 @@ inline std::atomic_bool g_streamline_plugin_seen{false};
 inline std::atomic<unsigned int> g_streamline_max_generated{0};
 inline std::atomic_bool g_capacity_advertised{false};
 inline std::atomic<unsigned int> g_runtime_max_generated{0};
+// Original GetState response before our capability rewrite, not a scan estimate.
+inline std::atomic<uint64_t> g_native_maximum{runtimecontrols::kUnknownMaximum};
 inline std::atomic<uint64_t> g_vulkan_native_state_epoch{0};
 inline std::atomic<uint32_t> g_vulkan_native_state_viewport{UINT32_MAX};
 
-// NVIDIA Dynamic MFG is opt-in and only submitted after the current D3D12
-// runtime reports the v4 capability on a typed, qualified runtime stack.
+// NVIDIA Dynamic MFG is opt-in. The live typed setter decides whether the
+// request works; API, GPU profile and capability flags are observations only.
 // The game-owned options structure is never extended or modified in place.
 inline std::atomic_bool g_dynamic_mfg_enabled{false};
-inline std::atomic<unsigned int> g_dynamic_target_fps{0};
+inline std::atomic<float> g_dynamic_target_fps{0.0f};
 inline std::atomic_bool g_dynamic_d3d12{false};
 inline std::atomic_bool g_dynamic_support_seen{false};
 inline std::atomic_bool g_dynamic_supported{false};
@@ -130,6 +137,11 @@ inline std::atomic_bool g_dynamic_applied{false};
 inline std::atomic_bool g_dynamic_fell_back{false};
 inline std::atomic_bool g_dynamic_runtime_declined{false};
 inline std::atomic<unsigned int> g_dynamic_result{0};
+inline std::atomic<unsigned int> g_dynamic_probe_result{0};
+inline std::atomic<uint64_t> g_dynamic_probe_calls{0};
+inline std::atomic<uint64_t> g_dynamic_request_calls{0};
+inline std::atomic<uint64_t> g_dynamic_suppressed_repeats{0};
+inline std::atomic<uint64_t> g_fixed_suppressed_repeats{0};
 inline bool (*g_dynamic_stack_ready)() = nullptr;
 
 // UI recomposition is independent of the selected Frame Generation preset.
@@ -234,16 +246,18 @@ enum class RuntimeSelectionMode : unsigned int {
 inline std::atomic<unsigned int> g_runtime_selection_mode{
     static_cast<unsigned int>(RuntimeSelectionMode::kGameDefault)};
 
-// More than one generated frame requires software pacing on backported
-// providers. slDLSSGSetOptions is the first point where the plugin is guaranteed
-// to be loaded, so verify pacing there before raising the request.
+// Prepare the software-pacing workaround when available. Its readiness is not
+// proof that a native scalar request will fail, and never vetoes that request.
 inline void (*g_ensure_pacing)() = nullptr;
 inline bool (*g_pacing_ready)() = nullptr;
-// Readiness of provider retargeting, the temporal program and MFG arch gates.
-// Pacing remains owned by g_ensure_pacing below.
+// Diagnostic preparation status only. Neither menu advertisement nor the
+// native scalar request requires positive readiness here.
 inline bool (*g_multi_frame_ready)() = nullptr;
+inline void (*g_on_dlssg_entry_observed)(void*) = nullptr;
+// Historical callback name: the value is the configured advertisement request,
+// not a discovered provider limit. Zero preserves the native maximum.
 inline unsigned int (*g_provider_mfg_ceiling)() = nullptr;
-// Local options/UI policy bound, not evidence about any provider version.
+// Legacy default when no configuration callback is bound, never an upper cap.
 inline constexpr unsigned int kPolicyGeneratedCeiling = 5;
 inline unsigned int ProviderMfgCeiling() {
   return g_provider_mfg_ceiling ? g_provider_mfg_ceiling() : kPolicyGeneratedCeiling;
@@ -253,6 +267,7 @@ inline sl::Result (*g_on_init)(const sl::Preferences&, uint64_t,
     sl::Result (*)(const sl::Preferences&, uint64_t)) = nullptr;
 inline bool (*g_init_compatible)(HMODULE) = nullptr;
 inline bool (*g_interposer_contract_ready)(HMODULE) = nullptr;
+inline HMODULE (*g_find_interposer)() = nullptr;
 inline hook::ModuleIdentity g_interposer_hook_identity{};
 namespace internal {
 
@@ -290,6 +305,7 @@ inline GetStateFn RealGetState() {
   return g_real_get_state;
 }
 inline std::atomic_bool g_entry_shutting_down{false};
+inline thread_local uint32_t g_options_call_depth = 0;
 inline GetFeatureFunctionFn g_real_get_feature_function = nullptr;
 inline InitFn g_real_init = nullptr;
 inline SetTagFn g_real_set_tag = nullptr;
@@ -317,16 +333,12 @@ inline bool SetFixedOverrideState(FixedOverrideStatus status, unsigned int reque
 }
 
 inline bool DynamicStackReady() {
-  const auto* profile = architecture::ActiveProfile();
-  return profile && features::BackendSupports(profile, features::Feature::kDynamicMfg) &&
-         g_dynamic_d3d12.load(std::memory_order_relaxed) &&
-         g_streamline_plugin_seen.load(std::memory_order_acquire) &&
-         g_streamline_max_generated.load(std::memory_order_acquire) != 0 &&
-         g_dynamic_stack_ready != nullptr && g_dynamic_stack_ready();
+  return !g_entry_shutting_down.load(std::memory_order_acquire) &&
+         RealSetOptions() != nullptr;
 }
 
 inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result) {
-  if (result != sl::Result::eOk || !DynamicStackReady() ||
+  if (result != sl::Result::eOk ||
       state.structType != sl::DLSSGState::s_structType ||
       state.structVersion != sl::kStructVersion4) {
     return false;
@@ -339,17 +351,42 @@ inline bool ObserveDynamicSupport(const sl::DLSSGState& state, sl::Result result
   const bool previous = g_dynamic_supported.exchange(supported, std::memory_order_acq_rel);
   const bool seen = g_dynamic_support_seen.exchange(true, std::memory_order_release);
   if (!seen || previous != supported) {
-    if (g_dynamic_mfg_enabled.load(std::memory_order_relaxed)) NotifyLiveOptionsChanged();
     reshade::log::message(
         reshade::log::level::info,
         supported
-            ? "mfgunlock: slDLSSGGetState confirms NVIDIA Dynamic MFG support on the validated runtime stack."
-            : "mfgunlock: slDLSSGGetState reports NVIDIA Dynamic MFG unsupported; fixed MFG remains active.");
+            ? "mfgunlock: slDLSSGGetState reports NVIDIA Dynamic MFG capability=true; actual SetOptions result decides activation."
+            : "mfgunlock: slDLSSGGetState reports NVIDIA Dynamic MFG capability=false; an explicitly requested Dynamic mode will still be tried.");
   }
   return true;
 }
 
 constexpr uint32_t kUnusedViewport = (std::numeric_limits<uint32_t>::max)();
+
+// These snapshots are compared, never replayed. Pointer fields identify a
+// synchronous caller context and do not extend any caller-owned lifetime.
+struct RuntimeAttempt {
+  sl::DLSSGOptions options{};
+  const void* entry = nullptr;
+  uint64_t provider_epoch = 0;
+  uint64_t setting_revision = 0;
+  uint32_t api = 0;
+  uint32_t forced_multiplier = 0;
+  float dynamic_target = 0.0f;
+  bool ui_composition = false;
+  bool valid = false;
+  bool rejected = false;
+  uint32_t transient_retries = 0;
+  uint32_t transient_wait = 0;
+  sl::Result result = sl::Result::eOk;
+};
+
+struct DynamicProbeAttempt {
+  std::atomic<const void*> entry{nullptr};
+  std::atomic<uint64_t> provider_epoch{0};
+  std::atomic<uint64_t> setting_revision{0};
+  std::atomic_bool attempted{false};
+  std::atomic<sl::Result> result{sl::Result::eOk};
+};
 
 struct UiViewportState {
   // Guarded by lock; unknown Vulkan UI metadata survives split tag batches.
@@ -364,6 +401,15 @@ struct UiViewportState {
   uint64_t attempted_revision = 0;
   uint64_t cache_epoch = 0;
   const void* options_entry = nullptr;
+  RuntimeAttempt fixed_attempt;
+  RuntimeAttempt dynamic_attempt;
+  RuntimeAttempt ui_attempt;
+  RuntimeAttempt pacing_attempt;
+  DynamicProbeAttempt dynamic_probe;
+  std::atomic<uint64_t> probe_presented_pending{0};
+  uint64_t probe_presented_epoch = 0;
+  std::atomic<uint64_t> runtime_health_epoch{0};
+  std::atomic_bool runtime_state_ready{false};
   SRWLOCK lock = SRWLOCK_INIT;
   std::atomic<uint32_t> key{kUnusedViewport};
   std::atomic_bool options_seen{false};
@@ -735,6 +781,208 @@ inline bool CopyOptions(const sl::DLSSGOptions& source, sl::DLSSGOptions& destin
   return true;
 }
 
+inline bool SameRuntimeOptions(const sl::DLSSGOptions& a, const sl::DLSSGOptions& b) {
+  // Both objects have already been copied through the bounded public ABI.
+  // Compare fields, not padding bytes or caller-owned pointed-to storage.
+  return a.structVersion == b.structVersion && a.next == b.next &&
+         a.mode == b.mode && a.numFramesToGenerate == b.numFramesToGenerate &&
+         a.flags == b.flags && a.dynamicResWidth == b.dynamicResWidth &&
+         a.dynamicResHeight == b.dynamicResHeight && a.numBackBuffers == b.numBackBuffers &&
+         a.mvecDepthWidth == b.mvecDepthWidth && a.mvecDepthHeight == b.mvecDepthHeight &&
+         a.colorWidth == b.colorWidth && a.colorHeight == b.colorHeight &&
+         a.colorBufferFormat == b.colorBufferFormat && a.mvecBufferFormat == b.mvecBufferFormat &&
+         a.depthBufferFormat == b.depthBufferFormat && a.hudLessBufferFormat == b.hudLessBufferFormat &&
+         a.uiBufferFormat == b.uiBufferFormat && a.onErrorCallback == b.onErrorCallback &&
+         a.bReserved15 == b.bReserved15 && a.queueParallelismMode == b.queueParallelismMode &&
+         a.enableUserInterfaceRecomposition == b.enableUserInterfaceRecomposition &&
+         std::memcmp(&a.dynamicTargetFrameRate, &b.dynamicTargetFrameRate,
+                     sizeof(a.dynamicTargetFrameRate)) == 0;
+}
+
+inline bool PrepareRuntimeAttempt(RuntimeAttempt& attempt, const sl::DLSSGOptions& options) {
+  sl::DLSSGOptions copied{};
+  if (!CopyOptions(options, copied)) return false;
+  const auto* entry = reinterpret_cast<const void*>(RealSetOptions());
+  const auto epoch = g_options_cache_epoch.load(std::memory_order_acquire);
+  const auto revision = g_request_retry_revision.load(std::memory_order_acquire);
+  const auto api = static_cast<uint32_t>(outputstate::GetResourceApi());
+  const auto multiplier = g_force_multiplier.load(std::memory_order_relaxed);
+  const auto target = g_dynamic_target_fps.load(std::memory_order_relaxed);
+  const auto ui = g_ui_composition_enabled.load(std::memory_order_relaxed);
+  const bool same = attempt.valid && attempt.entry == entry &&
+      attempt.provider_epoch == epoch && attempt.setting_revision == revision &&
+      attempt.api == api && attempt.forced_multiplier == multiplier &&
+      attempt.dynamic_target == target && attempt.ui_composition == ui &&
+      SameRuntimeOptions(attempt.options, copied);
+  if (same) return true;
+  attempt = RuntimeAttempt{};
+  attempt.options = copied;
+  attempt.entry = entry;
+  attempt.provider_epoch = epoch;
+  attempt.setting_revision = revision;
+  attempt.api = api;
+  attempt.forced_multiplier = multiplier;
+  attempt.dynamic_target = target;
+  attempt.ui_composition = ui;
+  attempt.valid = true;
+  return false;
+}
+
+inline bool SuppressRejectedAttempt(RuntimeAttempt& attempt, bool same) {
+  if (!same || !attempt.rejected) return false;
+  if (attempt.result != sl::Result::eErrorNotInitialized || attempt.transient_retries >= 3)
+    return true;
+  if (attempt.transient_wait != 0) {
+    --attempt.transient_wait;
+    return true;
+  }
+  ++attempt.transient_retries;
+  return false;
+}
+
+inline void RecordRuntimeResult(RuntimeAttempt& attempt, sl::Result result) {
+  attempt.result = result;
+  attempt.rejected = result != sl::Result::eOk;
+  if (result == sl::Result::eErrorNotInitialized)
+    attempt.transient_wait = 8u << (attempt.transient_retries * 2);
+  else if (result == sl::Result::eOk)
+    attempt.transient_retries = attempt.transient_wait = 0;
+}
+
+inline void ObserveRuntimeHealth(const sl::ViewportHandle& viewport, bool ready) {
+  auto* context = GetUiState(viewport);
+  if (!context) return;
+  const auto epoch = g_options_cache_epoch.load(std::memory_order_acquire);
+  if (context->runtime_health_epoch.load(std::memory_order_acquire) == epoch &&
+      context->runtime_state_ready.load(std::memory_order_relaxed) == ready) return;
+  std::unique_lock lock(context->options_lock, std::try_to_lock);
+  if (!lock) return;
+  if (context->runtime_health_epoch != epoch) {
+    context->runtime_health_epoch = epoch;
+    context->runtime_state_ready = false;
+  }
+  if (ready && !context->runtime_state_ready) {
+    bool retry = false;
+    for (auto* attempt : {&context->fixed_attempt, &context->dynamic_attempt, &context->ui_attempt}) {
+      if (attempt->valid && attempt->rejected && attempt->result == sl::Result::eErrorNotInitialized) {
+        attempt->valid = false;
+        retry = true;
+      }
+    }
+    if (context->dynamic_probe.result == sl::Result::eErrorNotInitialized)
+      context->dynamic_probe.attempted = false;
+    if (retry) NotifyLiveOptionsChanged();
+  }
+  context->runtime_state_ready = ready;
+}
+
+inline bool ProbeStampCurrent(const DynamicProbeAttempt& probe, GetStateFn real) {
+  return probe.attempted.load(std::memory_order_acquire) &&
+      probe.entry.load(std::memory_order_relaxed) == reinterpret_cast<const void*>(real) &&
+      probe.provider_epoch.load(std::memory_order_relaxed) == g_options_cache_epoch.load(std::memory_order_acquire) &&
+      probe.setting_revision.load(std::memory_order_relaxed) == g_request_retry_revision.load(std::memory_order_acquire);
+}
+
+inline void MarkProbeStamp(DynamicProbeAttempt& probe, GetStateFn real) {
+  probe.attempted.store(false, std::memory_order_release);
+  probe.entry.store(reinterpret_cast<const void*>(real), std::memory_order_relaxed);
+  probe.provider_epoch.store(g_options_cache_epoch.load(std::memory_order_acquire), std::memory_order_relaxed);
+  probe.setting_revision.store(g_request_retry_revision.load(std::memory_order_acquire), std::memory_order_relaxed);
+  probe.attempted.store(true, std::memory_order_release);
+}
+
+inline void RememberNativeDynamicState(const sl::ViewportHandle& viewport) {
+  auto* context = GetUiState(viewport);
+  if (!context) return;
+  if (ProbeStampCurrent(context->dynamic_probe, RealGetState())) return;
+  std::unique_lock lock(context->options_lock, std::try_to_lock);
+  if (lock) {
+    MarkProbeStamp(context->dynamic_probe, RealGetState());
+    context->dynamic_probe.result.store(sl::Result::eOk, std::memory_order_relaxed);
+  }
+}
+
+inline void ProbeDynamicSupport(const sl::ViewportHandle& viewport,
+                                 const sl::DLSSGOptions* options) {
+  const auto real = RealGetState();
+  if (!real || g_entry_shutting_down.load(std::memory_order_acquire)) return;
+  auto* context = GetUiState(viewport);
+  if (!context) return;
+  if (ProbeStampCurrent(context->dynamic_probe, real)) return;
+  std::unique_lock lock(context->options_lock, std::try_to_lock);
+  if (!lock || ProbeStampCurrent(context->dynamic_probe, real)) return;
+  MarkProbeStamp(context->dynamic_probe, real);
+  const auto probe_epoch = context->dynamic_probe.provider_epoch.load(std::memory_order_relaxed);
+  const auto probe_revision = context->dynamic_probe.setting_revision.load(std::memory_order_relaxed);
+  g_dynamic_probe_attempted.store(true, std::memory_order_release);
+  g_dynamic_probe_calls.fetch_add(1, std::memory_order_relaxed);
+
+  // The game may have allocated only State v1-v3. All extension fields belong
+  // to this buffer, never to that allocation or its extension chains.
+  sl::DLSSGState extended{};
+  extended.next = nullptr;
+  extended.structVersion = sl::kStructVersion4;
+  extended.bIsDynamicMFGSupported = static_cast<sl::Boolean>(UINT32_MAX);
+  sl::DLSSGOptions copied{};
+  const sl::DLSSGOptions* query_options = nullptr;
+  if (options && CopyOptions(*options, copied)) {
+    copied.next = nullptr;
+    copied.onErrorCallback = nullptr;
+    query_options = &copied;
+  }
+  {
+    std::stringstream message;
+    message << "mfgunlock: Dynamic GetState v4 BEGIN api="
+            << static_cast<uint32_t>(outputstate::GetResourceApi())
+            << " viewport=" << static_cast<uint32_t>(viewport);
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+  const sl::Result result = presentation::passive::CallNative(
+      [&] { return real(viewport, extended, query_options); });
+  const bool current = probe_epoch == g_options_cache_epoch.load(std::memory_order_acquire) &&
+                       real == RealGetState();
+  const bool current_setting = current &&
+      probe_revision == g_request_retry_revision.load(std::memory_order_acquire);
+  if (current) context->dynamic_probe.result = result;
+  if (current_setting)
+    g_dynamic_probe_result.store(static_cast<unsigned int>(result), std::memory_order_relaxed);
+  const bool observed = current_setting && ObserveDynamicSupport(extended, result);
+  if (current && result == sl::Result::eOk && extended.structType == sl::DLSSGState::s_structType &&
+      extended.structVersion >= sl::kStructVersion1 && extended.structVersion <= sl::kStructVersion4) {
+    // GetState consumes a counter. A probe made before SetOptions must carry
+    // those presentations into the next successful game-owned state query.
+    if (context->probe_presented_epoch != probe_epoch) context->probe_presented_pending = 0;
+    context->probe_presented_epoch = probe_epoch;
+    context->probe_presented_pending = (std::min)(uint64_t{UINT32_MAX},
+        context->probe_presented_pending.load(std::memory_order_relaxed) + extended.numFramesActuallyPresented);
+  }
+  std::stringstream message;
+  message << "mfgunlock: Dynamic GetState v4 attempt api="
+          << static_cast<uint32_t>(outputstate::GetResourceApi())
+          << " viewport=" << static_cast<uint32_t>(viewport)
+          << " result=0x" << std::hex << static_cast<uint32_t>(result) << std::dec
+          << " returnedAbi=" << extended.structVersion << " capability="
+          << (observed ? (g_dynamic_supported.load(std::memory_order_relaxed) ? "true" : "false")
+                       : "unobserved");
+  if (!current_setting) message << "; diagnostic context changed during native query";
+  reshade::log::message(result == sl::Result::eOk ? reshade::log::level::info
+                                                  : reshade::log::level::warning,
+                        message.str().c_str());
+}
+
+inline void DrainProbePresentations(const sl::ViewportHandle& viewport, sl::DLSSGState& state) {
+  auto* context = GetUiState(viewport);
+  if (!context) return;
+  if (context->probe_presented_pending.load(std::memory_order_relaxed) == 0) return;
+  std::unique_lock lock(context->options_lock, std::try_to_lock);
+  if (!lock) return;
+  if (context->probe_presented_epoch == g_options_cache_epoch.load(std::memory_order_acquire)) {
+    state.numFramesActuallyPresented = static_cast<uint32_t>((std::min)(uint64_t{UINT32_MAX},
+        uint64_t{state.numFramesActuallyPresented} + context->probe_presented_pending.load(std::memory_order_relaxed)));
+  }
+  context->probe_presented_pending = 0;
+}
+
 inline bool BuildUiCompositionOptions(const sl::DLSSGOptions& source,
                                       sl::DLSSGOptions& destination) {
   if (!CopyOptions(source, destination)) return false;
@@ -815,6 +1063,8 @@ inline sl::Result CallSetOptions(const sl::ViewportHandle& viewport,
                                  bool ui_fallback = false) {
   const auto real = RealSetOptions();
   if (!real) return sl::Result::eErrorNotInitialized;
+  if (origin == countobserver::Origin::kDynamic)
+    g_dynamic_request_calls.fetch_add(1, std::memory_order_relaxed);
   const uint32_t diag_call =
       g_turing_diag_set_options_calls.fetch_add(1, std::memory_order_relaxed) + 1;
   const bool diag_trace = diagnostic::g_verbose.load(std::memory_order_relaxed) &&
@@ -918,6 +1168,9 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
 
   const bool recompose = ShouldRequestUiComposition(options);
   if (!recompose) {
+    if (g_options_call_depth <= 1) {
+      if (auto* context = GetUiState(viewport)) context->ui_attempt.valid = false;
+    }
     ObserveUiOptionsTransition(viewport, options);
     const sl::Result result = CallSetOptions(viewport, options, origin);
     if (result == sl::Result::eOk) {
@@ -946,7 +1199,19 @@ inline sl::Result ForwardSetOptions(const sl::ViewportHandle& viewport,
 
   g_ui_composition_source_version.store(
       static_cast<unsigned int>(options.structVersion), std::memory_order_relaxed);
+  RuntimeAttempt uncached;
+  auto* context = g_options_call_depth <= 1 ? GetUiState(viewport) : nullptr;
+  auto& attempt = context ? context->ui_attempt : uncached;
+  const bool same = PrepareRuntimeAttempt(attempt, forwarded);
+  if (SuppressRejectedAttempt(attempt, same)) {
+    ObserveUiOptionsTransition(viewport, options);
+    const auto fallback = CallSetOptions(viewport, options, origin, true);
+    g_ui_candidate_options_synced.store(false, std::memory_order_release);
+    g_ui_composition_applied.store(false, std::memory_order_relaxed);
+    return fallback;
+  }
   const sl::Result result = CallSetOptions(viewport, forwarded, origin);
+  RecordRuntimeResult(attempt, result);
   g_ui_composition_result.store(static_cast<unsigned int>(result),
                                 std::memory_order_relaxed);
   if (result == sl::Result::eOk) {
@@ -987,8 +1252,11 @@ inline sl::Result ForwardFixedNative(const sl::ViewportHandle& viewport,
           ? countobserver::Origin::kNativeFallback : countobserver::Origin::kNative);
   if (result == sl::Result::eOk)
     g_dynamic_applied.store(options.mode == sl::DLSSGMode::eDynamic, std::memory_order_relaxed);
-  SetFixedOverrideState(result != sl::Result::eOk && status == FixedOverrideStatus::kAlreadyMatched
-                            ? FixedOverrideStatus::kNativeRejected : status,
+  SetFixedOverrideState(result != sl::Result::eOk
+                            ? (status == FixedOverrideStatus::kRejectedNativeFallback
+                                   ? FixedOverrideStatus::kFallbackRejected
+                                   : FixedOverrideStatus::kNativeRejected)
+                            : status,
                        requested, result == sl::Result::eOk ? requested : 0);
   return result;
 }
@@ -1007,12 +1275,12 @@ inline sl::Result ForwardFixedCount(const sl::ViewportHandle& viewport,
 
 inline bool BuildDynamicOptions(const sl::DLSSGOptions& source,
                                 sl::DLSSGOptions& destination) {
-  if (!CopyOptions(source, destination)) return false;
+  const float target = g_dynamic_target_fps.load(std::memory_order_relaxed);
+  if (!runtimecontrols::ValidDynamicTarget(target) || !CopyOptions(source, destination)) return false;
   destination.structVersion = sl::kStructVersion5;
   destination.mode = source.mode == sl::DLSSGMode::eOff
                          ? sl::DLSSGMode::eOff : sl::DLSSGMode::eDynamic;
-  destination.dynamicTargetFrameRate = static_cast<float>(
-      g_dynamic_target_fps.load(std::memory_order_relaxed));
+  destination.dynamicTargetFrameRate = target;
   return true;
 }
 
@@ -1072,6 +1340,10 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
                                   bool automatic = false) {
   presentation::passive::CpuScope timing(presentation::passive::CpuKind::kSetOptions);
   if (RealSetOptions() == nullptr) return sl::Result::eErrorNotInitialized;
+  struct CallDepth {
+    CallDepth() { ++g_options_call_depth; }
+    ~CallDepth() { --g_options_call_depth; }
+  } call_depth;
   const bool known = KnownOptionsAbi(options);
   const bool vulkan = outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan;
   if (known) {
@@ -1101,7 +1373,15 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
     countobserver::Emit(event);
   }
   const auto* profile = architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile) {
+  if (!g_enabled.load()) {
+    if (g_options_call_depth == 1) {
+      if (auto* context = GetUiState(viewport)) {
+        context->fixed_attempt.valid = false;
+        context->dynamic_attempt.valid = false;
+        context->ui_attempt.valid = false;
+        context->pacing_attempt.valid = false;
+      }
+    }
     const auto result = CallSetOptions(viewport, options);
     if (known && result == sl::Result::eOk) {
       g_dynamic_applied.store(false, std::memory_order_relaxed);
@@ -1117,73 +1397,92 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
     return CallSetOptions(viewport, options);
   }
 
+  // HookedSetOptions/ApplyLiveOptions already own this viewport's recursive
+  // options lock. No global hot-path mutex, scanner, or provider sweep is added.
+  auto* context = g_options_call_depth == 1 ? GetUiState(viewport) : nullptr;
   if (options.mode == sl::DLSSGMode::eOff) {
+    if (context) {
+      context->fixed_attempt.valid = false;
+      context->dynamic_attempt.valid = false;
+      context->ui_attempt.valid = false;
+      context->pacing_attempt.valid = false;
+      context->dynamic_probe.attempted = false;
+      context->runtime_state_ready = false;
+    }
     g_dynamic_applied.store(false, std::memory_order_relaxed);
     g_dynamic_runtime_declined.store(false, std::memory_order_relaxed);
     const sl::Result result = ForwardSetOptions(viewport, options);
-    SetFixedOverrideState(FixedOverrideStatus::kNative, 0, 0);
+    SetFixedOverrideState(result == sl::Result::eOk ? FixedOverrideStatus::kNative
+                                                   : FixedOverrideStatus::kNativeRejected, 0, 0);
     return result;
   }
 
-  const bool dynamic_requested =
-      g_dynamic_mfg_enabled.load(std::memory_order_relaxed) &&
-      !g_dynamic_runtime_declined.load(std::memory_order_relaxed);
-  if (dynamic_requested && DynamicStackReady() &&
-      g_dynamic_support_seen.load(std::memory_order_acquire) &&
-      g_dynamic_supported.load(std::memory_order_relaxed)) {
-    const bool backend_ready = !profile->RequiresProviderRetarget() ||
-        (g_multi_frame_ready != nullptr && g_multi_frame_ready());
-    if (backend_ready) {
+  if (g_dynamic_mfg_enabled.load(std::memory_order_relaxed)) {
+    // Observation is independent of admission: neither Boolean controls the
+    // request, retry cache or readiness of unrelated hooks.
+    ProbeDynamicSupport(viewport, &options);
+    RuntimeAttempt uncached;
+    auto& attempt = context ? context->dynamic_attempt : uncached;
+    const bool same = PrepareRuntimeAttempt(attempt, options);
+    if (SuppressRejectedAttempt(attempt, same)) {
+      // Only a real previous setter failure reaches this path. A different
+      // viewport, setting, native context, entrypoint or provider epoch retries.
+      g_dynamic_suppressed_repeats.fetch_add(1, std::memory_order_relaxed);
+      g_dynamic_runtime_declined.store(true, std::memory_order_release);
+      g_dynamic_result.store(static_cast<unsigned int>(attempt.result), std::memory_order_relaxed);
+    } else {
       sl::DLSSGOptions dynamic_options{};
       if (BuildDynamicOptions(options, dynamic_options)) {
-        sl::Result result = ForwardSetOptions(viewport, dynamic_options, countobserver::Origin::kDynamic);
-        if (result != sl::Result::eOk) {
-          // Feature-manager startup can be transient. Retry the same validated
-          // request once, then preserve the game's fixed request as fallback.
-          result = ForwardSetOptions(viewport, dynamic_options, countobserver::Origin::kDynamic);
-        }
-        g_dynamic_result.store(static_cast<unsigned int>(result),
-                               std::memory_order_relaxed);
-        if (result == sl::Result::eOk) {
-          SetFixedOverrideState(FixedOverrideStatus::kNative,
-                                options.numFramesToGenerate, 0);
-          if (!g_dynamic_applied.exchange(true, std::memory_order_relaxed)) {
-            std::stringstream message;
-            const unsigned int target =
-                g_dynamic_target_fps.load(std::memory_order_relaxed);
-            message << "mfgunlock: NVIDIA Dynamic MFG accepted (target "
-                    << (target == 0 ? "active-display refresh"
-                                    : std::to_string(target) + " FPS")
-                    << ").";
-            reshade::log::message(reshade::log::level::info,
-                                  message.str().c_str());
-          }
-          g_dynamic_fell_back.store(false, std::memory_order_relaxed);
-          return result;
-        }
-        g_dynamic_runtime_declined.store(true, std::memory_order_release);
-        g_dynamic_applied.store(false, std::memory_order_relaxed);
-        if (!g_dynamic_fell_back.exchange(true, std::memory_order_relaxed)) {
+        if (!same || attempt.rejected) {
           std::stringstream message;
-          message << "mfgunlock: NVIDIA Dynamic MFG was rejected with sl::Result "
-                  << static_cast<unsigned int>(result)
-                  << "; restoring the game's fixed mode.";
-          reshade::log::message(reshade::log::level::warning,
+          message << "mfgunlock: NVIDIA Dynamic MFG SetOptions BEGIN api="
+                  << static_cast<uint32_t>(outputstate::GetResourceApi())
+                  << " viewport=" << static_cast<uint32_t>(viewport)
+                  << " abi=" << dynamic_options.structVersion
+                  << " mode=" << static_cast<uint32_t>(dynamic_options.mode)
+                  << " targetFPS=" << dynamic_options.dynamicTargetFrameRate;
+          reshade::log::message(reshade::log::level::info, message.str().c_str());
+        }
+        const sl::Result first = ForwardSetOptions(viewport, dynamic_options,
+                                                   countobserver::Origin::kDynamic);
+        const sl::Result result = first == sl::Result::eOk ? first
+            : ForwardSetOptions(viewport, dynamic_options, countobserver::Origin::kDynamic);
+        const bool changed = !same || attempt.result != result ||
+                             attempt.rejected != (result != sl::Result::eOk);
+        RecordRuntimeResult(attempt, result);
+        g_dynamic_result.store(static_cast<unsigned int>(result), std::memory_order_relaxed);
+        g_dynamic_runtime_declined.store(attempt.rejected, std::memory_order_release);
+        g_dynamic_applied.store(!attempt.rejected, std::memory_order_relaxed);
+        g_dynamic_fell_back.store(attempt.rejected, std::memory_order_relaxed);
+        if (changed) {
+          std::stringstream message;
+          message << "mfgunlock: NVIDIA Dynamic MFG SetOptions attempt api="
+                  << static_cast<uint32_t>(outputstate::GetResourceApi())
+                  << " viewport=" << static_cast<uint32_t>(viewport)
+                  << " abi=" << dynamic_options.structVersion
+                  << " mode=" << static_cast<uint32_t>(dynamic_options.mode)
+                  << " targetFPS=" << dynamic_options.dynamicTargetFrameRate
+                  << " capability="
+                  << (!g_dynamic_support_seen.load(std::memory_order_acquire) ? "unobserved"
+                      : g_dynamic_supported.load(std::memory_order_relaxed) ? "true" : "false")
+                  << " firstResult=0x" << std::hex << static_cast<uint32_t>(first)
+                  << " finalResult=0x" << static_cast<uint32_t>(result)
+                  << (attempt.rejected
+                          ? "; native rejection, restoring fixed/native request until context changes."
+                          : "; accepted by the native setter (presentation remains separately observed).");
+          reshade::log::message(attempt.rejected ? reshade::log::level::warning
+                                                : reshade::log::level::info,
                                 message.str().c_str());
         }
-      } else {
-        g_dynamic_runtime_declined.store(true, std::memory_order_release);
-        g_dynamic_result.store(
-            static_cast<unsigned int>(sl::Result::eErrorUnsupportedInterface),
-            std::memory_order_relaxed);
-        if (!g_dynamic_fell_back.exchange(true, std::memory_order_relaxed)) {
-          reshade::log::message(
-              reshade::log::level::warning,
-              "mfgunlock: Dynamic MFG was not submitted because the game supplied "
-              "an unknown DLSSGOptions ABI; fixed mode remains active.");
+        if (result == sl::Result::eOk) {
+          SetFixedOverrideState(FixedOverrideStatus::kNative, options.numFramesToGenerate, 0);
+          return result;
         }
       }
     }
+  } else {
+    if (context) context->dynamic_attempt.valid = false;
+    g_dynamic_runtime_declined.store(false, std::memory_order_release);
   }
 
   if (options.mode == sl::DLSSGMode::eDynamic) {
@@ -1196,157 +1495,78 @@ inline sl::Result SetOptionsImpl(const sl::ViewportHandle& viewport,
   }
 
   const unsigned int multiplier = g_force_multiplier.load(std::memory_order_relaxed);
-  // Backported providers need temporal correction before a native 3x/4x request.
-  if (profile->RequiresProviderRetarget() && g_multi_frame_ready != nullptr && options.mode != sl::DLSSGMode::eOff &&
-      options.numFramesToGenerate > 1) {
-    bool ready = g_multi_frame_ready();
-    if (!vulkan && ready && g_pacing_ready != nullptr && !g_pacing_ready() &&
-        g_ensure_pacing != nullptr && !automatic) {
-      g_ensure_pacing();
-    }
-    if (!vulkan && ready && g_pacing_ready != nullptr) ready = g_pacing_ready();
-    if (!ready) {
-      if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
-        reshade::log::message(
-            reshade::log::level::warning,
-            "mfgunlock: provider not ready for MFG; using 2x.");
-      }
-      const uint32_t requested = options.numFramesToGenerate;
-      const sl::Result result = ForwardFixedCount(viewport, options, 1, countobserver::Origin::kBackendFallback);
-      SetFixedOverrideState(multiplier >= 2 ? FixedOverrideStatus::kBlockedBackend
-                                            : FixedOverrideStatus::kNative,
-                            requested, result == sl::Result::eOk ? 1 : 0);
-      return result;
-    }
-  }
-  if (multiplier < 2)
-    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kNative);
-
-  const uint32_t desired = multiplier - 1;  // generated frames, not total
+  const uint32_t desired = multiplier >= 2 ? multiplier - 1 : options.numFramesToGenerate;
   const uint32_t requested = options.numFramesToGenerate;
-  if (desired > 1 && g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
-    if (!g_declined_backend.exchange(true, std::memory_order_relaxed)) {
-      reshade::log::message(
-          reshade::log::level::warning,
-          "mfgunlock: provider not ready for MFG; multiplier unchanged.");
-    }
-    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kBlockedBackend);
+  // Keep the existing D3D pacing preparation as best effort. Neither missing
+  // readiness nor a scanner estimate authorizes rewriting or refusing a native
+  // request before the runtime sees it. Dynamic leaves NVIDIA pacing untouched.
+  if (!vulkan && !automatic && g_ensure_pacing &&
+      ((profile && profile->RequiresProviderRetarget() && requested > 1) ||
+       (multiplier >= 2 && desired > 1)) &&
+      (!g_pacing_ready || !g_pacing_ready())) {
+    // Some optional recipes cannot locate a marker. Repeating their full scan
+    // on every game call is unnecessary; provider/settings/context changes
+    // rearm this best-effort preparation independently from native admission.
+    RuntimeAttempt uncached;
+    auto& preparation = context ? context->pacing_attempt : uncached;
+    if (!PrepareRuntimeAttempt(preparation, options)) g_ensure_pacing();
   }
-
-  // Fixed multi-frame compatibility can use the legacy software-pacing path.
-  // Dynamic MFG returns above and leaves pacing to the current NVIDIA runtime.
-  if (desired > 1) {
-    unsigned int ceiling = (std::min)(g_streamline_max_generated.load(std::memory_order_acquire),
-                                      ProviderMfgCeiling());
-    if (ceiling != 0 && desired > ceiling) {
-      if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
-        std::stringstream message;
-        message << "mfgunlock: fixed " << multiplier
-                << "x not submitted: Streamline structural maximum is " << (ceiling + 1)
-                << "x; preserving the game's request.";
-        reshade::log::message(reshade::log::level::warning, message.str().c_str());
-      }
-      return ForwardFixedNative(
-          viewport, options, FixedOverrideStatus::kBlockedStructuralCeiling);
-    }
-
-    // Vulkan owns a native queue-present path, not the D3D flip-meter patch.
-    // An addon-generated fixed override additionally needs the current native
-    // GetState maximum. Do not fabricate a larger public maximum for Vulkan.
-    if (vulkan && (g_vulkan_native_state_epoch.load(std::memory_order_acquire) !=
-                       g_options_cache_epoch.load(std::memory_order_acquire) ||
-        g_vulkan_native_state_viewport.load(std::memory_order_relaxed) != static_cast<uint32_t>(viewport) ||
-        !g_state_seen.load(std::memory_order_acquire) ||
-        g_dlssg_status.load(std::memory_order_relaxed) != 0 ||
-        g_runtime_max_generated.load(std::memory_order_relaxed) < desired)) {
-      return ForwardFixedNative(viewport, options, FixedOverrideStatus::kBlockedBackend);
-    }
-    if (!vulkan && g_pacing_ready != nullptr && !g_pacing_ready() && g_ensure_pacing != nullptr && !automatic) {
-      g_ensure_pacing();
-    }
-    ceiling = (std::min)(g_streamline_max_generated.load(std::memory_order_acquire),
-                         ProviderMfgCeiling());
-    if (ceiling != 0 && desired > ceiling) {
-      if (g_ceiling_blocked_for.exchange(desired, std::memory_order_relaxed) != desired) {
-        std::stringstream message;
-        message << "mfgunlock: fixed " << multiplier
-                << "x not submitted: Streamline structural maximum is " << (ceiling + 1)
-                << "x; preserving the game's request.";
-        reshade::log::message(reshade::log::level::warning, message.str().c_str());
-      }
-      return ForwardFixedNative(
-          viewport, options, FixedOverrideStatus::kBlockedStructuralCeiling);
-    }
-    if (g_streamline_plugin_seen.load(std::memory_order_acquire) && ceiling == 0) {
-      if (!g_unknown_ceiling_logged.exchange(true, std::memory_order_relaxed)) {
-        reshade::log::message(
-            reshade::log::level::warning,
-            "mfgunlock: fixed multiplier not submitted because the active Streamline plugin's "
-            "structural frame ceiling is unknown; preserving the game's request.");
-      }
-      return ForwardFixedNative(
-          viewport, options, FixedOverrideStatus::kUnknownStructuralCeiling);
-    }
-    if (!vulkan && g_pacing_ready != nullptr && !g_pacing_ready()) {
-      if (!g_declined_no_pacing.exchange(true, std::memory_order_relaxed)) {
-        reshade::log::message(
-            reshade::log::level::warning,
-            "mfgunlock: NOT forcing the multiplier -- flip metering is still enabled, and "
-            "asking for more than one generated frame without software pacing freezes "
-            "presentation. Leaving the game's own request alone.");
-      }
-      return ForwardFixedNative(viewport, options, FixedOverrideStatus::kBlockedPacing);
-    }
+  if (multiplier < 2) {
+    if (context) context->fixed_attempt.valid = false;
+    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kNative);
   }
-
-  if (requested == desired)
+  if (requested == desired) {
+    if (context) context->fixed_attempt.valid = false;
     return ForwardFixedNative(viewport, options, FixedOverrideStatus::kAlreadyMatched);
+  }
 
-  SetFixedOverrideState(FixedOverrideStatus::kPending, requested, 0);
-  const sl::Result result = ForwardFixedCount(viewport, options, desired);
+  RuntimeAttempt uncached;
+  auto& attempt = context ? context->fixed_attempt : uncached;
+  const bool same = PrepareRuntimeAttempt(attempt, options);
+  if (SuppressRejectedAttempt(attempt, same)) {
+    g_fixed_suppressed_repeats.fetch_add(1, std::memory_order_relaxed);
+    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kRejectedNativeFallback);
+  }
 
-  // Fall back to the original request if the override is rejected.
-  if (result != sl::Result::eOk) {
-    // The feature manager can reject the first call while still initializing.
-    // Retry the same request once before treating the count as unsupported.
-    const sl::Result retry = ForwardFixedCount(viewport, options, desired, countobserver::Origin::kRetry);
-
-    if (retry == sl::Result::eOk) {
-      g_force_failed_for.store(0, std::memory_order_relaxed);
-      if (SetFixedOverrideState(
-              FixedOverrideStatus::kAppliedAfterRetry, requested, desired)) {
-        std::stringstream s;
-        s << "mfgunlock: slDLSSGSetOptions returned " << static_cast<unsigned int>(result)
-          << " on the first attempt but accepted numFramesToGenerate=" << desired
-          << " on retry.";
-        reshade::log::message(reshade::log::level::info, s.str().c_str());
-      }
-      return retry;
+  // Keep the previous terminal UI status while this synchronous call executes.
+  // Pending -> Applied on every frame previously produced thousands of logs.
+  if (!same || attempt.rejected) {
+    std::stringstream message;
+    message << "mfgunlock: fixed MFG SetOptions BEGIN viewport=" << static_cast<uint32_t>(viewport)
+            << " requested=" << requested << " forced=" << desired;
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
+  }
+  const sl::Result first = ForwardFixedCount(viewport, options, desired);
+  const sl::Result result = first == sl::Result::eOk ? first
+      : ForwardFixedCount(viewport, options, desired, countobserver::Origin::kRetry);
+  const bool changed = !same || attempt.result != result ||
+                       attempt.rejected != (result != sl::Result::eOk);
+  RecordRuntimeResult(attempt, result);
+  if (attempt.rejected) {
+    g_force_failed_for.store(desired, std::memory_order_relaxed);
+    if (changed) {
+      std::stringstream message;
+      message << "mfgunlock: slDLSSGSetOptions refused numFramesToGenerate=" << desired
+              << " twice (sl::Result " << static_cast<unsigned int>(first) << " then "
+              << static_cast<unsigned int>(result) << "); falling back to the game's request of "
+              << requested << ". The same rejected override will wait for a context change.";
+      reshade::log::message(reshade::log::level::warning, message.str().c_str());
     }
-
-    if (g_force_failed_for.exchange(desired, std::memory_order_relaxed) != desired) {
-      std::stringstream s;
-      s << "mfgunlock: slDLSSGSetOptions refused numFramesToGenerate=" << desired
-        << " twice (sl::Result " << static_cast<unsigned int>(result) << " then "
-        << static_cast<unsigned int>(retry) << "); falling back to the game's own request of "
-        << requested << ".";
-      reshade::log::message(reshade::log::level::warning, s.str().c_str());
-    }
-    const sl::Result fallback = ForwardSetOptions(viewport, options, countobserver::Origin::kNativeFallback);
-    g_dynamic_applied.store(fallback == sl::Result::eOk && options.mode == sl::DLSSGMode::eDynamic,
-                            std::memory_order_relaxed);
-    SetFixedOverrideState(fallback == sl::Result::eOk ? FixedOverrideStatus::kRejectedNativeFallback
-                                                     : FixedOverrideStatus::kFallbackRejected,
-                          requested, fallback == sl::Result::eOk ? requested : 0);
-    return fallback;
+    return ForwardFixedNative(viewport, options, FixedOverrideStatus::kRejectedNativeFallback);
   }
 
   g_force_failed_for.store(0, std::memory_order_relaxed);
-  if (SetFixedOverrideState(FixedOverrideStatus::kApplied, requested, desired)) {
-    std::stringstream s;
-    s << "mfgunlock: forcing DLSS-G numFramesToGenerate from " << requested << " to " << desired
-      << " (" << multiplier << "x). slDLSSGSetOptions accepted it.";
-    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  SetFixedOverrideState(first == sl::Result::eOk ? FixedOverrideStatus::kApplied
+                                               : FixedOverrideStatus::kAppliedAfterRetry,
+                        requested, desired);
+  if (changed) {
+    std::stringstream message;
+    message << "mfgunlock: forcing DLSS-G numFramesToGenerate from " << requested << " to " << desired
+            << " (" << multiplier << "x). slDLSSGSetOptions accepted it";
+    if (first != sl::Result::eOk)
+      message << " on retry after result " << static_cast<unsigned int>(first);
+    message << ".";
+    reshade::log::message(reshade::log::level::info, message.str().c_str());
   }
   return result;
 }
@@ -1422,6 +1642,7 @@ inline void ApplyLiveOptions(const sl::ViewportHandle& viewport) {
 }
 
 inline void InvalidateLiveOptions() {
+  g_native_maximum.store(runtimecontrols::kUnknownMaximum, std::memory_order_release);
   g_options_cache_epoch.fetch_add(1, std::memory_order_acq_rel);
   g_present_thread.store(0, std::memory_order_release);
 }
@@ -2198,7 +2419,7 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
     }
   } passive_tap{state, viewport, passive_valid};
   if (RealGetState() == nullptr) return sl::Result::eErrorNotInitialized;
-  if (!g_enabled.load() || !architecture::ActiveProfile())
+  if (!g_enabled.load())
     return presentation::passive::CallNative([&] { return RealGetState()(viewport, state, options); });
 
   const uint32_t diag_call =
@@ -2215,6 +2436,13 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   }
   const uint64_t native_epoch = g_options_cache_epoch.load(std::memory_order_acquire);
   const sl::Result result = presentation::passive::CallNative([&] { return RealGetState()(viewport, state, options); });
+  const bool maximum_known = result == sl::Result::eOk &&
+      state.structType == sl::DLSSGState::s_structType &&
+      state.structVersion >= sl::kStructVersion2 && state.structVersion <= sl::kStructVersion4 &&
+      native_epoch == g_options_cache_epoch.load(std::memory_order_acquire);
+  g_native_maximum.store(maximum_known
+      ? runtimecontrols::EncodeMaximum(state.numFramesToGenerateMax)
+      : runtimecontrols::kUnknownMaximum, std::memory_order_release);
   if (outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan) {
     g_vulkan_native_state_epoch.store(0, std::memory_order_release);
     if (result == sl::Result::eOk && state.structType == sl::DLSSGState::s_structType &&
@@ -2291,28 +2519,14 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
     presentation::ClearCorrelation();
     return result;
   }
+  ObserveRuntimeHealth(viewport, result == sl::Result::eOk && static_cast<uint32_t>(state.status) == 0);
   if (result == sl::Result::eOk) {
-    ObserveDynamicSupport(state, result);
-    if (!g_dynamic_support_seen.load(std::memory_order_acquire) &&
-        DynamicStackReady() && state.structVersion < sl::kStructVersion4 &&
-        !g_dynamic_probe_attempted.exchange(true, std::memory_order_acq_rel)) {
-      // Older games allocate the state ABI they were built against. Probe v4
-      // into addon-owned storage so no field beyond the caller's allocation is
-      // ever read or written. The original call/result above remains native.
-      sl::DLSSGState extended{};
-      extended.next = nullptr;  // Do not invoke caller-owned extension chains a second time.
-      extended.structVersion = sl::kStructVersion4;
-      const sl::Result probe = presentation::passive::CallNative([&] { return RealGetState()(viewport, extended, options); });
-      ObserveDynamicSupport(extended, probe);
-      // GetState consumes the presented-frame counter. Account for frames
-      // consumed by our one-time probe in the same caller-visible result.
-      if (probe == sl::Result::eOk) {
-        const uint64_t presented = uint64_t{state.numFramesActuallyPresented} +
-                                   extended.numFramesActuallyPresented;
-        state.numFramesActuallyPresented = static_cast<uint32_t>(
-            (std::min)(presented, uint64_t{UINT32_MAX}));
-      }
+    if (ObserveDynamicSupport(state, result)) {
+      RememberNativeDynamicState(viewport);
+    } else if (state.structVersion < sl::kStructVersion4) {
+      ProbeDynamicSupport(viewport, options);
     }
+    DrainProbePresentations(viewport, state);
 
     if (static_cast<uint32_t>(state.status) == 0) {
       passive_valid = true;
@@ -2339,26 +2553,12 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
 
   const unsigned int reported = state.numFramesToGenerateMax;
   g_runtime_max_generated.store(reported, std::memory_order_relaxed);
-  if (g_multi_frame_ready != nullptr && !g_multi_frame_ready()) {
-    if (state.numFramesToGenerateMax > 1) state.numFramesToGenerateMax = 1;
-    g_effective_max_generated.store(state.numFramesToGenerateMax,
-                                    std::memory_order_relaxed);
-    g_effective_max_seen.store(true, std::memory_order_release);
-    return result;
-  }
+  const unsigned int wanted = ProviderMfgCeiling();
+  // A configured menu request is independent of scanner/gate observations on
+  // both APIs. Keep native and advertised values separately; only an actual
+  // native options/create/state response confirms use.
 
-  const unsigned int wanted = (std::min)(g_streamline_max_generated.load(std::memory_order_relaxed),
-                                        ProviderMfgCeiling());
-  if (outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan) {
-    // Native support is authoritative. The structural plan is an upper bound,
-    // never a replacement for Vulkan runtime support/presentation capability.
-    if (wanted != 0) state.numFramesToGenerateMax = (std::min)(reported, wanted);
-    g_effective_max_generated.store(state.numFramesToGenerateMax, std::memory_order_relaxed);
-    g_effective_max_seen.store(true, std::memory_order_release);
-    return result;
-  }
-
-  if (wanted == 0 || reported == wanted) {
+  if (wanted == 0 || reported >= wanted) {
     g_effective_max_generated.store(state.numFramesToGenerateMax,
                                     std::memory_order_relaxed);
     g_effective_max_seen.store(true, std::memory_order_release);
@@ -2372,8 +2572,8 @@ inline sl::Result HookedGetState(const sl::ViewportHandle& viewport, sl::DLSSGSt
   if (!g_capacity_advertised.exchange(true, std::memory_order_relaxed)) {
     std::stringstream s;
     s << "mfgunlock: slDLSSGGetState reported a maximum of " << reported
-      << " generated frame(s); using the Streamline structural ceiling of " << wanted
-      << " (" << (wanted + 1) << "x).";
+      << " generated frame(s); advertising the configured trial maximum of " << wanted
+      << " (" << (uint64_t{wanted} + 1) << "x); native acceptance is not yet proven.";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
   }
   return result;
@@ -2384,6 +2584,10 @@ inline sl::Result HookedGetFeatureFunction(sl::Feature feature, const char* func
   const sl::Result result = g_real_get_feature_function(feature, function_name, function);
   if (result != sl::Result::eOk || function_name == nullptr || function == nullptr) return result;
   if (feature != sl::kFeatureDLSS_G || g_entry_shutting_down.load(std::memory_order_acquire)) return result;
+
+  if ((std::strcmp(function_name, "slDLSSGSetOptions") == 0 ||
+       std::strcmp(function_name, "slDLSSGGetState") == 0) && g_on_dlssg_entry_observed)
+    g_on_dlssg_entry_observed(function);
 
   if (std::strcmp(function_name, "slDLSSGSetOptions") == 0) {
     if (!g_set_options_entry.installed.load(std::memory_order_acquire) ||
@@ -2504,6 +2708,7 @@ inline void ReleaseGlobalAutomaticUiTags() {
 }
 
 inline void NotifyOutputStateChanged() {
+  g_request_retry_revision.fetch_add(1, std::memory_order_acq_rel);
   internal::ForgetUiOutputs();
   internal::RequestAllUiResets();
   g_ui_composition_applied.store(false, std::memory_order_relaxed);
@@ -2512,6 +2717,7 @@ inline void NotifyOutputStateChanged() {
 }
 
 inline void NotifyOutputUnknown() {
+  g_request_retry_revision.fetch_add(1, std::memory_order_acq_rel);
   outputstate::Reset();
   g_ui_composition_applied.store(false, std::memory_order_relaxed);
   g_ui_candidate_options_synced.store(false, std::memory_order_release);
@@ -2564,6 +2770,7 @@ inline void ApplyLiveOptionsOnPresent() {
 }
 
 inline void NotifyUiCompositionChanged() {
+  g_request_retry_revision.fetch_add(1, std::memory_order_acq_rel);
   internal::RequestGlobalAutomaticUiTagRelease();
   // Keep the last accepted options evidence while the new request is pending.
   g_ui_composition_fell_back.store(false, std::memory_order_relaxed);
@@ -2584,6 +2791,7 @@ inline void NotifyUiCompositionChanged() {
 }
 
 inline void NotifyUiCandidateInjectionChanged() {
+  g_request_retry_revision.fetch_add(1, std::memory_order_acq_rel);
   internal::RequestGlobalAutomaticUiTagRelease();
   g_ui_candidate_active.store(false, std::memory_order_relaxed);
   g_ui_candidate_options_synced.store(false, std::memory_order_release);
@@ -2607,6 +2815,7 @@ inline void NotifyDynamicD3D12(bool d3d12) {
 }
 
 inline void NotifyFixedMultiplierChanged() {
+  g_request_retry_revision.fetch_add(1, std::memory_order_acq_rel);
   const bool enabled = g_force_multiplier.load(std::memory_order_relaxed) >= 2;
   g_fixed_override_status.store(
       enabled ? FixedOverrideStatus::kPending : FixedOverrideStatus::kNative,
@@ -2620,15 +2829,20 @@ inline void NotifyFixedMultiplierChanged() {
 }
 
 inline void NotifyDynamicModeChanged() {
+  g_request_retry_revision.fetch_add(1, std::memory_order_acq_rel);
   g_dynamic_fell_back.store(false, std::memory_order_relaxed);
   g_dynamic_runtime_declined.store(false, std::memory_order_release);
   g_dynamic_result.store(0, std::memory_order_relaxed);
   g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
+  g_dynamic_probe_result.store(0, std::memory_order_relaxed);
   NotifyLiveOptionsChanged();
 }
 
 inline void NotifyDlssgPluginUnloaded(HMODULE module) {
   if (!module) return;
+  const auto options_owner = internal::g_set_options_entry.identity.module;
+  const auto state_owner = internal::g_get_state_entry.identity.module;
+  if ((options_owner || state_owner) && options_owner != module && state_owner != module) return;
   internal::InvalidateLiveOptions();
   if (internal::g_set_options_entry.identity.module == module) {
     hook::UninstallAddress(internal::g_set_options_entry);
@@ -2642,6 +2856,7 @@ inline void NotifyDlssgPluginUnloaded(HMODULE module) {
   g_streamline_max_generated.store(0, std::memory_order_release);
   g_capacity_advertised.store(false, std::memory_order_relaxed);
   g_runtime_max_generated.store(0, std::memory_order_relaxed);
+  g_native_maximum.store(runtimecontrols::kUnknownMaximum, std::memory_order_release);
   g_effective_max_generated.store(0, std::memory_order_relaxed);
   g_effective_max_seen.store(false, std::memory_order_release);
   g_last_forwarded_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
@@ -2649,6 +2864,12 @@ inline void NotifyDlssgPluginUnloaded(HMODULE module) {
   g_last_accepted_mode.store(diagnostic::kUnknown32, std::memory_order_relaxed);
   g_last_accepted_generated.store(diagnostic::kUnknown32, std::memory_order_relaxed);
   presentation::ObserveProviderUnavailable();
+  g_fixed_override_status.store(g_force_multiplier.load(std::memory_order_relaxed) >= 2
+                                   ? FixedOverrideStatus::kPending : FixedOverrideStatus::kNative,
+                               std::memory_order_relaxed);
+  g_last_effective_generated.store(0, std::memory_order_relaxed);
+  g_force_failed_for.store(0, std::memory_order_relaxed);
+  g_dynamic_probe_result.store(0, std::memory_order_relaxed);
   g_dynamic_support_seen.store(false, std::memory_order_release);
   g_dynamic_supported.store(false, std::memory_order_release);
   g_dynamic_probe_attempted.store(false, std::memory_order_relaxed);
@@ -2666,7 +2887,7 @@ inline void TryInstall() {
   struct Guard {
     ~Guard() { installing = false; }
   } guard;
-  HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
+  HMODULE interposer = g_find_interposer ? g_find_interposer() : GetModuleHandleW(L"sl.interposer.dll");
 
   // An entry detour disappeared with the old image. Clear every borrowed
   // trampoline before attempting to bind a replacement image. Do not detach
@@ -2689,7 +2910,7 @@ inline void TryInstall() {
   if (interposer == nullptr) return;
 
   // slInit must be observed before the game calls it. A current, own-code
-  // major-2 slInit is enough to install that entry hook; the complete runtime
+  // supported typed slInit is enough to install that entry hook; the complete runtime
   // contract can become available later, after sl.common is loaded.
   const bool compatible_init = g_init_compatible && g_init_compatible(interposer);
   const bool compatible_runtime =

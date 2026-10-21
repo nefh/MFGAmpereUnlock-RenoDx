@@ -22,8 +22,9 @@ void Check(bool value, const char* name) {
 int main() {
   const RequirementsEvidence base{true, true, 1, kNgxSuccess, kDlssGFeatureId,
                                   kAdapterUnsupported, kAdaArchitecture};
-  for (const ArchitectureProfile* profile : {&architecture::kAmpere, &architecture::kTuring}) {
-    Check(CanRelaxRequirements(base, profile), "qualified architecture override");
+  for (const ArchitectureProfile* profile : {&architecture::kAmpere, &architecture::kTuring,
+                                             &architecture::kAda}) {
+    Check(CanRelaxRequirements(base, profile), "scoped architecture query permits a native attempt");
     auto evidence = base;
     evidence.minimum_architecture = profile->native_arch;
     Check(CanRelaxRequirements(evidence, profile), "retargeted minimum with unsupported flag");
@@ -38,9 +39,8 @@ int main() {
           evidence.flags = flags;
           evidence.minimum_architecture = minimum;
           const bool expected = feature == kDlssGFeatureId &&
-              ((flags == 0 && minimum == profile->exposed_arch) ||
-               (flags == kAdapterUnsupported &&
-                (minimum == profile->exposed_arch || minimum == profile->native_arch)));
+              ((flags == 0 && minimum > profile->native_arch) ||
+               flags == kAdapterUnsupported);
           Check(CanRelaxRequirements(evidence, profile) == expected,
                 "feature/flag/minimum matrix");
         }
@@ -60,11 +60,13 @@ int main() {
     for (unsigned int providers : {0u, 2u, 3u, 8u}) {
       evidence = base;
       evidence.prepared_providers = providers;
-      Check(!CanRelaxRequirements(evidence, profile), "unprepared or ambiguous provider");
+      Check(CanRelaxRequirements(evidence, profile),
+            "provider count does not preempt a native attempt");
     }
     for (int mask = 0; mask < 32; ++mask) {
       Check(CanExposeArchitecture((mask & 1) != 0, (mask & 2) != 0, (mask & 4) != 0,
-                                   (mask & 8) != 0, (mask & 16) ? -1 : 0, profile) == (mask == 15),
+                                   (mask & 8) != 0, (mask & 16) ? -1 : 0, profile) ==
+                (profile->RequiresProviderRetarget() && (mask & 23) == 7),
             "NVAPI scope matrix");
     }
     const StreamlineSupportEvidence support_base{
@@ -77,22 +79,27 @@ int main() {
       support.adapter_bound = (mask & 2) != 0;
       support.adapter_matches = (mask & 4) != 0;
       support.prepared_providers = (mask & 8) ? 1u : 0u;
-      Check(CanRelaxStreamlineSupport(support, profile) == (mask == 15),
+      Check(CanRelaxStreamlineSupport(support, profile) == ((mask & 7) == 7),
             "Streamline admission evidence matrix");
     }
-    for (uint32_t result : {0u, 4u, 7u, 31u, 32u, 0xffffffffu}) {
+    auto adapter_rejection = support_base;
+    adapter_rejection.result = kStreamlineAdapterNotSupported;
+    Check(CanRelaxStreamlineSupport(adapter_rejection, profile),
+          "both native adapter admission codes permit creation attempts");
+    for (uint32_t result : {0u, 4u, 31u, 32u, 0xffffffffu}) {
       auto support = support_base;
       support.result = result;
       Check(!CanRelaxStreamlineSupport(support, profile),
             "preserve non-adapter Streamline failures");
     }
   }
-  for (const auto* profile : {&architecture::kAda, static_cast<const ArchitectureProfile*>(nullptr)}) {
-    Check(!CanRelaxRequirements(base, profile), "native or unresolved profile leaves NGX unchanged");
-    Check(!CanExposeArchitecture(true, true, true, true, 0, profile), "no architecture spoof");
+  {
+    const ArchitectureProfile* profile = nullptr;
+    Check(!CanRelaxRequirements(base, profile), "no invented architecture value for NGX output");
+    Check(!CanExposeArchitecture(true, true, true, true, 0, profile), "no invented architecture spoof");
     const StreamlineSupportEvidence support{true, true, true, 1, kStreamlineNoSupportedAdapter};
-    Check(!CanRelaxStreamlineSupport(support, profile),
-          "native or unresolved profile leaves Streamline support unchanged");
+    Check(CanRelaxStreamlineSupport(support, profile),
+          "unresolved profile can still attempt native Streamline creation");
   }
 
   Check(CapabilityFrameCount(1, 3) == 3, "raise lower capability");
@@ -104,10 +111,10 @@ int main() {
         "maximum signed limit accepted");
   Check(CapabilityFrameCount(1, static_cast<unsigned int>(INT_MAX) + 1u) == 1,
         "out-of-range limit rejected");
-  Check(CapabilityFrameCount(1, 5, 3) == 3,
-        "Streamline structural ceiling caps an advertised raise");
-  Check(CapabilityFrameCount(5, 5, 3) == 3,
-        "Streamline structural ceiling caps a larger native capability");
+  Check(CapabilityFrameCount(1, 5, 3) == 5,
+        "configured raise receives an attempt above a parsed ceiling");
+  Check(CapabilityFrameCount(5, 5, 3) == 5,
+        "parsed ceiling never reduces a larger native capability");
   Check(CapabilityFrameCount(1, 5, 0) == 5,
         "direct NGX has no artificial Streamline ceiling");
 

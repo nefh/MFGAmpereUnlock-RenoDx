@@ -18,7 +18,8 @@ struct LoadSite {
 // bytes and preserve the original displacement and every other argument.
 // Extra/interior references veto relocation; raw scanning is a veto ONLY.
 inline bool FindLoads(const endpoint::structural::ImageView& v, uint32_t payload,
-                      uint32_t bytes, std::vector<LoadSite>& output, std::string& reason) {
+                      uint32_t bytes, std::vector<LoadSite>& output, std::string& reason,
+                      uint32_t source_sm = 89) {
   output.clear();
   const auto reject=[&](const char* why){output.clear();reason=why;return false;};
   if(bytes<16 || !v.InSection(payload,bytes,false) || v.U32(payload)!=fatbin::kMagic)
@@ -48,7 +49,7 @@ inline bool FindLoads(const endpoint::structural::ImageView& v, uint32_t payload
         if(in_payload(pointer)) {
           if(pointer!=payload || length!=bytes || !length_site || name.empty() ||
               !v.Function(v.Relative(at,1,5)).first ||
-              !endpoint::structural::PtxHasEntry(v.image.subspan(payload,bytes),89,name))
+              !endpoint::structural::PtxHasEntry(v.image.subspan(payload,bytes),source_sm,name))
             return reject("SM75 storage: incomplete loader pointer/length/name tuple");
           if(matches.size()>=64) return reject("SM75 storage: loadsite budget");
           matches.push_back({lea_site,length_site,at,std::string(name)});

@@ -263,7 +263,7 @@ inline bool Loader(const View& v,const Graph& g,std::vector<Load>& loads,uint32_
       if(mfggate::WritesRegister(*n,2)||mfggate::WritesRegister(*n,8)||mfggate::WritesRegister(*n,9)||mfggate::WritesRegister(*n,1))return false;
     }
     if(!c||c->op!=0xe8||!c->target||!self||length!=load.payload.bytes||
-        !structural::PtxHasEntry(v.image.subspan(load.payload.rva,load.payload.bytes),89,name))return false;
+        !structural::PtxHasSourceEntry(v.image.subspan(load.payload.rva,load.payload.bytes),name))return false;
     if(helper&&helper!=c->target)return false;
     helper=c->target;
     auto* store=g.Next(c);unsigned stores=0;

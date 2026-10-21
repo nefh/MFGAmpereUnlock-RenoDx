@@ -21,6 +21,7 @@ inline constexpr uint32_t kDlssGFeatureId = 11;
 inline constexpr uint32_t kNgxSuccess = 1;
 inline constexpr uint32_t kAdapterUnsupported = 4;
 inline constexpr uint32_t kStreamlineNoSupportedAdapter = 6;
+inline constexpr uint32_t kStreamlineAdapterNotSupported = 7;
 
 struct RequirementsEvidence {
   bool enabled;
@@ -34,22 +35,26 @@ struct RequirementsEvidence {
 
 inline bool CanRelaxRequirements(const RequirementsEvidence& evidence,
                                  const ArchitectureProfile* profile) {
-  // AdapterUnsupported also covers non-architecture failures. Preserve all
-  // other requirement flags and only override for the prepared DLSS-G provider.
-  return profile && profile->RequiresProviderRetarget() && evidence.enabled && evidence.adapter_bound &&
-         evidence.prepared_providers == 1 && evidence.call_result == kNgxSuccess &&
+  // This adjusts a successful, adapter-scoped requirements query so the game
+  // can attempt native creation. Preparation count and the advertised minimum
+  // are not compatibility proofs: a new provider need not use Ada's threshold.
+  // A profile is required only because the caller writes its actual native
+  // architecture. Keep unrelated native errors/flags rather than inventing
+  // their meaning or returning a false successful operation.
+  return profile && evidence.enabled && evidence.adapter_bound &&
+         evidence.call_result == kNgxSuccess &&
          evidence.feature == kDlssGFeatureId &&
          (evidence.flags == 0 || evidence.flags == kAdapterUnsupported) &&
-         (evidence.minimum_architecture == profile->exposed_arch ||
-          (evidence.minimum_architecture == profile->native_arch &&
-           evidence.flags == kAdapterUnsupported));
+         (evidence.flags == kAdapterUnsupported ||
+          evidence.minimum_architecture > profile->native_arch);
 }
 
 inline bool CanExposeArchitecture(bool enabled, bool fg_requirements_scope, bool same_physical_gpu,
                                    bool provider_ready, int nvapi_result,
                                    const ArchitectureProfile* profile) {
+  (void)provider_ready;  // Provider discovery must not prevent the scoped attempt.
   return profile && profile->RequiresProviderRetarget() && enabled && fg_requirements_scope &&
-         same_physical_gpu && provider_ready && nvapi_result == 0;
+         same_physical_gpu && nvapi_result == 0;
 }
 
 struct StreamlineSupportEvidence {
@@ -62,26 +67,24 @@ struct StreamlineSupportEvidence {
 
 inline bool CanRelaxStreamlineSupport(const StreamlineSupportEvidence& evidence,
                                       const ArchitectureProfile* profile) {
-  // A prepared native provider plus an exact renderer-adapter LUID match is
-  // required before relaxing Streamline's cached adapter-admission verdict.
-  // Preserve all other SL errors so OS, driver, plugin and integration failures
-  // continue to fail closed.
-  return profile && profile->RequiresProviderRetarget() && evidence.enabled && evidence.adapter_bound &&
-         evidence.adapter_matches && evidence.prepared_providers == 1 &&
-         evidence.result == kStreamlineNoSupportedAdapter;
+  // Adapter admission is a prerequisite query, not an actual Create/Evaluate
+  // result. Let the selected renderer attempt the native operation even when
+  // its architecture is unknown or provider preparation was not observed.
+  // Exact adapter ownership still prevents changing another GPU's answer.
+  (void)profile;
+  return evidence.enabled && evidence.adapter_bound && evidence.adapter_matches &&
+         (evidence.result == kStreamlineNoSupportedAdapter ||
+          evidence.result == kStreamlineAdapterNotSupported);
 }
 
-// Counts are generated frames, not presentation multipliers. A nonzero
-// structural ceiling is authoritative for Streamline; direct NGX leaves it 0.
+// Counts are generated frames, not presentation multipliers. The configured
+// raise enables an empirical request; a parsed ceiling is diagnostic only.
+// Never turn an older observation into a downward override of a native value.
 inline int CapabilityFrameCount(int reported, unsigned int limit,
                                 unsigned int structural_ceiling = 0) {
+  (void)structural_ceiling;
   if (reported < 0 || limit == 0 || limit > static_cast<unsigned int>(INT_MAX)) return reported;
-  int wanted = reported < static_cast<int>(limit) ? static_cast<int>(limit) : reported;
-  if (structural_ceiling == 0 || structural_ceiling > static_cast<unsigned int>(INT_MAX))
-    return wanted;
-  return wanted > static_cast<int>(structural_ceiling)
-      ? static_cast<int>(structural_ceiling)
-      : wanted;
+  return reported < static_cast<int>(limit) ? static_cast<int>(limit) : reported;
 }
 
 

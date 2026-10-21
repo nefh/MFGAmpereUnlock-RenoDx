@@ -334,6 +334,8 @@ void SetVersion(HMODULE module, unsigned int major, unsigned int minor) {
 
 void ResetParameters(int available, int maximum, int needs_driver,
                      unsigned int init_result = NVSDK_NGX_Result_Success) {
+  ngx_internal::ForgetCapabilityOwner(nullptr);
+  ngx_internal::ForgetCapabilityOwner(&ngx_internal::g_slots[0]);
   g_parameters.values.clear();
   g_parameters.writes = 0;
   g_parameters.writable = true;
@@ -580,25 +582,80 @@ int main(int argc, char** argv) {
   Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1,
         "eligible provider exposes frame generation");
   Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 3,
-        "capability maximum raised to verified limit");
+        "capability maximum exposes the requested native trial");
+
+  using namespace mfgunlock::runtimecontrols;
+  Check(ngx::g_status.native_maximum.load() == EncodeMaximum(1),
+        "native maximum captured before the first addon Set");
+  ngx_internal::ApplyCapabilities(&g_parameters, 9, 1);
+  Check(ngx::g_status.native_maximum.load() == EncodeMaximum(1, true) &&
+        ngx::g_status.capability_max.load() == 9,
+        "same vendor block retains native original, not our previous raised maximum");
+  ngx_internal::ApplyCapabilities(&g_parameters, 0);
+  Check(ngx::g_status.native_maximum.load() == EncodeMaximum(1, true),
+        "disabling raises does not relabel an already edited block as native");
+  g_parameters.values.erase("DLSSG.MultiFrameCountMax");
+  ngx_internal::ApplyCapabilities(&g_parameters, 9);
+  Check(ngx::g_status.native_maximum.load() == kUnknownMaximum,
+        "failed native maximum read is unknown, not zero or an old success");
+  g_parameters.values["DLSSG.MultiFrameCountMax"] = 9;
+  ngx_internal::ApplyCapabilities(&g_parameters, 9);
+  Check(ngx::g_status.native_maximum.load() == EncodeMaximum(1, true),
+        "failure does not discard the marker of our own capability write");
+  ngx_internal::InvalidateCapabilityEvidence();
+  ngx_internal::ApplyCapabilities(&g_parameters, 9);
+  Check(ngx::g_status.native_maximum.load() == kUnknownMaximum,
+        "new device epoch cannot inherit a prior native maximum from an edited block");
+  g_parameters.values["DLSSG.MultiFrameCountMax"] = 4;
+  ngx_internal::ApplyCapabilities(&g_parameters, 9);
+  Check(ngx::g_status.native_maximum.load() == EncodeMaximum(4),
+        "a fresh unmodified native value can replace unknown evidence");
+
+  ResetParameters(1, 1, 0);
+  Check(countobserver::SetCallback(+[](const countobserver::Event* event) noexcept {
+    if (event->operation == countobserver::Operation::kRead && event->key == countobserver::Key::kMaximum)
+      ngx_internal::InvalidateCapabilityEvidence();
+  }), "install lifecycle reentry observer");
+  ngx_internal::ApplyCapabilities(&g_parameters, 9);
+  countobserver::SetCallback(nullptr);
+  Check(ngx::g_status.native_maximum.load() == kUnknownMaximum &&
+        ngx::g_status.capability_max.load() == 9,
+        "lifecycle callback invalidates evidence without deadlock or denying the native trial");
 
   ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
   ngx_internal::ApplyCapabilities(&g_parameters, 0);
   Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1,
-        "base FG is admitted after preparation even when optional MFG count is unavailable");
+        "base FG trial is admitted even when optional MFG count is unavailable");
   Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 1,
         "admitting base FG does not invent a higher frame count");
   mfgunlock::provider::g_test_prepared_count = 0;
   ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
   ngx_internal::ApplyCapabilities(&g_parameters, 3);
-  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 0,
-        "requested count alone cannot claim successful provider preparation");
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1 &&
+        mfgunlock::provider::g_test_prepared_count == 0,
+        "missing provider preparation does not veto a trial or claim preparation succeeded");
   mfgunlock::provider::g_test_prepared_count = 1;
 
   ResetParameters(0, 1, 1);
   ngx_internal::ApplyCapabilities(&g_parameters, 3);
-  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 0,
-        "explicit driver requirement is preserved");
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1 &&
+        g_parameters.Get("FrameGeneration.NeedsUpdatedDriver", &value) == NVSDK_NGX_Result_Success && value == 1,
+        "driver metadata remains observable but does not veto a native trial");
+  ResetParameters(0, 1, 1, NVSDK_NGX_Result_FAIL_InvalidParameter);
+  ngx_internal::ApplyCapabilities(&g_parameters, 3);
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1 &&
+        g_parameters.values["FrameGeneration.FeatureInitResult"] == NVSDK_NGX_Result_FAIL_InvalidParameter,
+        "trial admission preserves the prior native initialization failure verbatim");
+
+  architecture::Configure(Architecture::kUnknown);
+  mfgunlock::provider::g_test_prepared_count = 0;
+  ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
+  ngx_internal::ApplyCapabilities(&g_parameters, 5, 2);
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1 &&
+        g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 5,
+        "unknown profile and lower scan estimate still permit the requested native trial");
+  architecture::Configure(Architecture::kAmpere);
+  mfgunlock::provider::g_test_prepared_count = 1;
 
   ResetParameters(1, 5, 0);
   ngx_internal::ApplyCapabilities(&g_parameters, 3);
@@ -607,8 +664,8 @@ int main(int argc, char** argv) {
 
   ResetParameters(1, 5, 0);
   ngx_internal::ApplyCapabilities(&g_parameters, 5, 3);
-  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 3,
-        "known Streamline ceiling caps NGX capability advertising");
+  Check(g_parameters.Get("DLSSG.MultiFrameCountMax", &value) == NVSDK_NGX_Result_Success && value == 5,
+        "parsed Streamline estimate never reduces a larger native capability");
 
   ResetParameters(1, 1, 0);
   ngx_internal::ApplyCapabilities(&g_parameters, 5, 0);
@@ -623,8 +680,8 @@ int main(int argc, char** argv) {
 
   ResetParameters(0, 1, 0, NVSDK_NGX_Result_FAIL_FeatureNotSupported);
   ngx_internal::ApplyCapabilities(&g_parameters, 3);
-  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 0,
-        "native Ada capability bridge never overrides native FG admission");
+  Check(g_parameters.Get("FrameGeneration.Available", &value) == NVSDK_NGX_Result_Success && value == 1,
+        "native Ada also admits the selected trial after a capability rejection");
 
   ResetParameters(1, 1, 0);
   g_provider_maintenance_calls = 0;
@@ -871,9 +928,63 @@ int main(int argc, char** argv) {
         "modern Streamline ABI admitted separately");
   mock::modules.erase(L"sl.common.dll");
   Check(mfgunlock::streamline::CanHookInit(interposer) &&
-            !mfgunlock::streamline::FullModernContractReady(interposer),
-        "modern init hook precedes common without qualifying full contract");
+            mfgunlock::streamline::FullModernContractReady(interposer),
+        "public modern resolver is usable before common-module discovery");
+  // The native dump/log pairs identify a common plugin renamed by NVIDIA OTA.
+  // No vendor function is invoked while establishing its role.
+  const auto ota_common = Module(0x7170);
+  for (const auto& pair : {std::pair{L"sl_dlss_g", streamline_internal::PluginRole::kFg},
+                           std::pair{L"sl_dlss", streamline_internal::PluginRole::kSr},
+                           std::pair{L"sl_dlss_d", streamline_internal::PluginRole::kRr},
+                           std::pair{L"sl_common", streamline_internal::PluginRole::kCommon}}) {
+    mock::paths[ota_common] = std::wstring(L"D:/arbitrary/models/") + pair.first +
+        L"_91/versions/future-version/files/same-filename.DLL";
+    Check(streamline_internal::ModuleRole(ota_common) == pair.second,
+          "OTA roles are independent of cache version and DLL basename");
+  }
+  mock::paths[ota_common] = L"D:/cache/models/sl_dlss_g_0_backup/versions/x/files/x.dll";
+  Check(streamline_internal::ModuleRole(ota_common) == streamline_internal::PluginRole::kUnknown,
+        "not every opaque DLL is assumed to be FG");
+
+  auto common_export = +[]() {};
+  for (const auto* path : {
+      L"C:\\ProgramData\\NVIDIA\\NGX\\models\\sl_common_0\\versions\\134672\\files\\170_E658703.dll",
+      L"D:/cache/models/sl_common_123/versions/arbitrary-revision/files/future.DLL",
+      L"C:\\CACHE\\MODELS\\SL_COMMON_0\\VERSIONS\\9\\FILES\\X.DLL"})
+    Check(streamline_internal::IsOtaCommonPath(path), "OTA role independent of version/hash/name");
+  for (const auto* path : {
+      L"", L"sl.common.dll", L"C:\\models\\sl_common_\\versions\\1\\files\\x.dll",
+      L"C:\\models\\sl_common_0_backup\\versions\\1\\files\\x.dll",
+      L"C:\\models\\sl_dlss_0\\versions\\1\\files\\x.dll",
+      L"C:\\othermodels\\sl_common_0\\versions\\1\\files\\x.dll",
+      L"C:\\models\\sl_common_0\\versions\\files\\x.dll",
+      L"C:\\models\\sl_common_0\\versions\\1\\otherfiles\\x.dll",
+      L"C:\\models\\sl_common_0\\versions\\1\\files\\x.dll.txt",
+      L"C:\\models\\sl_common_0\\versions\\1\\files\\subdir\\x.dll"})
+    Check(!streamline_internal::IsOtaCommonPath(path), "lookalike path not a common role");
+  mock::paths[ota_common] = L"C:\\ProgramData\\NVIDIA\\NGX\\models\\sl_common_0\\versions\\134672\\files\\170_E658703.dll";
+  Check(!streamline_internal::ObserveCommonModule(ota_common), "path alone is insufficient");
+  mock::exports[{ota_common, "slGetPluginFunction"}] = Proc(common_export);
+  mock::allocation[reinterpret_cast<const void*>(Proc(common_export))] = interposer;
+  Check(!streamline_internal::ObserveCommonModule(ota_common), "forwarded gateway is not own code");
+  mock::allocation[reinterpret_cast<const void*>(Proc(common_export))] = ota_common;
+  Check(streamline_internal::ObserveCommonModule(ota_common), "renamed OTA common observed");
+  Check(streamline_internal::CommonModule() == ota_common &&
+        mfgunlock::streamline::FullModernContractReady(interposer),
+        "OTA common satisfies the same dependency without sl.common filename");
+  mock::module_current[ota_common] = false;
+  Check(streamline_internal::CommonModule() == nullptr &&
+        mfgunlock::streamline::FullModernContractReady(interposer),
+        "stale common is discarded without disabling independent public APIs");
+  mock::module_current[ota_common] = true;
+  mock::exports.erase({interposer, "slGetFeatureFunction"});
+  Check(!mfgunlock::streamline::FullModernContractReady(interposer),
+        "OTA common does not bypass the parent executable-export contract");
+  mock::exports[{interposer, "slGetFeatureFunction"}] = Proc(Unrelated);
+  streamline_internal::g_common_identity = {};
   mock::modules[L"sl.common.dll"] = Module(0x5152);
+  for (auto entry : {Proc(RealSupport), Proc(RealFeatureLoaded), Proc(RealSetD3DDevice)})
+    mock::allocation[reinterpret_cast<const void*>(entry)] = interposer;
   streamline_internal::InstallSupportHook();
   Check(streamline_internal::g_support_hooked.load() &&
             streamline_internal::g_real_support == RealSupport,
@@ -912,8 +1023,28 @@ int main(int argc, char** argv) {
   g_support_architecture = 0;
   Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
             sl::Result::eOk && g_support_architecture == architecture::kAdaArchitecture,
-        "DLSS-G support query uses scoped architecture exposure");
+        "actual architecture rejection is retried under scoped exposure");
+  // Reproduce the successful native polling storm from the supplied R3 log.
   g_force_support_result = true;
+  g_forced_support_result = sl::Result::eOk;
+  const auto successful_maintenance = g_provider_maintenance_calls;
+  const auto successful_native_calls = g_support_calls;
+  const auto successful_requirements = g_feature_requirements_calls;
+  const auto successful_loaded = g_feature_loaded_calls;
+  const auto poll_log_start = provider::g_test_log.size();
+  for (unsigned i = 0; i < 10000; ++i) {
+    Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) == sl::Result::eOk,
+          "successful support polling preserves result");
+    streamline_internal::HookedGetFeatureRequirements(sl::kFeatureDLSS_G, feature_requirements);
+    streamline_internal::HookedIsFeatureLoaded(sl::kFeatureDLSS_G, feature_loaded);
+  }
+  Check(g_provider_maintenance_calls == successful_maintenance &&
+        g_support_calls == successful_native_calls + 10000 &&
+        g_feature_requirements_calls == successful_requirements + 10000 &&
+        g_feature_loaded_calls == successful_loaded + 10000,
+        "30000 successful queries perform exactly 30000 native calls and zero provider maintenance");
+  Check(provider::g_test_log.size() - poll_log_start <= 48,
+        "30000 successful polls emit at most 48 startup trace lines, never per-frame logs");
   g_forced_support_result = sl::Result::eErrorNoSupportedAdapterFound;
   Check(streamline_internal::HookedIsFeatureSupported(sl::kFeatureDLSS_G, adapter_info) ==
             sl::Result::eOk,
@@ -1003,6 +1134,30 @@ int main(int argc, char** argv) {
 
   TestDiscoveryPassThrough();
 
+  const auto ota_fg = Module(0x6180);
+  auto ota_gateway_fn = +[](const char* name) -> void* { return RealGateway(name); };
+  mock::paths[ota_fg] = L"D:/cache/models/sl_dlss_g_0/versions/next/files/opaque.dll";
+  mock::exports[{ota_fg, "slGetPluginFunction"}] = Proc(ota_gateway_fn);
+  mock::allocation[reinterpret_cast<const void*>(Proc(ota_gateway_fn))] = ota_fg;
+  mock::modules.erase(L"sl.common.dll");
+  mock::exports.erase({interposer, "slGetFeatureVersion"});
+  const auto ota_before = g_plugin_bound_calls;
+  Check(streamline_internal::BindPlugin(ota_fg, Proc(ota_gateway_fn)) == Proc(ota_gateway_fn) &&
+        g_plugin_bound_calls == ota_before + 1 && g_bound_plugin == ota_fg,
+        "OTA FG binds its own gateway despite unrelated parent/common missing exports");
+  const auto ota_lookups = g_gateway_lookups;
+  for (unsigned i = 0; i < 100; ++i) streamline_internal::BindPlugin(ota_fg, Proc(ota_gateway_fn));
+  Check(g_gateway_lookups == ota_lookups && g_plugin_bound_calls == ota_before + 1,
+        "stable OTA identity generates no redundant probes or ceiling callbacks");
+  mock::module_current[plugin.gateway_hook.identity.module] = false;
+  streamline_internal::RefreshPluginLifetimes();
+  Check(streamline_internal::g_lifecycle_state.load() != streamline_internal::LifecycleState::kUnloaded,
+        "unloading obsolete local FG does not mark active OTA FG unloaded");
+  mock::module_current[reinterpret_cast<HMODULE>(Proc(RealGateway))] = true;
+  mock::modules[L"sl.common.dll"] = Module(0x5152);
+  mock::exports[{interposer, "slGetFeatureVersion"}] = Proc(Unrelated);
+
+
   mfgunlock::streamline::Shutdown();
   Check(!plugin.gateway_hook.installed.load() && !plugin.load_hook.installed.load() &&
             !plugin.startup_hook.installed.load(),
@@ -1066,10 +1221,10 @@ int main(int argc, char** argv) {
             ada_startup && ada_startup("{}", reinterpret_cast<void*>(0x2222)) &&
             g_load_architecture == architecture::kAdaArchitecture &&
             g_startup_architecture == architecture::kAdaArchitecture &&
-            g_provider_maintenance_calls == maintenance_before_ada_lifecycle &&
+            g_provider_maintenance_calls == maintenance_before_ada_lifecycle + 2 &&
             streamline_internal::g_lifecycle_state.load() ==
                 streamline_internal::LifecycleState::kStartupSucceeded,
-        "Ada plugin lifecycle stays native and reaches STARTUP_SUCCEEDED");
+        "Ada plugin lifecycle keeps native arguments/results and runs the independent preflight");
   mfgunlock::streamline::Shutdown();
   mfgunlock::streamline::Initialize(Module(0x9191));
   Check(streamline_internal::LifecycleEnabled(),
@@ -1097,6 +1252,100 @@ int main(int argc, char** argv) {
   ngx_internal::TraceCapabilityBlock("TEST", "NATIVE", &g_parameters, 1);
   Check(g_parameters.values == cap_values && g_parameters.writes == cap_writes && GetLastError() == 9911,
         "capability diagnostic only reads, never converts SR failure into success");
+  // D2 observes SR queries without changing native return values, arguments,
+  // calls, output values, error state, or invoking additional feature probes.
+  streamline_internal::g_shutting_down.store(false);
+  streamline_internal::g_real_support = RealSupport;
+  streamline_internal::g_real_requirements = RealFeatureRequirements;
+  streamline_internal::g_real_loaded = RealFeatureLoaded;
+  sl::AdapterInfo sr_adapter{};
+  const sl::Feature sr_feature = 0;
+  const auto sr_support_before = g_support_calls;
+  SetLastError(2222);
+  Check(streamline_internal::HookedIsFeatureSupported(sr_feature, sr_adapter) ==
+            sl::Result::eErrorFeatureMissing && g_support_calls == sr_support_before + 1 &&
+            GetLastError() == 2222,
+        "D2 SR support observes the native failure exactly once");
+  sl::FeatureRequirements sr_requirements{};
+  const auto sr_req_before = g_feature_requirements_calls;
+  Check(streamline_internal::HookedGetFeatureRequirements(sr_feature, sr_requirements) ==
+            sl::Result::eErrorFeatureMissing && g_feature_requirements_calls == sr_req_before + 1,
+        "D2 SR requirements remains a native call");
+  bool sr_loaded = false;
+  const auto sr_loaded_before = g_feature_loaded_calls;
+  Check(streamline_internal::HookedIsFeatureLoaded(sr_feature, sr_loaded) ==
+            sl::Result::eErrorFeatureMissing && g_feature_loaded_calls == sr_loaded_before + 1 &&
+            sr_loaded == g_feature_loaded_value,
+        "D2 preserves even native outputs on a failed SR-loaded query");
+  const auto saw_trace = [&](const char* needle) {
+    for (const auto& line : provider::g_test_log)
+      if (line.find(needle) != std::string::npos) return true;
+    return false;
+  };
+  Check(saw_trace("SL_FEATURE api=slIsFeatureSupported.native feature=0"), "D2 logs SR support");
+  Check(saw_trace("SL_FEATURE api=slGetFeatureRequirements feature=0"), "D2 logs SR requirements");
+  Check(saw_trace("SL_FEATURE api=slIsFeatureLoaded feature=0"), "D2 logs SR load result");
+  ngx_internal::g_slots[0].entry_vulkan_requirements = RealVulkanRequirements;
+  NVSDK_NGX_FeatureDiscoveryInfo sr_discovery{};
+  sr_discovery.FeatureID = static_cast<NVSDK_NGX_Feature>(1);
+  NVSDK_NGX_FeatureRequirement sr_vk_req{};
+  const auto vk_req_before = g_vulkan_requirement_calls;
+  Check(ngx_internal::VulkanRequirements<0>(nullptr, nullptr, &sr_discovery, &sr_vk_req) ==
+            g_requirement_result && g_vulkan_requirement_calls == vk_req_before + 1,
+        "D2 Vulkan SR requirements observes exactly one native call");
+  Check(saw_trace("NGX_VULKAN_REQUIREMENTS phase=NATIVE"), "D2 logs native Vulkan requirement results");
+  unsigned forwarded = 0;
+  SetLastError(4444);
+  Check(ngx_internal::CreateVulkanFeature<0>(static_cast<NVSDK_NGX_Feature>(1), nullptr,
+      [&] { ++forwarded; return NVSDK_NGX_Result_FAIL_FeatureNotSupported; }) ==
+      NVSDK_NGX_Result_FAIL_FeatureNotSupported && forwarded == 1 && GetLastError() == 4444,
+      "D2 never turns an SR create failure into a success or creates twice");
+  Check(saw_trace("NGX_VULKAN_CREATE"), "D2 logs native Vulkan creation results");
+  sl::Preferences sr_pref{};
+  const sl::Feature sr_requested[] = {sr_feature};
+  sr_pref.featuresToLoad = sr_requested;
+  sr_pref.numFeaturesToLoad = 1;
+  g_original_preferences = &sr_pref;
+  const auto sr_init_before = g_init_calls;
+  Check(mfgunlock::streamline::OnInit(sr_pref, sl::kSDKVersion, RealInit) == g_sl_result &&
+            g_init_calls == sr_init_before + 1 && sr_pref.featuresToLoad == sr_requested &&
+            sr_pref.numFeaturesToLoad == 1,
+        "D2 observes slInit while forwarding the same preferences object and feature list");
+  Check(saw_trace("SL_INIT_BEGIN") && saw_trace("SL_INIT_END"), "D2 logs both initialization boundaries");
+
+  // R6: actual exported operations identify renamed runtimes; display versions
+  // and unrelated missing functions do not stand in for the available call.
+  const auto renamed_interposer = Module(0x61234);
+  auto renamed_resolver = +[]() {};
+  mock::paths[renamed_interposer] = L"X:\\custom\\graphics-runtime.dll";
+  mock::exports[{renamed_interposer, "slGetFeatureFunction"}] = Proc(renamed_resolver);
+  mock::allocation[reinterpret_cast<const void*>(Proc(renamed_resolver))] = renamed_interposer;
+  Check(streamline_internal::GetInterposerAbi(renamed_interposer) ==
+            streamline_internal::InterposerAbi::kModern &&
+        streamline_internal::HasModernFeatureResolver(renamed_interposer),
+        "renamed resolver remains callable with no version, init, tags or optional exports");
+  Check(!mfgunlock::streamline::CanHookInit(renamed_interposer),
+        "an available resolver does not invent a missing init address");
+  Check(streamline_internal::ObserveInterposerModule(renamed_interposer) &&
+        streamline_internal::InterposerModule() == renamed_interposer,
+        "native lookup observation selects the actual renamed interposer");
+  mock::module_current[renamed_interposer] = false;
+  Check(!streamline_internal::HasModernFeatureResolver(renamed_interposer) &&
+        !streamline_internal::ObserveInterposerModule(renamed_interposer) &&
+        streamline_internal::InterposerModule() != renamed_interposer,
+        "unloaded observed interposer is never reused as a current function source");
+  streamline_internal::g_observed_interposer = {};
+
+  const auto renamed_ngx = Module(0x61235);
+  mock::paths[renamed_ngx] = L"X:\\custom\\native-runtime.dll";
+  Check(!ngx_internal::IsNgxRuntime(renamed_ngx), "name alone does not invent a public NGX ABI");
+  mock::exports[{renamed_ngx, "NVSDK_NGX_D3D12_CreateFeature"}] = Proc(RealCreate);
+  Check(!ngx_internal::IsNgxRuntime(renamed_ngx),
+        "provider-private CreateFeature is not mistaken for the public runtime ABI");
+  mock::exports[{renamed_ngx, "NVSDK_NGX_VULKAN_GetCapabilityParameters"}] = Proc(RealParameters);
+  Check(ngx_internal::IsNgxRuntime(renamed_ngx),
+        "actual public parameter export identifies a renamed NGX runtime");
+
   std::cout << "host wrappers: " << g_checks
             << " checks PASS (mock APIs; no ABI/Detours/GPU test)\n";
   return 0;

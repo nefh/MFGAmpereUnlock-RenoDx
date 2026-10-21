@@ -24,10 +24,20 @@ add_compile_definitions(
   MFGUNLOCK_RESHADE_LOG_STYLE=2
   MFGUNLOCK_RESHADE_CONFIG_STYLE=1)
 
-foreach(test assertions_enabled_test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test capability_policy_test output_state_test presentation_observer_test runtime_lifecycle_test advanced_features_test composition_state_test ui_alpha_test ui_submission_test ui_alpha_backend_test)
+foreach(test assertions_enabled_test addon_entry_test registration_trace_test architecture_test feature_capabilities_test early_load_test ptx_retarget_test temporal_composition_test runtime_controls_test capability_policy_test output_state_test presentation_observer_test runtime_lifecycle_test advanced_features_test composition_state_test ui_alpha_test ui_submission_test ui_alpha_backend_test)
   add_executable(${test} "${TEST_ROOT}/${test}.cpp")
   add_test(NAME ${test} COMMAND ${test})
 endforeach()
+
+# A process-lifetime host reference protects all SDK-cached entrypoints.
+add_executable(host_lifetime_test "${TEST_ROOT}/host_lifetime_test.cpp")
+if(WIN32)
+  add_library(host_lifetime_fixture SHARED "${TEST_ROOT}/host_lifetime_fixture.cpp")
+  add_dependencies(host_lifetime_test host_lifetime_fixture)
+  add_test(NAME host_lifetime_test COMMAND host_lifetime_test "$<TARGET_FILE:host_lifetime_fixture>")
+else()
+  add_test(NAME host_lifetime_test COMMAND host_lifetime_test)
+endif()
 
 # The host-wrapper test compiles the real production headers against explicit
 # API doubles. It is intentionally non-Windows: the real addon build uses the
@@ -42,7 +52,7 @@ if(NOT WIN32)
     configure_file("${header}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   foreach(name vulkan_contract.hpp vulkan_native.hpp architecture.hpp provider_profile.hpp feature_capabilities.hpp compatibility_foundation.hpp compatibility_runtime.hpp streamline_bridge.hpp ngx_bridge.hpp loadhook.hpp capability_policy.hpp
-               framecount.hpp ui_alpha.hpp ui_alpha_backend.hpp ui_submission.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp output_state.hpp presentation_observer.hpp quality_config.hpp advanced_features.hpp)
+               framecount.hpp runtime_controls.hpp ui_alpha.hpp ui_alpha_backend.hpp ui_submission.hpp ui_candidate.hpp observer_scope.hpp count_observer.hpp diagnostic_bridge.hpp integration_contract.hpp output_state.hpp presentation_observer.hpp quality_config.hpp advanced_features.hpp)
     configure_file("${REPO_ROOT}/src/addons/mfgunlock/${name}" "${mock_dir}/${name}" COPYONLY)
   endforeach()
   configure_file("${REPO_ROOT}/src/addons/mfgunlock/quality_guard.hpp"
@@ -77,6 +87,10 @@ if(NOT WIN32)
   target_include_directories(framecount_profile_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
   add_test(NAME framecount_profile_test COMMAND framecount_profile_test)
 
+  add_executable(diagnostics_dynamic_probe_test "${TEST_ROOT}/diagnostics_dynamic_probe_test.cpp")
+  target_include_directories(diagnostics_dynamic_probe_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
+  add_test(NAME diagnostics_dynamic_probe_test COMMAND diagnostics_dynamic_probe_test)
+
   add_executable(quality_guard_test "${TEST_ROOT}/quality_guard_test.cpp")
   target_include_directories(quality_guard_test PRIVATE "${mock_dir}" "${TEST_ROOT}/framecount_mocks")
   add_test(NAME quality_guard_test COMMAND quality_guard_test)
@@ -102,6 +116,10 @@ if(NOT WIN32)
                                                   "${REPO_ROOT}/src/addons/mfgunlock")
   add_test(NAME fg_preset_test COMMAND fg_preset_test)
 endif()
+
+# R6.3.1: the cached-reader contract is pure C++; test it on native Windows too.
+add_executable(fg_preset_cached_test "${TEST_ROOT}/fg_preset_cached_test.cpp")
+add_test(NAME fg_preset_cached_test COMMAND fg_preset_cached_test)
 
 add_executable(provider_state_test "${TEST_ROOT}/provider_state_test.cpp")
 target_include_directories(provider_state_test PRIVATE "${TEST_ROOT}/provider_mocks")
@@ -156,6 +174,9 @@ add_test(NAME integration_contract_test COMMAND integration_contract_test)
 add_executable(diagnostics_trace_test "${TEST_ROOT}/diagnostics_trace_test.cpp")
 target_include_directories(diagnostics_trace_test PRIVATE "${TEST_ROOT}/diagnostics_mocks")
 add_test(NAME diagnostics_trace_test COMMAND diagnostics_trace_test)
+
+add_executable(diagnostics_hud_tag_summary_test "${TEST_ROOT}/diagnostics_hud_tag_summary_test.cpp")
+add_test(NAME diagnostics_hud_tag_summary_test COMMAND diagnostics_hud_tag_summary_test)
 
 option(MFG_NATIVE_STACK_TESTS "Exercise production preflight with real Windows/Detours on small stacks" OFF)
 set(MFG_DETOURS_SOURCE_DIR "" CACHE PATH "Optional local Microsoft Detours source tree (contains src/detours.h)")
@@ -214,6 +235,18 @@ target_include_directories(mapped_image_bounds_test PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/provider_mocks")
 add_test(NAME mapped_image_bounds_test COMMAND mapped_image_bounds_test)
 
+# Exact production flip writer/rollback/cache, with injectable OS failures.
+# The separate image/corpus probe above continues to use non-writing plan stubs.
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_image_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/addon_flip_transaction_seam.hpp" --transaction
+  COMMAND_ERROR_IS_FATAL ANY)
+add_executable(flip_transaction_test "${TEST_ROOT}/flip_transaction_test.cpp")
+target_include_directories(flip_transaction_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/provider_mocks")
+add_test(NAME flip_transaction_test COMMAND flip_transaction_test)
+
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_addon_maintenance_seam.py")
 execute_process(COMMAND "${Python3_EXECUTABLE}"
@@ -237,6 +270,20 @@ add_executable(present_maintenance_test "${TEST_ROOT}/present_maintenance_test.c
 target_include_directories(present_maintenance_test PRIVATE
   "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/hook_mocks" "${TEST_ROOT}/provider_mocks")
 add_test(NAME present_maintenance_test COMMAND present_maintenance_test)
+
+# Reuse the exact addon implementation for OTA ceiling replacement and UI rows.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_runtime_compat_seam.py")
+execute_process(COMMAND "${Python3_EXECUTABLE}"
+  "${CMAKE_CURRENT_SOURCE_DIR}/tools/extract_runtime_compat_seam.py"
+  "${REPO_ROOT}/src/addons/mfgunlock/addon.cpp"
+  "${CMAKE_CURRENT_BINARY_DIR}/addon_runtime_compat_seam.hpp"
+  COMMAND_ERROR_IS_FATAL ANY)
+add_executable(runtime_compat_test "${TEST_ROOT}/runtime_compat_test.cpp")
+target_include_directories(runtime_compat_test PRIVATE
+  "${CMAKE_CURRENT_BINARY_DIR}" "${TEST_ROOT}/hook_mocks" "${TEST_ROOT}/provider_mocks")
+add_test(NAME runtime_compat_test COMMAND runtime_compat_test)
+
 
 
 add_test(NAME provider_qualification_test
@@ -335,6 +382,9 @@ set_tests_properties(sm75_relu_test PROPERTIES TIMEOUT 60)
 add_executable(mfg_gate_test "${TEST_ROOT}/mfg_gate_test.cpp")
 target_include_directories(mfg_gate_test PRIVATE "${TEST_ROOT}/provider_mocks")
 add_test(NAME mfg_gate_test COMMAND mfg_gate_test)
+add_executable(mfg_gate_flow_test "${TEST_ROOT}/mfg_gate_flow_test.cpp")
+target_include_directories(mfg_gate_flow_test PRIVATE "${TEST_ROOT}/provider_mocks")
+add_test(NAME mfg_gate_flow_test COMMAND mfg_gate_flow_test)
 add_executable(probe_mfg_gate "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_mfg_gate.cpp")
 target_include_directories(probe_mfg_gate PRIVATE "${TEST_ROOT}/provider_mocks")
 # Bind this independent host probe to every source and API double it compiles.
@@ -438,3 +488,28 @@ add_test(NAME f4_passive_read_test COMMAND f4_passive_read_test)
 set_tests_properties(f4_passive_read_test PROPERTIES TIMEOUT 60)
 add_test(NAME f4_tools_test COMMAND "${Python3_EXECUTABLE}" "${TEST_ROOT}/f4_tools_test.py")
 set_tests_properties(f4_tools_test PROPERTIES TIMEOUT 60)
+
+# R6.3: reuse the production private-reader proof in the read-only collector.
+if(NOT WIN32)
+  add_executable(probe_fg_preset "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_fg_preset.cpp")
+  target_include_directories(probe_fg_preset PRIVATE "${preset_mock_dir}" "${TEST_ROOT}/provider_mocks"
+                                                     "${REPO_ROOT}/src/addons/mfgunlock")
+  set(preset_probe_sources ${mfg_probe_sources})
+  list(REMOVE_ITEM preset_probe_sources "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_provider_capability.cpp"
+                                       "${CMAKE_CURRENT_SOURCE_DIR}/tools/mapped_provider_image.hpp")
+  list(APPEND preset_probe_sources "${CMAKE_CURRENT_SOURCE_DIR}/tools/probe_fg_preset.cpp"
+                                   "${TEST_ROOT}/fg_preset_mocks/ngx_hook.hpp")
+  list(SORT preset_probe_sources)
+  set(preset_probe_manifest "")
+  foreach(input IN LISTS preset_probe_sources)
+    file(SHA256 "${input}" digest)
+    file(RELATIVE_PATH relative "${REPO_ROOT}" "${input}")
+    string(APPEND preset_probe_manifest "${relative}|${digest}\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${input}")
+  endforeach()
+  string(SHA256 preset_probe_digest "${preset_probe_manifest}")
+  target_compile_definitions(probe_fg_preset PRIVATE MFG_PRESET_SOURCE_ID="${preset_probe_digest}")
+  add_test(NAME preset_evidence_test COMMAND "${Python3_EXECUTABLE}"
+    "${TEST_ROOT}/preset_evidence_test.py" --probe "$<TARGET_FILE:probe_fg_preset>")
+  set_tests_properties(preset_evidence_test PROPERTIES TIMEOUT 90)
+endif()

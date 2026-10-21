@@ -143,11 +143,11 @@ int main() {
         ni::IsTargetName("NVSDK_NGX_VULKAN_EvaluateFeature") &&
         !ni::IsTargetName("NVSDK_NGX_VULKAN_EvaluateFeature_C"),
         "only the verified C++ callback ABI is intercepted");
-  Check(!ni::ShouldHookEntry("NVSDK_NGX_D3D12_GetFeatureRequirements", false) &&
-        !ni::ShouldHookEntry("NVSDK_NGX_VULKAN_GetFeatureRequirements", false) &&
+  Check(ni::ShouldHookEntry("NVSDK_NGX_D3D12_GetFeatureRequirements", false) &&
+        ni::ShouldHookEntry("NVSDK_NGX_VULKAN_GetFeatureRequirements", false) &&
         ni::ShouldHookEntry("NVSDK_NGX_D3D12_CreateFeature", false) &&
         ni::ShouldHookEntry("NVSDK_NGX_VULKAN_EvaluateFeature", false),
-        "Ada keeps native admission but installs both API lifecycle observers");
+        "typed admission and lifecycle observers remain available without a retarget profile");
   Check(ni::ShouldHookEntry("NVSDK_NGX_VULKAN_GetFeatureRequirements", true),
         "retarget architectures retain their requirements bridge");
   d::SetEvaluateCallback(nullptr);

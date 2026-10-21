@@ -41,3 +41,14 @@ validation-logs/
 /validation-logs/
 
 /external/Vulkan-Headers/
+
+# Machine-local test runs and research artifacts (never release sources)
+/build.*/
+/build-*/
+/validation-*/
+/reports/
+/*.log
+/*.bak
+/*.bak.*
+/*.zip
+/*.tar.gz

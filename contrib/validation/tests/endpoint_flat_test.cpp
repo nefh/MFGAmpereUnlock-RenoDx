@@ -21,6 +21,7 @@ struct Fixture {
   std::array<uint32_t,2> selectors{},ptxloader{},native_ctor{},ptx_ctor{},ptx_table{},native_table{},payload{},length_operand{};
   uint32_t guard=0x8700,helper=0,init=0,stub=0,wrapper=0,wrapper_table=0,destructor=0;
   unsigned at=0;
+  uint32_t source_sm=89;
   uint32_t fresh(){code=(code+31)&~31u;at=code;return at;}
   void bytes(std::initializer_list<unsigned char> s){std::copy(s.begin(),s.end(),b.begin()+at);at+=static_cast<unsigned>(s.size());}
   void end(uint32_t start){functions.emplace_back(start,at);code=at;}
@@ -41,11 +42,11 @@ struct Fixture {
     return table;
   }
   uint32_t container(){
-    std::string t=".version 8.7\n.target sm_89\n.address_size 64\n.visible .entry kernel() {ret;}\n";t.push_back(0);
+    std::string t=".version 8.7\n.target sm_"+std::to_string(source_sm)+"\n.address_size 64\n.visible .entry kernel() {ret;}\n";t.push_back(0);
     const auto pos=data;const auto compressed=t.size()+2;const auto n=80+((compressed+7)&~size_t{7});data+=static_cast<uint32_t>(n);
     Put<uint32_t>(b,pos,f::kMagic);Put<uint16_t>(b,pos+4,1);Put<uint16_t>(b,pos+6,16);Put<uint64_t>(b,pos+8,n-16);
     Put<uint16_t>(b,pos+16,1);Put<uint16_t>(b,pos+18,0x101);Put<uint32_t>(b,pos+20,64);Put<uint64_t>(b,pos+24,n-80);
-    Put<uint32_t>(b,pos+32,static_cast<uint32_t>(compressed));Put<uint32_t>(b,pos+44,89);Put<uint64_t>(b,pos+56,0x2041);Put<uint64_t>(b,pos+72,t.size());
+    Put<uint32_t>(b,pos+32,static_cast<uint32_t>(compressed));Put<uint32_t>(b,pos+44,source_sm);Put<uint64_t>(b,pos+56,0x2041);Put<uint64_t>(b,pos+72,t.size());
     b[pos+80]=0xf0;b[pos+81]=static_cast<unsigned char>(t.size()-15);std::copy(t.begin(),t.end(),b.begin()+pos+82);
     return pos;
   }
@@ -69,7 +70,7 @@ struct Fixture {
     const auto field=static_cast<unsigned char>(0x28+role*8);
     bytes({0x48,0x89,0x4e,field,0x48,0x8b,0x4e,field,0x48,0x8b,0x01,0x45,0x33,0xc9,0x48,0x8b,0x40,0x10});indirect();return query;
   }
-  explicit Fixture(uint32_t shift=0){
+  explicit Fixture(uint32_t shift=0,uint32_t sm=89):source_sm(sm){
     code+=shift;data+=shift;
     IMAGE_DOS_HEADER dos{};dos.e_magic=IMAGE_DOS_SIGNATURE;dos.e_lfanew=0x80;Put(b,0,dos);
     IMAGE_NT_HEADERS64 nt{};nt.Signature=IMAGE_NT_SIGNATURE;nt.FileHeader.Machine=IMAGE_FILE_MACHINE_AMD64;nt.FileHeader.NumberOfSections=2;
@@ -110,6 +111,14 @@ struct Fixture {
 };
 void Reset(){p::Restore();provider_mock::regions.clear();provider_mock::paths.clear();provider_mock::exports.clear();provider_mock::protection_calls=0;provider_mock::fail_protection_call=0;provider_mock::fail_protection_calls.clear();p::internal::g_registry_failed=false;p::g_create_seen=false;mfgunlock::g_enabled=true;mfgunlock::architecture::Configure(mfgunlock::Architecture::kTuring);}
 int main(){try{
+  for(unsigned source_sm:{90u,120u,999u}) {
+    Reset(); Fixture x(0,source_sm); e::StructuralPlan plan; std::string why;
+    Check(e::FindEndpointPlan(x.b,x.ranges,plan,why),"endpoint resolves actual non-SM89 PTX source");
+    const auto before=x.b;
+    Check(p::PrepareProvider(x.b.data())&&p::internal::g_providers.front().endpoint_selected,
+          "production endpoint selection and retarget from actual source SM");
+    p::Restore();Check(x.b==before,"generic source endpoint fully restores");
+  }
   for(unsigned shift:{0u,0x400u,0x800u}){
     Reset();Fixture x(shift);e::StructuralPlan plan;std::string why;
     Check(e::FindEndpointPlan(x.b,x.ranges,plan,why),why.c_str());

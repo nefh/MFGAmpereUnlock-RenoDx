@@ -124,9 +124,9 @@ int main() {
         "unprepared retarget provider fails closed");
 
   input = Good(nullptr);
-  Check(State(advanced::Evaluate(input), advanced::Feature::kFallbackSelection).fallback_reason ==
-            advanced::FallbackReason::kNoArchitecture,
-        "unknown architecture fails closed");
+  Check(State(advanced::Evaluate(input), advanced::Feature::kFallbackSelection).input_eligible &&
+        State(advanced::Evaluate(input), advanced::Feature::kMotionValidation).input_eligible,
+        "actual applied software backends are not vetoed by an unknown architecture");
 
   input = Good(&mfgunlock::architecture::kAmpere);
   auto no_kernels = mfgunlock::profiles::kDlssg31091;

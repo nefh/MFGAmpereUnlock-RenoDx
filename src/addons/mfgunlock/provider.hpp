@@ -30,7 +30,12 @@ namespace mfgunlock::provider {
 
 inline std::atomic_bool g_create_seen{false};
 
+// Optional passive startup observer. It cannot replace a result or call vendor code.
+using StartupLogObserver = void (*)(const char*, bool) noexcept;
+inline std::atomic<StartupLogObserver> g_startup_log_observer{nullptr};
 inline void Log(const std::string& message, bool warning = false) {
+  if (const auto observer = g_startup_log_observer.load(std::memory_order_relaxed))
+    observer(message.c_str(), warning);
   reshade::log::message(warning ? reshade::log::level::warning : reshade::log::level::info,
                         ("mfgunlock: " + message).c_str());
 }
@@ -542,7 +547,9 @@ struct ProviderStatus {
   bool busy = false;
   bool failed = false;
   unsigned int QualifiedCount() const {
-    return busy || failed || blocked ? 0 : ready;
+    // A separate inspected/rejected provider cannot revoke successful work on
+    // a current retained provider. Real registry/rollback failures still can.
+    return busy || failed ? 0 : ready;
   }
 };
 inline ProviderStatus GetProviderStatus() {
@@ -572,8 +579,8 @@ inline ProviderStatus GetProviderStatus() {
     }
   }
   for (const auto& rejected : internal::g_rejected) {
-    // An image reused at the same address is unqualified, not automatically
-    // harmless. Only absence of an executable image expires this veto.
+    // Keep a current diagnostic count without turning unrelated discovery
+    // results into a veto for separately committed providers.
     if (internal::IsImageMapping(rejected.module)) {
       ++result.blocked;
     }
@@ -611,7 +618,6 @@ inline bool PrepareProviderImpl(HMODULE module,
   internal::Image image;
   internal::ImageIdentity identity;
   if (!internal::InspectImage(module, image) || !internal::ReadIdentity(module, identity)) {
-    internal::g_registry_failed.store(true);
     Log("invalid provider image: " + internal::ModulePath(module), true);
     return false;
   }
@@ -627,13 +633,11 @@ inline bool PrepareProviderImpl(HMODULE module,
     } else if (internal::g_rejected.size() < 32) {
       internal::g_rejected.push_back(std::move(entry));
     } else {
-      internal::g_registry_failed.store(true);
+      // Bounded diagnostic history is not a compatibility admission gate.
+      internal::g_rejected.erase(internal::g_rejected.begin());
+      internal::g_rejected.push_back(std::move(entry));
     }
-    if (changed) {
-      const bool ready = std::any_of(internal::g_providers.begin(), internal::g_providers.end(),
-          [](const auto& provider) { return provider.ready; });
-      if (!ready) Log("provider rejected: " + reason + " (" + path + ")", true);
-    }
+    if (changed) Log("provider preparation result: " + reason + " (" + path + ")", true);
     return false;
   };
   const auto arch_export = GetProcAddress(module, "NVSDK_NGX_GetGPUArchitecture");
@@ -647,9 +651,10 @@ inline bool PrepareProviderImpl(HMODULE module,
   if (!internal::IsDlssgImage(image, module)) return reject("not a DLSS-G provider");
 
   // Pre-write failures can be retried at the next normal maintenance boundary.
-  // They are cleared ONLY after this same image passes the complete transaction.
+  // In-place payload mutation needs quiescent consumers: after Create, CUDA
+  // may retain pointers into the containers. No per-module quiescence contract
+  // is available here, so live rewrites remain deferred until a fresh process.
   if (g_create_seen.load()) return reject("provider loaded after FG Create");
-  if (internal::g_providers.size() >= 8) return reject("provider limit reached");
   auto* gate = reinterpret_cast<unsigned char*>(GetProcAddress(module, "NVSDK_NGX_GetGPUArchitecture"));
   constexpr size_t kArchitectureGateBytes = 6;
   uint32_t minimum_arch = 0;
@@ -658,14 +663,9 @@ inline bool PrepareProviderImpl(HMODULE module,
     return reject("unrecognized minimum-architecture export");
   }
   std::memcpy(&minimum_arch, gate + 1, sizeof(minimum_arch));
-  // NV_GPU_ARCHITECTURE_ID values are ordered architecture identifiers. Accept
-  // the constant-return contract, not one provider generation: 0x160 is the
-  // already-permissive Turing minimum used by the oldest corpus providers,
-  // while later providers currently return 0x190. Keep future values in the
-  // same published 0x1x0 architecture-id space structural/version agnostic.
-  if (minimum_arch < 0x100 || minimum_arch > 0x1f0 || (minimum_arch & 0x0f) != 0) {
-    return reject("unrecognized minimum-architecture value");
-  }
+  // The export's decoded constant is the actual minimum. Its numeric value is
+  // not a version/architecture allowlist: a newer value still receives the
+  // same bounded transaction and is lowered only to the detected native ID.
   bool executable_gate = false;
   for (const auto& section : image.sections) {
     const auto begin = reinterpret_cast<uintptr_t>(image.base + section.VirtualAddress);
@@ -678,8 +678,8 @@ inline bool PrepareProviderImpl(HMODULE module,
   }
   if (!executable_gate) return reject("architecture export is not in code");
 
-  // A registry hit is evidence for optional private-layout patches, not a
-  // prerequisite for trying the generic PTX transaction. Inspect every actual
+  // A registry hit is diagnostic reference evidence, never authorization or
+  // a prerequisite for trying the generic PTX transaction. Inspect every actual
   // container below even when metadata, hashes, RVAs or inventory counts differ.
   const auto* qualified = profiles::Find(identity.timestamp, identity.image_bytes, known_profiles);
   bool exact_inventory = qualified != nullptr;
@@ -713,7 +713,8 @@ inline bool PrepareProviderImpl(HMODULE module,
   std::vector<Block> blocks;
   size_t total_bytes = 0;
   size_t hidden_cubins = 0;
-  size_t native_cubin_trials = 0;
+  std::vector<std::pair<uint32_t, size_t>> native_cubin_trials;
+  size_t native_containers = 0;
   std::vector<endpoint::ImageRange> ranges;
   for(const auto& sec:image.sections) {
     if(sec.Misc.VirtualSize && internal::IsReadable(image.base+sec.VirtualAddress,sec.Misc.VirtualSize,module))
@@ -742,28 +743,37 @@ inline bool PrepareProviderImpl(HMODULE module,
       ptx::Plan plan;
       std::string reason;
       auto result = ptx::Retarget({start + at, bytes}, plan, reason, *profile);
-      if (result == ptx::Result::kRejected && profile->architecture == Architecture::kAmpere &&
-          profile->target_sm == 86) {
+      if (result == ptx::Result::kRejected && (profile->target_sm == 75 || profile->target_sm == 86)) {
         std::string native_reason;
-        if (cubin::RetargetOpaqueSm89To86({start + at, bytes}, plan.replacement, native_reason)) {
+        uint32_t source_sm = 0;
+        if (cubin::RetargetNativeToTarget({start + at, bytes}, plan.replacement, native_reason,
+                                          profile->target_sm, &source_sm)) {
           result = ptx::Result::kRetargeted;
-          ++native_cubin_trials;
+          plan.source_sm = source_sm;
+          plan.target_sm = profile->target_sm;
+          const auto trial = std::find_if(native_cubin_trials.begin(), native_cubin_trials.end(),
+              [source_sm](const auto& item) { return item.first == source_sm; });
+          if (trial == native_cubin_trials.end()) native_cubin_trials.emplace_back(source_sm, 1);
+          else ++trial->second;
+        } else if (!native_reason.empty()) {
+          reason += "; " + native_reason;
         }
       }
       if (result == ptx::Result::kRejected) return reject(reason);
+      if (result == ptx::Result::kUnchanged) ++native_containers;
       if (result == ptx::Result::kRetargeted) {
         if (blocks.size() == 512 || bytes > 64 * 1024 * 1024 - total_bytes) {
           return reject("provider exceeds preparation budget");
         }
         std::vector<storage::LoadSite> loads;
         if(plan.requires_external_storage) {
-          if(plan.replacement.size()>4*1024*1024 || plan.replacement.size()<=bytes ||
+          if(plan.replacement.size()>fatbin::kMaxFatbinBytes || plan.replacement.size()<=bytes ||
               (storage_image.functions.empty() && !storage_image.ReadFunctions()) ||
               !storage::FindLoads(storage_image,static_cast<uint32_t>(start+at-image.base),
-                                  static_cast<uint32_t>(bytes),loads,reason))
+                                  static_cast<uint32_t>(bytes),loads,reason,plan.source_sm))
             return reject(reason.empty()?"SM75 storage: unproven relocation":reason);
           for(const auto& load:loads)
-            if(!endpoint::structural::PtxHasEntry(plan.replacement,75,load.entry_name))
+            if(!endpoint::structural::PtxHasEntry(plan.replacement,profile->target_sm,load.entry_name))
               return reject("SM75 storage: rebuilt entry mismatch");
         } else if(plan.replacement.size()!=bytes) return reject("invalid in-place replacement size");
         if(plan.replacement.size()>64*1024*1024-total_bytes)return reject("provider storage budget");
@@ -775,7 +785,9 @@ inline bool PrepareProviderImpl(HMODULE module,
       at += bytes;
     }
   }
-  if (blocks.empty()) return reject("no supported sm_89 fatbins");
+  if (blocks.empty()) return reject(native_containers
+      ? "native/target payload already present; no retarget transaction needed"
+      : "no retarget transaction planned; native provider path remains unchanged");
   if (exact_inventory) {
     exact_inventory = blocks.size() == qualified->retarget_payloads.size();
     for (const auto& block : blocks) {
@@ -917,13 +929,13 @@ inline bool PrepareProviderImpl(HMODULE module,
   saved.ready = true;
   std::erase_if(internal::g_rejected, [module](const auto& entry) { return entry.module == module; });
   std::stringstream message;
-  message << "provider prepared: sm_89 -> sm_" << profile->target_sm << ", "
+  message << "provider prepared: target sm_" << profile->target_sm << ", "
           << blocks.size() << " fatbins, "
           << hidden_cubins << " cubins hidden";
   Log(message.str());
-  if (native_cubin_trials) {
-    Log("StockCubinN1: native_code_trial sm89->sm86 containers=" +
-        std::to_string(native_cubin_trials) + " instruction_bytes_changed=0");
+  for (const auto& [source_sm, count] : native_cubin_trials) {
+    Log("StockCubinR6: native_code_trial source_sm=" + std::to_string(source_sm) + " target_sm=" +
+        std::to_string(profile->target_sm) + " containers=" + std::to_string(count) + " instruction_bytes_changed=0");
   }
   Log(exact_inventory
       ? std::string("ProviderProfile ") + qualified->id + " PATCHABLE (mapped exact inventory; target preparation committed)"

@@ -98,11 +98,10 @@ PlanScan ScanPlanner(const p::internal::Image& image,
         ++scan.ptx_retargeted;
         scan.external_storage += plan.requires_external_storage;
       } else if (result == mfgunlock::ptx::Result::kRejected &&
-                 profile.architecture == mfgunlock::Architecture::kAmpere &&
-                 profile.target_sm == 86) {
+                 (profile.target_sm == 75 || profile.target_sm == 86)) {
         std::string native_reason;
-        if (mfgunlock::cubin::RetargetOpaqueSm89To86(
-                {start + at, bytes}, plan.replacement, native_reason)) {
+        if (mfgunlock::cubin::RetargetOpaqueSm89ToTarget(
+                {start + at, bytes}, plan.replacement, native_reason, profile.target_sm)) {
           ++scan.native_cubin_retargeted;
           result = mfgunlock::ptx::Result::kRetargeted;
         }

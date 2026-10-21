@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
-// Runtime decisions built on the Stage 1 evidence vocabulary. Select existing
-// typed adapters from the complete own-code export contract. File versions are
-// diagnostic metadata, not admission criteria; native results stay authoritative.
+// Runtime decisions built on the Stage 1 evidence vocabulary. A callable
+// operation selects its existing typed adapter independently of unrelated
+// module exports. File versions and capability observations are diagnostics;
+// an actual attempted operation supplies the runtime result.
 
 #include "./compatibility_foundation.hpp"
 
@@ -34,12 +35,11 @@ struct InterposerContract {
 
 inline InterposerContract AssessInterposer(std::span<const ExportSymbol> symbols,
                                            bool common_present, bool current_image) {
+  (void)common_present;  // Loading a sibling is not a calling-ABI discriminator.
   InterposerContract result;
   result.surface = ClassifyStreamline(symbols);
   if (!current_image) {
     result.admission = {FeatureState::kUnavailable, "interposer image changed or disappeared"};
-  } else if (!common_present) {
-    result.admission = {FeatureState::kDegraded, "sl.common is missing"};
   } else if (result.surface == StreamlineFamily::kModernSurface) {
     result.typed_abi = TypedInterposerAbi::kModern2;
     result.admission = {FeatureState::kAvailable, "MODERN_EXPORT_CONTRACT"};
@@ -56,7 +56,6 @@ struct PluginGatewayEvidence {
   bool named_dlssg = false;
   bool own_code_gateway = false;
   bool current_image = false;
-  bool parent_abi_qualified = false;
   bool set_options = false;
   bool get_state = false;
   bool on_load = false;
@@ -66,29 +65,35 @@ struct PluginGatewayEvidence {
 inline FeatureDecision GatewayLookup(const PluginGatewayEvidence& e) {
   if (!e.current_image || !e.own_code_gateway)
     return {FeatureState::kUnavailable, "plugin gateway is absent, forwarded, or stale"};
-  if (!e.named_dlssg || !e.parent_abi_qualified)
-    return {FeatureState::kUnknown, "plugin and interposer gateway ABI not qualified"};
+  if (!e.named_dlssg)
+    return {FeatureState::kUnknown, "not a DLSS-G plugin role"};
+  // slGetPluginFunction has its own stable opaque-pointer ABI. Its native
+  // lookup must not depend on every unrelated export in the parent module.
   return {FeatureState::kAvailable, "matching typed plugin gateway contract"};
 }
 
 inline FeatureDecision PluginFunctions(const PluginGatewayEvidence& e, TypedInterposerAbi abi) {
   const auto gateway = GatewayLookup(e);
   if (!gateway.Available()) return gateway;
-  if (abi == TypedInterposerAbi::kModern2 && e.set_options && e.get_state)
-    return {FeatureState::kAvailable, "typed DLSS-G options and state entrypoints"};
+  if (e.set_options || e.get_state)
+    return {FeatureState::kAvailable, "individual typed DLSS-G operation entrypoint"};
   if (abi == TypedInterposerAbi::kLegacy1 && e.on_load && e.on_startup)
-    return {FeatureState::kDegraded, "legacy lifecycle only; Dynamic MFG unqualified"};
+    return {FeatureState::kDegraded, "legacy lifecycle observed; options/state entrypoints absent"};
   return {FeatureState::kUnavailable, "required DLSS-G plugin functions are missing"};
 }
 
 struct DynamicEvidence {
+  // These two fields describe the individual callable entrypoint, including
+  // its current module lifetime. One operation must not require the other.
+  bool live_set_options = false;
+  bool live_get_state = false;
   bool architecture_supports = false;
   bool target_ready = false;
   bool provider_qualified = false;
   bool typed_modern_interposer = false;
   bool typed_modern_plugin = false;
-  bool options_v5 = false;
-  bool state_v4 = false;
+  bool options_v5 = false;  // capacity of our owned typed request, not caller ABI
+  bool state_v4 = false;    // capacity of our owned typed query, not caller ABI
   bool hook_entries_current = false;
   bool ceiling_observed = false;
   bool d3d12 = false;
@@ -97,29 +102,25 @@ struct DynamicEvidence {
 };
 
 inline FeatureDecision DynamicStack(const DynamicEvidence& e) {
-  if (!e.architecture_supports || !e.d3d12)
-    return {FeatureState::kUnavailable, "target/backend does not support Dynamic MFG"};
-  if (!e.provider_qualified || !e.target_ready)
-    return {FeatureState::kDegraded, "provider or target preparation is unqualified"};
-  if (!e.typed_modern_interposer || !e.typed_modern_plugin)
-    return {FeatureState::kDegraded, "typed Streamline/plugin contract is unavailable"};
-  if (!e.options_v5 || !e.state_v4 || !e.hook_entries_current)
-    return {FeatureState::kDegraded, "Options/State ABI or live entrypoints unqualified"};
-  if (!e.ceiling_observed)
-    return {FeatureState::kDegraded, "plugin frame-count capability unobserved"};
-  if (!e.api_support_observed)
-    return {FeatureState::kUnknown, "waiting for successful slDLSSGGetState v4"};
-  if (!e.api_supports_dynamic)
-    return {FeatureState::kUnavailable, "slDLSSGGetState reports Dynamic MFG unsupported"};
-  return {FeatureState::kAvailable, "typed API and provider capability confirmed"};
+  if (!e.live_set_options)
+    return {FeatureState::kDegraded, "live slDLSSGSetOptions entrypoint is absent"};
+  if (!e.options_v5)
+    return {FeatureState::kDegraded, "owned DLSSGOptions v5 request is unavailable"};
+  // A false/unknown capability bit is not a failed eDynamic request. Vulkan,
+  // architecture profiles, provider preparation and a prior fixed ceiling are
+  // not calling prerequisites. The caller records the native attempt result.
+  return {FeatureState::kAvailable, "live typed Dynamic request can be attempted"};
 }
 
-// The v4 query itself must be allowed before support is observed. Its inputs
-// undergo the same checks, but no support result is required to make the query.
-inline FeatureDecision DynamicProbe(DynamicEvidence e) {
-  e.api_support_observed = true;
-  e.api_supports_dynamic = true;
-  return DynamicStack(e);
+// Query the individual getter even when no setter, profile, capability, or
+// unrelated hook has been observed. Never use the query result as permission
+// for the user's separately selected Dynamic request.
+inline FeatureDecision DynamicProbe(const DynamicEvidence& e) {
+  if (!e.live_get_state)
+    return {FeatureState::kDegraded, "live slDLSSGGetState entrypoint is absent"};
+  if (!e.state_v4)
+    return {FeatureState::kDegraded, "owned DLSSGState v4 query is unavailable"};
+  return {FeatureState::kAvailable, "live typed Dynamic capability query can be attempted"};
 }
 
 inline FeatureDecision LateAttach(bool interposer_present, bool init_observed,

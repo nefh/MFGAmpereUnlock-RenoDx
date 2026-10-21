@@ -3,8 +3,9 @@
  * SPDX-License-Identifier: MIT
  *
  * NVIDIA does not publish this container format as a stable ABI. Every parser
- * check below is therefore deliberately conservative: unknown headers, entry
- * layouts, compression flags, or sizes are rejected rather than guessed.
+ * check below bounds the actual versioned header and entry layout. Payload
+ * decoding proves the representation; unrelated flags and producer identities
+ * do not decide compatibility.
  */
 #pragma once
 
@@ -460,6 +461,27 @@ inline bool Parse(std::span<const unsigned char> bytes, std::vector<Entry>& entr
   }
 
   return offset == end && !entries.empty();
+}
+
+// Decode an actually bounded kind-1 payload. Compression flags are retained
+// as metadata; the recorded sizes and successful decoder determine whether we
+// have LZ4 or uncompressed storage. No producer-version/flag whitelist.
+inline bool DecodePtx(std::span<const unsigned char> bytes, const Entry& entry,
+                      std::vector<unsigned char>& raw) {
+  raw.clear();
+  if (entry.kind != 1 || entry.PayloadOffset() > bytes.size() ||
+      entry.payload_bytes > bytes.size() - entry.PayloadOffset()) return false;
+  if (entry.compressed_bytes) {
+    if (!entry.unpacked_bytes || entry.unpacked_bytes > kMaxPtxBytes ||
+        entry.compressed_bytes > entry.payload_bytes) return false;
+    raw.resize(entry.unpacked_bytes);
+    if (!Lz4BlockDecompress(bytes.data() + entry.PayloadOffset(), entry.compressed_bytes,
+                           raw.data(), raw.size())) { raw.clear(); return false; }
+  } else {
+    if (!entry.payload_bytes || entry.payload_bytes > kMaxPtxBytes) return false;
+    raw.assign(bytes.begin() + entry.PayloadOffset(), bytes.begin() + entry.End());
+  }
+  return !raw.empty();
 }
 
 }  // namespace mfgunlock::fatbin

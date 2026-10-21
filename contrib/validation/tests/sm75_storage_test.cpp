@@ -31,9 +31,9 @@ void Reset() {
   m::fail_protection_call=0;m::protection_calls=0;m::frees=0;m::fail_free=false;
   m::force_lock_busy=false;m::retain_ok=true;
 }
-Bytes TightContainer() {
+Bytes TightContainer(uint32_t source_sm=89) {
   for(unsigned count: {1u,4u,16u,32u,64u,128u}) {
-    std::string text=".version 8.2\n.target sm_89\n.address_size 64\n"
+    std::string text=".version 8.2\n.target sm_"+std::to_string(source_sm)+"\n.address_size 64\n"
         ".visible .entry synthetic_storage() {\n.reg .b16 %rs<64>;\n.reg .f32 %f<8>;\n.reg .b32 %r<64>;\n";
     for(unsigned i=0;i<count;++i) text+=(i%2?"min.f16 ":"max.f16 ")+std::string("%rs")+
         std::to_string((i*7)%64)+", %rs"+std::to_string((i*11+1)%64)+", %rs"+
@@ -44,7 +44,7 @@ Bytes TightContainer() {
     Put<uint32_t>(b,0,f::kMagic);Put<uint16_t>(b,4,1);Put<uint16_t>(b,6,16);
     Put<uint64_t>(b,8,b.size()-16);Put<uint16_t>(b,16,1);Put<uint16_t>(b,18,0x101);
     Put<uint32_t>(b,20,64);Put<uint64_t>(b,24,b.size()-80);
-    Put<uint32_t>(b,32,compressed.size());Put<uint32_t>(b,44,89);
+    Put<uint32_t>(b,32,compressed.size());Put<uint32_t>(b,44,source_sm);
     Put<uint64_t>(b,56,0x2041);Put<uint64_t>(b,72,text.size());
     std::copy(compressed.begin(),compressed.end(),b.begin()+80);
     t::Plan plan;std::string why;
@@ -59,9 +59,10 @@ struct Image {
   Bytes original;
   std::vector<e::ImageRange> ranges{{0x1000,0x1000,true},{0x4000,0xc000,false}};
   size_t container_bytes=0;
+  uint32_t source_sm=89;
   static constexpr size_t payload=0x8000,loader=0x1200,name=0x7100;
   void* Module() {return b.data();}
-  Image() {
+  explicit Image(uint32_t sm=89):source_sm(sm) {
     IMAGE_DOS_HEADER dos{};dos.e_magic=IMAGE_DOS_SIGNATURE;dos.e_lfanew=0x80;Put(b,0,dos);
     IMAGE_NT_HEADERS64 nt{};nt.Signature=IMAGE_NT_SIGNATURE;
     nt.FileHeader.Machine=IMAGE_FILE_MACHINE_AMD64;nt.FileHeader.NumberOfSections=2;
@@ -76,7 +77,7 @@ struct Image {
     data.Characteristics=IMAGE_SCN_MEM_READ;
     Put(b,0x80+sizeof(nt),text);Put(b,0x80+sizeof(nt)+sizeof(text),data);
     Code(b,0x1000,{0xb8,0x90,1,0,0,0xc3});Code(b,0x1100,{0xc3});
-    const auto container=TightContainer();container_bytes=container.size();
+    const auto container=TightContainer(source_sm);container_bytes=container.size();
     std::copy(container.begin(),container.end(),b.begin()+payload);
     std::memcpy(b.data()+name,"synthetic_storage",18);
     std::memcpy(b.data()+0x7000,"dlfg_kernel",12);
@@ -93,11 +94,11 @@ struct Image {
   }
   bool Loads(std::vector<mfgunlock::storage::LoadSite>& sites,std::string& why) {
     e::structural::ImageView view{b,ranges,{}};
-    return view.ReadFunctions() && mfgunlock::storage::FindLoads(view,payload,container_bytes,sites,why);
+    return view.ReadFunctions() && mfgunlock::storage::FindLoads(view,payload,container_bytes,sites,why,source_sm);
   }
 };
-void Successful() {
-  Reset();Image x;
+void Successful(uint32_t source_sm=89) {
+  Reset();Image x(source_sm);
   Check(p::PrepareProvider(x.Module()),"larger PTX published");
   Check(m::allocations.size()==1,"one owned allocation");
   auto& record=p::internal::g_providers.back();
@@ -206,7 +207,7 @@ void Refusals() {
   }
 }
 int main() {
-  try {Successful();FailurePaths();Refusals();Reset();
+  try {Successful();Successful(120);FailurePaths();Refusals();Reset();
     std::cout<<"SM75 storage checks="<<checks<<" PASS\n";
   } catch(const std::exception& ex){std::cerr<<ex.what()<<'\n';return 1;}
 }

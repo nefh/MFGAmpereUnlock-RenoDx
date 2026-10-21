@@ -233,17 +233,14 @@ def read_envelopes(image: PEView) -> tuple[list[dict], list[dict]]:
 
 def export_surface(exports: list[dict]) -> str:
     names = own_exports(exports)
-    common = {'slInit', 'slShutdown', 'slSetTag', 'slEvaluateFeature'}
-    modern = {'slGetFeatureFunction', 'slGetFeatureRequirements', 'slGetFeatureVersion'}
     legacy = {'slGetFeatureSettings', 'slSetFeatureConstants'}
-    if not common <= names:
-        return 'unknown-safe'
-    m, l = modern <= names, legacy <= names
-    if m and not (legacy & names):
+    # A callable ABI discriminator is independent of optional module exports.
+    # This is descriptive surface metadata, never runtime authorization.
+    if 'slGetFeatureFunction' in names:
         return 'modern-export-surface'
-    if l and not (modern & names):
+    if legacy <= names:
         return 'legacy-export-surface'
-    return 'ambiguous-export-surface' if m and l else 'unknown-safe'
+    return 'unknown-safe'
 
 
 def preset_regions() -> list[dict]:
@@ -403,38 +400,62 @@ def transform_profile_observations(containers: list[dict]) -> dict:
 
 
 def temporal_observations(containers: list[dict]) -> dict:
-    """Reuse profile definitions from midpoint.hpp; descriptor binding is NOT claimed."""
-    source = (ROOT / 'src/addons/mfgunlock/midpoint.hpp').read_text(encoding='utf-8')
+    """Read shared semantic role definitions; executable transform proof is separate."""
+    source = (ROOT / 'src/addons/mfgunlock/midpoint_transform.hpp').read_text(encoding='utf-8')
     block = re.search(r'kTemporalProfiles\[\]\s*=\s*\{(.*?)\n\};', source, re.S)
     if not block:
-        raise ValueError('temporal_profiles_missing')
-    profiles = [(int(n), name, desc) for n, name, desc in re.findall(
-        r'\{(\d+),\s*"([^"]+)",\s*"([^"]+)"', block.group(1))]
+        raise ValueError('temporal_roles_missing')
+    profiles = re.findall(r'\{"([^"]+)",\s*"([^"]+)"', block.group(1))
     expected = int(re.search(r'kExpectedMidpoints\s*=\s*(\d+)', source).group(1))
+    parameter_bytes = int(re.search(r'kTemporalParameterBytes\s*=\s*(\d+)', source).group(1))
     observations = []
-    for size, name, descriptor in profiles:
+    for name, descriptor in profiles:
         matches = []
         for b in containers:
             for e in b['entries']:
                 text = e.get('_text')
-                if text is None or e['declared_raw_bytes'] != size:
+                if text is None:
                     continue
-                entry = ('.entry ' + name + '(').encode()
-                param = ('.param .align 8 .b8 ' + name + '_param_0[144]').encode()
-                join = b'$L__BB0_3:'
-                multiplications = list(re.finditer(rb'(?m)^mul\.ftz\.f32 [^\n]*0f3F000000;', text))
-                insertion = text.find(b'\n', text.find(join))
-                context = entry in text and param in text and b'.reg .f32 %f<1362>;' in text
-                invariants = (text.count(join) == 1 and insertion >= 0 and len(multiplications) == expected
-                              and multiplications[0].start() > insertion)
+                code = re.sub(rb'//[^\r\n]*|/\*.*?(?:\*/|\Z)|"(?:\\.|[^"\\])*"', b' ', text, flags=re.S)
+                entry = list(re.finditer(rb'\.entry\s+' + re.escape(name.encode()) + rb'\s*\(', code))
+                if not entry:
+                    continue
+                declaration = re.match(rb'\s*\.param\s+\.align\s+(\d+)\s+\.b8\s+([a-zA-Z_$][a-zA-Z0-9_$]*)'
+                                       rb'\s*\[\s*(\d+)\s*\]\s*\)', code[entry[0].end():])
+                target = re.findall(rb'\.target\s+sm_(\d+)', code)
+                context = len(entry) == 1 and len(target) == 1 and int(target[0]) == e['architecture']
+                body = b''
+                parameter = None
+                if declaration:
+                    alignment, parameter, size = declaration.groups()
+                    align = int(alignment)
+                    context = context and align >= 4 and align & (align - 1) == 0 and int(size) == parameter_bytes
+                    opening = code.find(b'{', entry[0].end() + declaration.end())
+                    depth = 1
+                    if opening >= 0:
+                        for at in range(opening + 1, len(code)):
+                            if code[at] == 123: depth += 1
+                            elif code[at] == 125: depth -= 1
+                            if depth == 0:
+                                body = code[opening + 1:at]
+                                break
+                    context = context and bool(body)
+                else:
+                    context = False
+                reg = rb'%[a-zA-Z0-9_$.]+'
+                half = rb'0f3F000000'
+                operands = rb'(?:' + reg + rb'\s*,\s*' + half + rb'|' + half + rb'\s*,\s*' + reg + rb')'
+                count = len(re.findall(rb'\bmul\.ftz\.f32\s+' + reg + rb'\s*,\s*' + operands + rb'\s*;', body))
                 matches.append({'container_rva': b['rva'], 'normalized_sha256': e['normalized_sha256'],
-                                'signature_context': context, 'join_count': text.count(join),
-                                'midpoint_count': len(multiplications), 'invariants': invariants})
-        validated = [m for m in matches if m['signature_context'] and m['invariants']]
-        observations.append({'entry_name': name, 'descriptor_name': descriptor, 'declared_raw_bytes': size,
-                             'candidates': matches, 'status': gate(len(matches), bool(validated), len(validated) == 1,
-                             'PTX signature/count evidence; descriptor ABI and composed retarget+temporal runtime remain unqualified.')})
-    return {'profiles': observations, 'descriptor_binding': 'NOT_RUN', 'runtime_authorized': False}
+                                'declared_raw_bytes': e['declared_raw_bytes'], 'signature_context': bool(context),
+                                'parameter_symbol': parameter.decode('ascii') if parameter else None,
+                                'midpoint_count': count, 'expected_midpoint_count': expected,
+                                'local_shape_observed': bool(context and count == expected)})
+        observations.append({'entry_name': name, 'descriptor_name': descriptor, 'parameter_bytes': parameter_bytes,
+                             'candidates': matches, 'status': gate(len(matches), False, False,
+                             'Observational role/parameter/count inventory. Run the shared C++ temporal probe for executable transformation proof.')})
+    return {'profiles': observations, 'descriptor_binding': 'NOT_RUN', 'transform_execution': 'NOT_RUN',
+            'runtime_authorized': False}
 
 
 def strip_private(obj: Any) -> Any:

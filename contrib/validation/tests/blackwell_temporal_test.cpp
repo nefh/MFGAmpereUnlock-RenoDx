@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Exercises the exact full-temporal profiles and motion-vector quality rewrites
+// Exercises structural full-temporal profiles and motion-vector quality rewrites
 // without embedding or redistributing NVIDIA kernel payloads.
 
 #include "../../../src/addons/mfgunlock/blackwell_temporal.hpp"
@@ -35,15 +35,14 @@ size_t CountOccurrences(const std::string& text, const std::string& needle) {
 }
 
 std::string MotionFixture() {
-  return ".version 8.7\n"
-         ".target sm_120\n"
-         ".reg .pred %p<656>;\n"
-         ".visible .entry Kernel_EstimateIntermMvecsScatter() {\n"
-         "ld.param.f32 %f2, [Kernel_EstimateIntermMvecsScatter_param_0+120];\n"
-         "fma.rn.ftz.f32 %f14, %f7, %f7, %f157;\n"
-         "fma.rn.ftz.f32 %f22, %f15, %f15, %f942;\n"
-         "ret;\n"
-         "}\n";
+  std::string out = ".version 8.7\n.target sm_120\n"
+      ".visible .entry Kernel_EstimateIntermMvecsScatter() {\n"
+      ".reg .pred %p<656>;\n.reg .f32 %f<1000>;\n";
+  for (unsigned n = 0; n < 1000; ++n)
+    out += "mov.f32 %f" + std::to_string(n) + ", 0f00000000;\n";
+  return out + "ld.param.f32 %f2, [Kernel_EstimateIntermMvecsScatter_param_0+120];\n"
+      "fma.rn.ftz.f32 %f14, %f7, %f7, %f157;\n"
+      "fma.rn.ftz.f32 %f22, %f15, %f15, %f942;\nret;\n}\n";
 }
 
 struct NeighborEvidence {
@@ -92,7 +91,7 @@ int main() {
   std::string target_version;
   Check(!temporal::Prepare(nullptr, false, BoundaryArtifactMode::kOff,
                            target_plan, target_result, target_version, 70),
-        "unknown temporal target rejected before source access");
+        "unlisted target still receives provider inspection");
   Check(!target_plan.ready && !target_result.applied, "failed target is not applied");
 
   temporal::Plan turing_plan;
@@ -225,6 +224,21 @@ int main() {
   Check(CountOccurrences(aggressive, "add.f32 %qgf0, %qgf0, %qgf6;") == 8,
         "Aggressive accumulates four neighbors in both directions");
 
+  std::string renamed = MotionFixture();
+  renamed.replace(renamed.find("ld.param.f32 %f2,"), std::string("ld.param.f32 %f2,").size(),
+                  "ld.param.f32 %f999,");
+  Check(internal::RewriteMotionVector(renamed, BoundaryArtifactMode::kBalanced, why) &&
+        renamed.find("mul.ftz.f32 %f999, %f999, %qgf11;") != renamed.npos,
+        "divisor register is captured from the actual parameter load");
+  std::string decoys = MotionFixture() + "// " + internal::kBoundaryDirections[0].anchor +
+      "// .reg .pred %p<656>;\n";
+  Check(internal::RewriteMotionVector(decoys, BoundaryArtifactMode::kBalanced, why),
+        "comment-only FMA and declarations do not become semantic anchors");
+  decoys = MotionFixture(); decoys.insert(decoys.find(internal::kBoundaryDirections[0].anchor), "// ");
+  const auto decoy_source = decoys;
+  Check(!internal::RewriteMotionVector(decoys, BoundaryArtifactMode::kBalanced, why) && decoys == decoy_source,
+        "commented native direction cannot authorize boundary injection");
+
   why.clear();
   Check(!internal::RewriteMotionVector(off, BoundaryArtifactMode::kOff, why),
         "double legacy rewrite rejected");
@@ -243,14 +257,14 @@ int main() {
   Check(!internal::RewriteMotionVector(
             ambiguous_divisor, BoundaryArtifactMode::kBalanced, why),
         "ambiguous divisor anchor rejected");
-  Check(why == "required PTX anchor is ambiguous", "ambiguous divisor reason");
+  Check(why == "motion-vector divisor load is ambiguous", "ambiguous divisor reason");
 
   why.clear();
   std::string ambiguous = MotionFixture() + internal::kMotionRegisterAnchor;
   Check(!internal::RewriteMotionVector(
             ambiguous, BoundaryArtifactMode::kBalanced, why),
         "ambiguous register anchor rejected");
-  Check(why == "required PTX anchor is ambiguous", "ambiguous anchor reason");
+  Check(why.find("declaration") != why.npos, "ambiguous anchor reason");
 
   why.clear();
   std::string missing = MotionFixture();

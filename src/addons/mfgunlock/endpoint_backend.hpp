@@ -36,7 +36,10 @@ inline bool Matches(std::span<const unsigned char> bytes, const Region& region) 
              region.hash;
 }
 
-inline bool QualifiedCode(std::span<const unsigned char> image, uint32_t timestamp) {
+// Offline historical-corpus diagnostics only. Runtime preparation uses the
+// location-independent structural plan below; these fingerprints are never
+// an admission condition for a loaded provider.
+inline bool ReferenceCodeFingerprint(std::span<const unsigned char> image, uint32_t timestamp) {
   if (timestamp != kTimestamp || image.size() != kImageBytes) return false;
   for (const auto& region : kCode) {
     if (region.rva > image.size() || region.bytes > image.size() - region.rva ||
@@ -55,7 +58,7 @@ inline bool QualifiedCode(std::span<const unsigned char> image, uint32_t timesta
   return true;
 }
 
-inline bool PreparedPayload(std::span<const unsigned char> before,
+inline bool ReferencePreparedPayload(std::span<const unsigned char> before,
                             std::span<const unsigned char> after, const Region& region) {
   if (!Matches(before, region) || after.size() != before.size()) return false;
   std::vector<fatbin::Entry> entries;
@@ -346,11 +349,7 @@ inline bool PtxHasEntry(std::span<const unsigned char> container, unsigned targe
   }
   if (!selected) return false;
   std::vector<unsigned char> raw;
-  if (selected->compressed_bytes) {
-    raw.resize(selected->unpacked_bytes);
-    if (!fatbin::Lz4BlockDecompress(container.data()+selected->PayloadOffset(),
-          selected->compressed_bytes,raw.data(),raw.size())) return false;
-  } else raw.assign(container.begin()+selected->PayloadOffset(),container.begin()+selected->End());
+  if (!fatbin::DecodePtx(container, *selected, raw)) return false;
   const auto nul=std::find(raw.begin(),raw.end(),0);
   if (nul==raw.end()) return false;
   std::string text(reinterpret_cast<const char*>(raw.data()),static_cast<size_t>(nul-raw.begin()));
@@ -374,13 +373,36 @@ inline bool PtxHasEntry(std::span<const unsigned char> container, unsigned targe
   }
   if (comment || quoted) return false;
   // Entry declaration, not a match against a filename or arbitrary label.
-  const std::string pattern = ".entry " + std::string(name);
+  constexpr std::string_view pattern = ".entry";
   size_t matches=0;
   for (size_t at=0;(at=text.find(pattern,at))!=text.npos;at+=pattern.size()) {
-    const auto pos=at+pattern.size();
-    if (pos<text.size() && (text[pos]=='(' || text[pos]==' ' || text[pos]=='\n')) ++matches;
+    auto pos=at+pattern.size();
+    const auto whitespace=[](char c){return c==' '||c=='\t'||c=='\r'||c=='\n';};
+    if(pos==text.size()||!whitespace(text[pos]))continue;
+    while(pos<text.size()&&whitespace(text[pos]))++pos;
+    if(std::string_view(text).substr(pos,name.size())!=name)continue;
+    pos+=name.size();while(pos<text.size()&&whitespace(text[pos]))++pos;
+    if(pos<text.size()&&text[pos]=='(')++matches;
   }
   return matches==1;
+}
+
+// Source-side loader proof follows the actual PTX inventory. A source SM89
+// constant would veto otherwise identical SM90/120 producers before the
+// generic retargeter could make its driver-JIT attempt.
+inline bool PtxHasSourceEntry(std::span<const unsigned char> container,
+                             std::string_view name, unsigned target = 75) {
+  std::vector<fatbin::Entry> entries; size_t end = 0;
+  if (!fatbin::Parse(container, entries, end)) return false;
+  unsigned source = 0;
+  for (const auto& entry : entries) {
+    if (entry.kind != 1 || !entry.architecture) continue;
+    if (entry.architecture == target) { source = target; break; }
+    if (entry.architecture > target) {
+      if (!source || source < target || entry.architecture < source) source = entry.architecture;
+    } else if (source < target && entry.architecture > source) source = entry.architecture;
+  }
+  return source && PtxHasEntry(container, source, name);
 }
 
 inline bool LoaderPayloads(const ImageView& v, uint32_t loader,
@@ -409,7 +431,7 @@ inline bool LoaderPayloads(const ImageView& v, uint32_t loader,
       if (payload) {
         if (!length || length>fatbin::kMaxFatbinBytes || !v.InSection(payload,length,false) ||
             v.U64(payload+8)!=length-16 || name.empty() || !v.Function(called).first ||
-            (load_call && called!=load_call) || !PtxHasEntry(v.image.subspan(payload,length),89,name))
+            (load_call && called!=load_call) || !PtxHasSourceEntry(v.image.subspan(payload,length),name))
           return false;
         if (refs.size()>=512 || std::any_of(refs.begin()+initial,refs.end(),
              [&](const auto& r){return r.rva==payload && r.entry_name==name;})) return false;

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Read-only local provider trials. Return reports, NEVER DLLs or mapped bytes.
+"""Read-only local provider trials. Reports contain no complete DLL/mapped image.
 
 Reuses compatibility_corpus.PEView and the production C++ preparation probe.
 Each DLL is processed sequentially in a separate child; no vendor code executes.
+Preset reports may contain bounded code excerpts for diagnosing an unresolved reader.
 """
 from __future__ import annotations
 import argparse
@@ -15,6 +16,43 @@ import sys
 import zipfile
 import compatibility_corpus as c
 
+
+
+def preset_source_id(root: Path | None = None) -> str:
+    root = root or Path(__file__).resolve().parents[1]
+    paths = list((root / 'src/addons/mfgunlock').rglob('*.hpp'))
+    for ext in ('*.h', '*.hpp'):
+        paths.extend((root / 'contrib/validation/tests/provider_mocks').rglob(ext))
+    paths.extend([root / 'contrib/validation/tools/probe_fg_preset.cpp',
+                  root / 'contrib/validation/tests/fg_preset_mocks/ngx_hook.hpp'])
+    lines = ''.join(f'{p.relative_to(root).as_posix()}|{hashlib.sha256(p.read_bytes()).hexdigest()}\n'
+                    for p in sorted(set(paths), key=lambda p: p.as_posix()))
+    return hashlib.sha256(lines.encode('utf-8')).hexdigest()
+
+
+def preset_trial(path: Path, probe: Path) -> dict:
+    """Inspect only the current preset reader; no provider preparation or DLL execution."""
+    from collect_mfg_gate_evidence import map_pe
+    raw = c.read_file(path)
+    before = hashlib.sha256(raw).hexdigest()
+    image, metadata = map_pe(raw)
+    observations = []
+    for _ in range(2):
+        run = subprocess.run([str(probe)], input=image, capture_output=True, timeout=90, check=False)
+        if run.returncode or len(run.stdout) > 4 * 1024 * 1024:
+            raise RuntimeError(f'preset probe failed {run.returncode}: ' + run.stderr.decode(errors='replace')[-2048:])
+        observation = json.loads(run.stdout)
+        if observation.get('compiled_source_id') != preset_source_id():
+            raise ValueError('stale preset probe: compiled source identity mismatch')
+        if observation.get('vendor_code_executed') is not False or observation.get('input_unchanged') is not True:
+            raise ValueError('preset inspection violated read-only invariant')
+        observations.append(observation)
+    if observations[0] != observations[1]:
+        raise ValueError('non-deterministic preset inspection')
+    if hashlib.sha256(c.read_file(path)).hexdigest() != before:
+        raise ValueError('provider changed during read-only inspection')
+    return {'path': str(path), 'sha256': before, 'file_bytes': len(raw), 'metadata': metadata,
+            'preset': observations[0], 'deterministic_two_processes': True}
 
 def trial(path: Path, probe: Path, architecture: str = 'Ampere') -> dict:
     data=c.read_file(path)
@@ -58,11 +96,17 @@ def trial(path: Path, probe: Path, architecture: str = 'Ampere') -> dict:
 
 def main() -> int:
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--probe',type=Path,required=True)
+    ap.add_argument('--probe',type=Path)
+    ap.add_argument('--preset-probe',type=Path,help='read-only production preset resolver')
+    ap.add_argument('--preset-only',action='store_true',help='inspect preset readers instead of base preparation')
     ap.add_argument('--corpus-root',type=Path)
     ap.add_argument('--provider',type=Path,action='append',default=[])
     ap.add_argument('--out',type=Path,required=True)
     args=ap.parse_args()
+    if args.preset_only:
+        if not args.preset_probe or not args.preset_probe.is_file(): ap.error('--preset-only requires --preset-probe')
+    elif not args.probe or not args.probe.is_file(): ap.error('base preparation requires --probe')
+    if args.preset_probe and not args.preset_probe.is_file(): ap.error('missing preset probe')
     if args.out.exists() and any(args.out.iterdir()):ap.error('output directory must be empty/new')
     args.out.mkdir(parents=True,exist_ok=True)
     paths=list(args.provider)
@@ -72,8 +116,16 @@ def main() -> int:
     rows=[]; errors=[]
     for i,path in enumerate(paths,1):
         try:
-            row=trial(path,args.probe.resolve())
-            print(f'[{i}/{len(paths)}] prepared={row["trial"]["trial_prepared"]}: {path}',flush=True)
+            if args.preset_only:
+                row=preset_trial(path,args.preset_probe.resolve())
+            else:
+                row=trial(path,args.probe.resolve())
+                if args.preset_probe:
+                    row['preset']=preset_trial(path,args.preset_probe.resolve())['preset']
+            if args.preset_only:
+                print(f'[{i}/{len(paths)}] reader_resolved={row["preset"]["reader_resolved"]} (NOT GPU): {path}',flush=True)
+            else:
+                print(f'[{i}/{len(paths)}] prepared={row["trial"]["trial_prepared"]}: {path}',flush=True)
         except (OSError,ValueError,RuntimeError,subprocess.SubprocessError) as e:
             row={'path':str(path),'test_error':str(e)}; errors.append(row)
             print(f'[{i}/{len(paths)}] TEST_ERROR: {path}: {e}',flush=True)
@@ -82,10 +134,19 @@ def main() -> int:
             'runtime_gpu_tested':False,'dll_files_included':False,'inputs':len(rows),
             'prepared_trials':sum(r.get('trial',{}).get('trial_prepared',False) for r in rows),
             'test_errors':errors,'libraries':rows}
-    report['probe_sha256']=hashlib.sha256(args.probe.read_bytes()).hexdigest()
+    report['probe_sha256']=hashlib.sha256(args.probe.read_bytes()).hexdigest() if args.probe else None
+    if args.preset_probe:
+        report['preset_probe_sha256']=hashlib.sha256(args.preset_probe.read_bytes()).hexdigest()
+        report['preset_compiled_source_id']=preset_source_id()
+        report['preset_readers_resolved']=sum(r.get('preset',{}).get('reader_resolved',False) for r in rows)
+    if args.preset_only:
+        report['schema']='mfg_preset_trials_r6_3'
+        report['scope']='OFFLINE_PRESET_READER_INSPECTION_ONLY_NOT_GPU'
+        report['base_preparation_tested']=False
     report['tool_sha256']=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-    report['probe_source_sha256']=hashlib.sha256((Path(__file__).resolve().parents[1]/
+    report['probe_source_sha256']=(hashlib.sha256((Path(__file__).resolve().parents[1]/
         'contrib/validation/tools/probe_provider_trial.cpp').read_bytes()).hexdigest()
+        if not args.preset_only else None)
     report['source_sha256']={str(p.relative_to(Path(__file__).resolve().parents[1])):hashlib.sha256(p.read_bytes()).hexdigest()
         for p in sorted((Path(__file__).resolve().parents[1]/'src/addons/mfgunlock').glob('*')) if p.is_file()}
     output=args.out/'provider_trials.json'

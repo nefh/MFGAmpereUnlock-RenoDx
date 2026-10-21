@@ -95,11 +95,20 @@ python tools/validate_mfg_diagnostics_capture.py <bundle-directory>
 8. The paths are shown in the panel and are written under
    `%TEMP%\MFGUnlock-Diagnostics`.
 
-The panel can also arm a one-shot **Dynamic MFG capability probe**. If the game
-already requests a current `DLSSGState`, support is observed passively. For an
-older state ABI, the next game-side `slDLSSGGetState` call triggers one extra
-query into addon-owned current-version storage on the same thread. The game's
-state and result are not changed.
+The panel can also arm a one-shot **Dynamic MFG capability probe**. The next
+game-side `slDLSSGGetState` call triggers one extra v4 query into addon-owned
+storage on the same thread and viewport, including when the game already uses
+v4. This also applies to Vulkan when a current typed getter is available. The
+query distinguishes native true, false, an unwritten capability field, and a
+native error. It does not issue a Dynamic setter. Presentation counts consumed
+by the extra query are carried into the matching successful game query; the
+original native result is preserved. Unknown caller tails and extension chains
+are never replayed as an enlarged structure.
+
+R6 can discover an interposer under a changed filename from its own executable
+modern resolver. An initial or changed-load module inventory is deferred to
+lifecycle callbacks outside loader initialization. Stable polling does not
+repeat that inventory.
 
 Send the schema-2 bundle, legacy JSON and `ReShade.log` from the same run. Remove
 the companion and restart before performance or frame-pacing measurements. Do
@@ -124,9 +133,17 @@ and the export reports that explicitly.
 
 ## Build
 
+For the API-specific R6 package, follow the companion build block in its
+`README_R6_PL.md`. The main `build_mfgunlock.ps1` helper selects ReShade,
+matching ImGui and dependency include paths through temporary `CL` options
+and restores that environment when it exits. A later standalone CMake build
+does not automatically inherit those options. The R6 instructions reuse the
+actual options calculated by the unchanged helper.
+
 Copy this folder beside `src/addons/mfgunlock` in the RenoDX tree. RenoDX creates
 addon targets from `src/**/**/addon.cpp`, so no CMake changes are required.
-Configure once after adding the new folder, then build `mfgdiagnostics`:
+With the required compiler include/SDK environment active, configure once after
+adding the new folder, then build `mfgdiagnostics`:
 
 ```powershell
 cmake --preset vs-x64
@@ -158,3 +175,42 @@ Configuration bits: temporal=0, ISR=1, Boundary=2..3, Warp=4, Warp mode=5..6.
 There is no `quality_reconfigure_commit` event in this implementation. A successful
 Release/Create is observed but does not prove CUDA module retirement or authorize
 live kernel replacement. The validator rejects invented cache-retirement claims.
+
+## Optional HUD tag audit (migration from HUDTRACE-D1)
+
+The existing **MFG Diagnostics** addon now enriches its schema-2 `resource_tag`
+entries with an observed tag role (`HUDLessColor`, `UIAlpha`,
+`UIColorAndAlpha`), lifecycle, resource-field presence, resource extent,
+resource identity and tracked D3D12 descriptor when available. The existing
+`frame_id`, viewport, CPU-side result and QPC sequence are unchanged.
+
+A compact `hud_tag_observations` section in `summary.json` counts active/clear
+calls, API failures, tag resource transitions, events lacking a reliable
+native identity and frame-scoped pairs. It runs **only during Stop & export**
+on the already bounded event stream. No new capture hook, sampling mode,
+background CSV logging, GPU reads or main-add-on dependency is introduced.
+The legacy schema-1 export retains its prior fields.
+
+For offline analysis of one or two schema-2 bundles:
+
+```powershell
+$Repo = "$env:USERPROFILE\Downloads\MFGAmpereUnlock-source"
+$Python = "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
+& $Python "$Repo\tools\diagnostics\analyze_mfgdiagnostics_hud.py" `
+    "C:\path\to\first-bundle" "C:\path\to\second-bundle" `
+    --out "$Repo\validation-logs\hud-comparison.json"
+```
+
+A one-bundle run is also supported. Old HUDTRACE-D1 CSVs remain readable using
+`tools/diagnostics/legacy/analyze_hudtrace_d1.py`; they are not emitted by the
+production addon anymore. The old continuous HUDTRACE ring and CSV writer
+are deliberately *not* part of MFG Diagnostics.
+
+**Limitations:** Observing a complete pair does not verify pixels, render
+ordering or Streamline presentation. Legacy `slSetTag` has no frame token;
+those tags are never classified as missing per-frame. Resource pointer
+changes are descriptive, not automatically errors. Capture truncation and
+nonzero dropped-event counters make negative conclusions unsafe. The location
+of a hook in a chain of addons may not expose both an original call and its
+post-filtered equivalent; this optional addon does not claim to compare both
+sides of another addon's private hook.

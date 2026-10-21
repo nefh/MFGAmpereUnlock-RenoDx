@@ -2,9 +2,9 @@
  * Validated Warp Blend provider patch.
  * SPDX-License-Identifier: MIT
  *
- * Cross-generation Validated Warp Blend path for the exact 310.9.1 provider.
- * The same qualified Blackwell PTX is rebuilt for native Ada sm_89 or the
- * Ampere/Turing sm_86/sm_75 backends; provider retargeting remains separate.
+ * Cross-generation Validated Warp Blend. Kernel roles, parameter layouts and
+ * local operands are resolved from the actual provider payload; historical
+ * whole-file/PTX fingerprints are diagnostic only. Native JIT decides support.
  */
 
 #pragma once
@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <sstream>
 #include <span>
 #include <string>
@@ -83,7 +84,7 @@ constexpr uint32_t kAmpereArch = 86;
 constexpr uint32_t kAdaArch = 89;
 constexpr uint32_t kBlackwellArch = 120;
 constexpr uint64_t kUncompressedFlags = 0x41;
-constexpr size_t kMaxFatbinSize = 4u * 1024u * 1024u;
+constexpr size_t kMaxFatbinSize = fatbin::kMaxFatbinBytes - kOuterHeader;
 
 using ProviderProfile = profiles::ProviderProfile;
 using PtxProfile = profiles::PtxProfile;
@@ -173,20 +174,140 @@ inline bool ReplaceOnce(std::string& text, const std::string& needle,
   return true;
 }
 
+inline bool MaskPtx(std::string_view input, std::string& code);
+
+// Resolve a real register-array declaration without relying on the producer's
+// whitespace, indentation or historical register count. Input is masked code.
+inline bool QualityRegisterLimit(std::string_view code, std::string_view type,
+                                  std::string_view prefix, unsigned& limit, size_t& end) {
+  size_t matches = 0;
+  for (size_t at = 0; (at = code.find(".reg", at)) != code.npos; at += 4) {
+    size_t cursor = at + 4;
+    const auto whitespace = [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; };
+    if (cursor == code.size() || !whitespace(code[cursor])) continue;
+    const auto skip = [&] { while (cursor < code.size() && whitespace(code[cursor])) ++cursor; };
+    skip();
+    if (code.substr(cursor, type.size()) != type) continue;
+    cursor += type.size();
+    if (cursor == code.size() || !whitespace(code[cursor])) continue;
+    skip();
+    if (code.substr(cursor, prefix.size()) != prefix) continue;
+    cursor += prefix.size(); skip();
+    if (cursor == code.size() || code[cursor++] != '<') continue;
+    skip(); unsigned count = 0;
+    const auto parsed = std::from_chars(code.data() + cursor, code.data() + code.size(), count);
+    if (parsed.ec != std::errc{} || !count) return false;
+    cursor = static_cast<size_t>(parsed.ptr - code.data()); skip();
+    if (cursor == code.size() || code[cursor++] != '>') return false;
+    skip(); if (cursor == code.size() || code[cursor++] != ';') return false;
+    // Inserting after the declaration must start a new source statement.
+    if (cursor < code.size() && code[cursor] == '\n') ++cursor;
+    if (++matches != 1) return false;
+    limit = count; end = cursor;
+  }
+  return matches == 1;
+}
+
+// Rewrites consume existing SSA-like PTX registers. Prove declarations and a
+// native definition before the insertion, instead of treating a whole-source
+// hash as proof of those local facts. Only instruction destinations qualify;
+// comments, declarations and mere operand mentions do not.
+inline bool LocalOperandsDefined(std::string_view source, size_t before,
+                                 std::span<const std::string_view> operands,
+                                 std::string& why) {
+  std::string code;
+  if (!MaskPtx(source, code) || before > code.size()) {
+    why = "quality PTX lexical structure is invalid"; return false;
+  }
+  for (const auto operand : operands) {
+    size_t number_at = operand.size();
+    while (number_at && operand[number_at - 1] >= '0' && operand[number_at - 1] <= '9') --number_at;
+    if (number_at == operand.size()) { why = "quality operand is not a numbered register"; return false; }
+    unsigned number = 0;
+    auto digits = operand.substr(number_at);
+    const auto parsed = std::from_chars(digits.data(), digits.data() + digits.size(), number);
+    const auto prefix = operand.substr(0, number_at);
+    const auto type = prefix == "%f" ? ".f32" : prefix == "%p" ? ".pred" :
+        prefix == "%r" ? ".b32" : prefix == "%rs" ? ".b16" : prefix == "%rd" ? ".b64" : "";
+    unsigned limit = 0; size_t declaration_end = 0;
+    if (parsed.ec != std::errc{} || !*type ||
+        !QualityRegisterLimit(code, type, prefix, limit, declaration_end) ||
+        number >= limit || declaration_end > before) {
+      why = "quality operand has no unique in-range declaration: " + std::string(operand); return false;
+    }
+    bool defined = false;
+    for (size_t at = declaration_end; at < before;) {
+      const auto nl = code.find('\n', at);
+      const auto end = std::min(before, nl == code.npos ? code.size() : nl);
+      auto line = ptx::Trim(std::string_view(code).substr(at, end - at));
+      while (!line.empty() && (line.front() == '{' || line.front() == '}')) line = ptx::Trim(line.substr(1));
+      if (line.starts_with("@")) {
+        const auto pred = line.find_first_of(" \t");
+        if (pred == line.npos) { at = end + 1; continue; }
+        line = ptx::Trim(line.substr(pred));
+      }
+      const auto opcode_end = line.find_first_of(" \t");
+      if (opcode_end != line.npos && !line.starts_with(".") && !line.starts_with("st.") &&
+          !line.starts_with("bra") && !line.starts_with("ret") && !line.starts_with("call")) {
+        auto destination = ptx::Trim(line.substr(opcode_end));
+        if (destination.starts_with("{")) {
+          const auto close = destination.find('}');
+          if (close != destination.npos) destination = destination.substr(1, close - 1);
+        } else destination = destination.substr(0, destination.find_first_of(",;"));
+        size_t pos = 0;
+        while ((pos = destination.find(operand, pos)) != destination.npos) {
+          const auto stop = pos + operand.size();
+          const auto token = [](char c) { return (c >= '0' && c <= '9') ||
+              (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; };
+          if ((pos == 0 || !token(destination[pos - 1])) &&
+              (stop == destination.size() || !token(destination[stop]))) { defined = true; break; }
+          pos = stop;
+        }
+      }
+      at = end + 1;
+    }
+    if (!defined) { why = "quality operand has no native definition before insertion: " +
+        std::string(operand); return false; }
+  }
+  return true;
+}
+
+inline std::string FreshRegisterPrefix(std::string_view source, std::string prefix) {
+  while (source.find(prefix) != source.npos) prefix += "_r6";
+  return prefix;
+}
+
+inline void RenameGeneratedPrefix(std::string& text, std::string_view from,
+                                  std::string_view to) {
+  if (from == to) return;
+  for (size_t at = 0; (at = text.find(from, at)) != text.npos;) {
+    text.replace(at, from.size(), to); at += to.size();
+  }
+}
+
 inline bool RewriteValidatedWarpBlend(std::string& ptx, std::string& why) {
   if (ptx.find("MFGUNLOCK_VALIDATED_WARP_BLEND_V1") != std::string::npos) {
     why = "validated-warp PTX is already modified";
     return false;
   }
-  constexpr char kRegisters[] = ".reg .pred %p<260>;\n";
-  if (!ReplaceOnce(ptx, kRegisters,
-                   std::string(kRegisters) + ".reg .pred %qv<7>;\n"
-                                             ".reg .f32 %qf<12>;\n",
-                   why)) {
+  constexpr char kInsertion[] = "ld.param.u8 %rs8, [%rd6+220];\n";
+  std::string code;
+  if (!MaskPtx(ptx, code)) { why = "quality PTX lexical structure is invalid"; return false; }
+  const auto insertion = code.find(kInsertion);
+  if (insertion == code.npos || code.find(kInsertion, insertion + 1) != code.npos) {
+    why = insertion == ptx.npos ? "required PTX anchor is missing" : "required PTX anchor is ambiguous";
     return false;
   }
-
-  constexpr char kInsertion[] = "ld.param.u8 %rs8, [%rd6+220];\n";
+  constexpr std::string_view operands[] = {
+      "%r10", "%r11", "%p16", "%p17", "%f115", "%f116", "%f117", "%f119", "%f120", "%f121",
+      "%f123", "%f124", "%f125", "%f126", "%f127", "%f129", "%f130", "%f131", "%f132", "%f133",
+      "%f148", "%f149", "%f39", "%f38", "%f37", "%f43", "%f42", "%f41"};
+  if (!LocalOperandsDefined(ptx, insertion, operands, why)) return false;
+  const auto qv = FreshRegisterPrefix(ptx, "%qv"), qf = FreshRegisterPrefix(ptx, "%qf");
+  unsigned predicates = 0; size_t declaration_end = 0;
+  if (!QualityRegisterLimit(code, ".pred", "%p", predicates, declaration_end)) {
+    why = "quality predicate declaration is ambiguous"; return false;
+  }
   constexpr char kProgram[] = R"ptx(// MFGUNLOCK_VALIDATED_WARP_BLEND_V1
 cvt.rn.f32.u32 %qf0, %r10;
 cvt.rn.f32.u32 %qf1, %r11;
@@ -274,7 +395,12 @@ sub.f32 %qf4, %f133, %f121;
 @%qv1 fma.rn.f32 %f42, %qf1, %qf3, %f120;
 @%qv1 fma.rn.f32 %f41, %qf1, %qf4, %f121;
 )ptx";
-  return ReplaceOnce(ptx, kInsertion, std::string(kProgram) + kInsertion, why);
+  std::string result = ptx;
+  std::string program = kProgram;
+  RenameGeneratedPrefix(program, "%qv", qv); RenameGeneratedPrefix(program, "%qf", qf);
+  result.insert(insertion, program);
+  result.insert(declaration_end, "\n.reg .pred " + qv + "<7>;\n.reg .f32 " + qf + "<12>;\n");
+  ptx.swap(result); return true;
 }
 
 inline const ProviderProfile* MatchProvider(const provider::internal::ImageIdentity& identity) {
@@ -287,72 +413,111 @@ inline const ProviderProfile* MatchProvider(const provider::internal::ImageIdent
   return nullptr;
 }
 
-inline bool FindPtxEntry(const uint8_t* fatbin, size_t fatbin_size,
-                         const PtxProfile& profile, size_t& entry_offset,
-                         std::vector<uint8_t>& ptx, std::string& why) {
-  if (fatbin_size < kOuterHeader || ReadU32(fatbin) != kFatbinMagic ||
-      ReadU16(fatbin + 6) != kOuterHeader ||
-      ReadU64(fatbin + 8) + kOuterHeader != fatbin_size) {
-    why = "invalid fatbin header";
-    return false;
+// Mask comments and strings before resolving semantic entry/header anchors.
+// Keep source positions: the returned offsets always address the original text.
+inline bool MaskPtx(std::string_view input, std::string& code) {
+  code.clear(); code.reserve(input.size());
+  bool block = false;
+  for (size_t at = 0; at < input.size();) {
+    const auto nl = input.find('\n', at);
+    const auto end = nl == input.npos ? input.size() : nl;
+    std::string line;
+    if (!ptx::internal::CodeLine(input.substr(at, end - at), block, line)) return false;
+    line.resize(end - at, ' ');
+    code += line;
+    if (nl != input.npos) code += '\n';
+    at = end + (nl != input.npos);
   }
-  size_t cursor = kOuterHeader;
-  while (cursor + 64 <= fatbin_size) {
-    const uint32_t header = ReadU32(fatbin + cursor + 4);
-    const uint64_t payload = ReadU64(fatbin + cursor + 8);
-    if (header < 64 || payload == 0 || cursor + header + payload > fatbin_size) {
-      why = "invalid fatbin entry";
-      return false;
-    }
-    if (ReadU16(fatbin + cursor) == kPtxKind &&
-        ReadU32(fatbin + cursor + 28) == profile.arch) {
-      const uint32_t compressed = ReadU32(fatbin + cursor + 16);
-      const uint64_t raw = ReadU64(fatbin + cursor + 56);
-      if ((profile.declared_raw_size != 0 && raw != profile.declared_raw_size) ||
-          compressed == 0 || compressed > payload || raw > (8u << 20)) {
-        why = "PTX size/compression does not match the supported profile";
-        return false;
-      }
-      ptx.resize(static_cast<size_t>(raw));
-      if (!Lz4BlockDecompress(fatbin + cursor + header, compressed,
-                              ptx.data(), ptx.size())) {
-        why = "PTX LZ4 decompression failed";
-        return false;
-      }
-      ptx.erase(std::remove(ptx.begin(), ptx.end(), '\r'), ptx.end());
-      while (!ptx.empty() && ptx.back() == 0) ptx.pop_back();
-      if (ptx.size() != profile.normalized_size ||
-          Fnv1a64(ptx.data(), ptx.size()) != profile.raw_fnv1a64) {
-        why = "PTX identity hash does not match the supported profile";
-        return false;
-      }
-      const std::string text(reinterpret_cast<const char*>(ptx.data()), ptx.size());
-      const std::string entry = std::string(".entry ") + profile.entry_name + "(";
-      if (text.find(entry) == std::string::npos ||
-          text.find(profile.parameter_signature) == std::string::npos) {
-        why = "PTX entry or parameter layout changed";
-        return false;
-      }
-      entry_offset = cursor;
-      return true;
-    }
-    cursor += header + static_cast<size_t>(payload);
-  }
-  why = "required PTX architecture entry is missing";
-  return false;
+  return !block;
 }
 
-inline bool ValidatePristineLayout(const uint8_t* fatbin, size_t fatbin_size,
+inline std::string CompactCode(std::string_view code) {
+  std::string compact;
+  for (const auto c : code)
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') compact += c;
+  return compact;
+}
+
+inline bool TargetDirective(std::string_view code, size_t& offset, size_t& bytes,
+                            uint32_t& architecture) {
+  size_t matches = 0;
+  for (size_t at = 0; at < code.size();) {
+    const auto nl = code.find('\n', at);
+    const auto end = nl == code.npos ? code.size() : nl;
+    auto line = ptx::Trim(code.substr(at, end - at));
+    if (line.starts_with(".target") && line.size() > 7 &&
+        (line[7] == ' ' || line[7] == '\t')) {
+      auto token = ptx::Trim(line.substr(7));
+      token = token.substr(0, token.find_first_of(", \t"));
+      if (!token.starts_with("sm_") || token.size() <= 3 || ++matches != 1) return false;
+      const auto number = token.substr(3);
+      const auto parsed = std::from_chars(number.data(), number.data() + number.size(), architecture);
+      if (parsed.ec != std::errc{} || parsed.ptr != number.data() + number.size() || architecture == 0)
+        return false;
+      offset = static_cast<size_t>(token.data() - code.data()); bytes = token.size();
+    }
+    at = end + 1;
+  }
+  return matches == 1;
+}
+
+inline bool FindPtxEntry(const uint8_t* fatbin, size_t fatbin_size,
+                         const PtxProfile& profile, size_t& entry_offset,
+                         std::vector<uint8_t>& source, std::string& why) {
+  source.clear();
+  std::vector<fatbin::Entry> entries;
+  size_t end = 0;
+  if (!fatbin || !fatbin::Parse({fatbin, fatbin_size}, entries, end) || end != fatbin_size) {
+    why = "invalid fatbin header or entry bounds"; return false;
+  }
+  uint32_t selected_arch = 0;
+  size_t matches = 0;
+  for (const auto& candidate : entries) {
+    if (candidate.kind != kPtxKind) continue;
+    std::vector<unsigned char> raw;
+    if (!fatbin::DecodePtx({fatbin, fatbin_size}, candidate, raw)) continue;
+    const auto nul = std::find(raw.begin(), raw.end(), 0);
+    if (nul == raw.end() || nul == raw.begin() ||
+        std::any_of(nul, raw.end(), [](unsigned char c) { return c != 0; })) continue;
+    std::string text(raw.begin(), nul);
+    std::erase(text, '\r');
+    std::string code;
+    if (!MaskPtx(text, code)) continue;
+    const auto compact = CompactCode(code);
+    const std::string entry = std::string(".entry") + profile.entry_name + "(";
+    const auto start = compact.find(entry);
+    if (start == compact.npos || compact.find(entry, start + entry.size()) != compact.npos) continue;
+    // A role source preserves its own parameter ABI. A local rewrite proves
+    // its actual parameter accesses/operands separately; register numbering or
+    // historical parameter-buffer size is never a whole-kernel admission rule.
+    size_t target_at = 0, target_bytes = 0;
+    uint32_t source_arch = 0;
+    if (!TargetDirective(code, target_at, target_bytes, source_arch) || source_arch != candidate.architecture)
+      continue;
+    // Prefer the most capable actual source for this role. Duplicate same-SM
+    // implementations remain ambiguous; older sources are not refused by ID.
+    if (source_arch < selected_arch) continue;
+    if (source_arch > selected_arch) { selected_arch = source_arch; matches = 0; }
+    ++matches;
+    entry_offset = candidate.offset;
+    source.assign(text.begin(), text.end());
+  }
+  if (matches != 1) {
+    why = matches ? "PTX role has multiple same-target implementations" : "PTX role/parameter contract not resolved";
+    source.clear(); return false;
+  }
+  why.clear(); return true;
+}
+
+inline bool ValidatePristineLayout(const uint8_t* bytes, size_t count,
                                    size_t target_entry, std::string& why) {
   std::vector<fatbin::Entry> entries;
   size_t end = 0;
-  if (!fatbin::Parse(std::span<const unsigned char>(fatbin, fatbin_size), entries, end) ||
-      end != fatbin_size || entries.size() != 3 ||
-      entries[0].offset != target_entry || entries[0].kind != kPtxKind ||
-      entries[0].architecture != kBlackwellArch ||
-      entries[1].kind != kPtxKind || entries[1].architecture != kAdaArch ||
-      entries[2].kind != 2 || entries[2].architecture != kAdaArch) {
-    why = "provider fatbin was already retargeted or selectable image layout changed";
+  if (!bytes || !fatbin::Parse({bytes, count}, entries, end) || end != count ||
+      std::count_if(entries.begin(), entries.end(), [&](const auto& entry) {
+        return entry.offset == target_entry && entry.kind == kPtxKind;
+      }) != 1) {
+    why = "selected PTX entry is not uniquely bounded by its container";
     return false;
   }
   return true;
@@ -360,67 +525,70 @@ inline bool ValidatePristineLayout(const uint8_t* fatbin, size_t fatbin_size,
 
 using RewritePtxCallback = bool (*)(std::string&, std::string&);
 
-inline bool BuildRetargetedFatbin(const uint8_t* fatbin, size_t fatbin_size,
+inline bool BuildRetargetedFatbin(const uint8_t* bytes, size_t count,
                                    const PtxProfile& profile, RewritePtxCallback rewrite,
                                    std::vector<uint8_t>& rebuilt,
                                    std::string& why, uint32_t target_sm = kAmpereArch) {
-  if (target_sm != 75 && target_sm != kAmpereArch && target_sm != kAdaArch) {
-    why = "unsupported quality PTX target";
-    return false;
-  }
-  size_t entry = 0;
+  rebuilt.clear();
+  if (target_sm == 0) { why = "quality PTX target is unknown"; return false; }
+  size_t selected = 0;
   std::vector<uint8_t> source;
-  if (!FindPtxEntry(fatbin, fatbin_size, profile, entry, source, why)) return false;
-  // Build from the pristine 310.9.1 image set before provider retargeting, so
-  // the replacement has one selectable sm_86 program instead of inheriting a
-  // second retargeted sm_86 PTX image.
-  if (!ValidatePristineLayout(fatbin, fatbin_size, entry, why)) return false;
-  std::string ptx(reinterpret_cast<const char*>(source.data()), source.size());
-  if (rewrite != nullptr && !rewrite(ptx, why)) return false;
-  size_t packed_count = 0;
-  if (profile.raw_fnv1a64 == 0x9b47635b91b2436bull && profile.normalized_size == 23116u)
-    packed_count = 8;
-  if (profile.raw_fnv1a64 == kPtxProfile.raw_fnv1a64 &&
-      profile.normalized_size == kPtxProfile.normalized_size) packed_count = 20;
-  if (!ptx::LowerPackedHalf(ptx, target_sm, packed_count, why)) return false;
-  if (!ReplaceOnce(ptx, ".target sm_120", ".target sm_" + std::to_string(target_sm), why))
-    return false;
+  if (!FindPtxEntry(bytes, count, profile, selected, source, why) ||
+      !ValidatePristineLayout(bytes, count, selected, why)) return false;
+  std::string text(source.begin(), source.end());
+  if (rewrite && !rewrite(text, why)) return false;
+  if (target_sm == 75) {
+    ptx::Sm75LoweringCounts actual;
+    // The transformer is transactional. A valid spelling it cannot rewrite
+    // remains intact for an empirical JIT attempt; no count/hash admission.
+    if (!ptx::LowerSm75Structurally(text, actual, why)) why.clear();
+  }
+  std::string code;
+  size_t target_at = 0, target_bytes = 0;
+  uint32_t source_arch = 0;
+  if (!MaskPtx(text, code) || !TargetDirective(code, target_at, target_bytes, source_arch)) {
+    why = "quality PTX has no unique target directive"; return false;
+  }
+  text.replace(target_at, target_bytes, "sm_" + std::to_string(target_sm));
+  if (text.size() + 1 > fatbin::kMaxPtxBytes) { why = "replacement PTX exceeds storage budget"; return false; }
 
-  const uint32_t header = ReadU32(fatbin + entry + 4);
-  const uint64_t original_payload64 = ReadU64(fatbin + entry + 8);
-  if (original_payload64 > fatbin_size - entry - header) {
-    why = "target PTX entry extends beyond its fatbin";
-    return false;
+  std::vector<fatbin::Entry> entries;
+  size_t end = 0;
+  if (!fatbin::Parse({bytes, count}, entries, end)) { why = "fatbin changed during rebuild"; return false; }
+  rebuilt.assign(bytes, bytes + kOuterHeader);
+  for (const auto& entry : entries) {
+    if (entry.offset != selected) {
+      // Preserve other architectures verbatim. A same/older-SM PTX or cubin
+      // would bypass the requested replacement, so it is deliberately hidden.
+      if (entry.architecture <= target_sm) continue;
+      rebuilt.insert(rebuilt.end(), bytes + entry.offset, bytes + entry.End());
+      continue;
+    }
+    const auto at = rebuilt.size();
+    const size_t padded = (text.size() + 1 + 7) & ~size_t{7};
+    rebuilt.insert(rebuilt.end(), bytes + entry.offset, bytes + entry.PayloadOffset());
+    rebuilt.resize(at + entry.header_bytes + padded, 0);
+    std::memcpy(rebuilt.data() + at + entry.header_bytes, text.data(), text.size());
+    const uint64_t stored = padded, zero64 = 0;
+    const uint32_t zero32 = 0;
+    const uint64_t flags = entry.flags & ~uint64_t{0x2000};
+    std::memcpy(rebuilt.data() + at + 8, &stored, 8);
+    std::memcpy(rebuilt.data() + at + 16, &zero32, 4);
+    std::memcpy(rebuilt.data() + at + 28, &target_sm, 4);
+    std::memcpy(rebuilt.data() + at + 40, &flags, 8);
+    std::memcpy(rebuilt.data() + at + 56, &zero64, 8);
   }
-  const size_t original_payload = static_cast<size_t>(original_payload64);
-  const size_t padded = (ptx.size() + 7u) & ~size_t{7u};
-  const size_t suffix_offset = entry + header + original_payload;
-  if (padded > std::numeric_limits<size_t>::max() -
-                   (fatbin_size - original_payload)) {
-    why = "replacement fatbin size overflow";
-    return false;
+  const uint64_t outer = rebuilt.size() - kOuterHeader;
+  std::memcpy(rebuilt.data() + 8, &outer, 8);
+  std::vector<fatbin::Entry> verified;
+  size_t verified_end = 0;
+  if (!fatbin::Parse(rebuilt, verified, verified_end) || verified_end != rebuilt.size() ||
+      std::count_if(verified.begin(), verified.end(), [&](const auto& entry) {
+        return entry.architecture == target_sm && entry.kind == kPtxKind;
+      }) != 1) {
+    rebuilt.clear(); why = "replacement fatbin selection verification failed"; return false;
   }
-  const size_t final_size = fatbin_size - original_payload + padded;
-  rebuilt.assign(fatbin, fatbin + entry + header);
-  rebuilt.resize(final_size, 0);
-  std::memcpy(rebuilt.data() + entry + header, ptx.data(), ptx.size());
-  // Preserve every entry after the replaced PTX payload. Some fatbins place
-  // architecture-specific cubins or metadata after the source entry; dropping
-  // that suffix can make a provider fail only when CUDA consumes it at startup.
-  std::memcpy(rebuilt.data() + entry + header + padded,
-              fatbin + suffix_offset, fatbin_size - suffix_offset);
-  const uint64_t payload = padded;
-  const uint32_t zero32 = 0;
-  const uint64_t zero64 = 0;
-  std::memcpy(rebuilt.data() + entry + 8, &payload, sizeof(payload));
-  std::memcpy(rebuilt.data() + entry + 16, &zero32, sizeof(zero32));
-  std::memcpy(rebuilt.data() + entry + 28, &target_sm, sizeof(target_sm));
-  std::memcpy(rebuilt.data() + entry + 40, &kUncompressedFlags,
-              sizeof(kUncompressedFlags));
-  std::memcpy(rebuilt.data() + entry + 56, &zero64, sizeof(zero64));
-  const uint64_t outer = final_size - kOuterHeader;
-  std::memcpy(rebuilt.data() + 8, &outer, sizeof(outer));
-  return true;
+  why.clear(); return true;
 }
 
 struct LocatedFatbin {
@@ -446,14 +614,12 @@ inline bool BuildRedirectControlFatbin(const LocatedFatbin& located,
   const size_t size = static_cast<size_t>(declared) + kOuterHeader;
   std::vector<fatbin::Entry> entries;
   size_t end = 0;
-  if ((target_sm != 75 && target_sm != kAmpereArch) ||
-      !fatbin::Parse(std::span<const unsigned char>(located.address, size), entries, end) ||
-      end != size || entries.size() != 2 ||
-      entries[0].kind != kPtxKind || entries[0].architecture != kBlackwellArch ||
-      entries[1].kind != kPtxKind || entries[1].architecture != target_sm) {
-    why = "prepared control fatbin does not match the normal retargeted layout";
+  if (!fatbin::Parse(std::span<const unsigned char>(located.address, size), entries, end) ||
+      end != size) {
+    why = "prepared control fatbin has invalid entry bounds";
     return false;
   }
+  (void)target_sm;
   // Match the provider's physical backing span as well as its visible header.
   // The normal retargeted path hides the trailing sm_89 cubin by shortening
   // the outer header; keeping those bytes makes pointer relocation the only change.
@@ -487,21 +653,24 @@ inline std::string DescribeFatbin(const std::vector<uint8_t>& bytes) {
 
 inline bool LocateUniqueFatbin(HMODULE module, const PtxProfile& profile,
                                LocatedFatbin& located, std::string& why) {
-  auto* base = reinterpret_cast<uint8_t*>(module);
-  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-  const size_t image_size = nt->OptionalHeader.SizeOfImage;
+  provider::internal::Image image;
+  if (!provider::internal::IsImageMapping(module) ||
+      !provider::internal::InspectImage(module, image)) {
+    why = "PTX source image is unreadable or structurally invalid"; located = {}; return false;
+  }
+  auto* base = image.base;
+  const size_t image_size = image.bytes;
   size_t matches = 0;
-  const auto* section = IMAGE_FIRST_SECTION(nt);
-  for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
-    if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
-        (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
-        section->VirtualAddress >= image_size) {
+  for (const auto& section : image.sections) {
+    if ((section.Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
+        (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
+        section.VirtualAddress >= image_size) {
       continue;
     }
     const size_t section_size = std::min<size_t>(
-        section->Misc.VirtualSize, image_size - section->VirtualAddress);
-    const uint8_t* bytes = base + section->VirtualAddress;
+        section.Misc.VirtualSize, image_size - section.VirtualAddress);
+    const uint8_t* bytes = base + section.VirtualAddress;
+    if (!provider::internal::IsReadable(bytes, section_size, module)) continue;
     for (size_t offset = 0; offset + kOuterHeader <= section_size; ++offset) {
       if (ReadU32(bytes + offset) != kFatbinMagic ||
           ReadU16(bytes + offset + 6) != kOuterHeader) {
@@ -527,7 +696,7 @@ inline bool LocateUniqueFatbin(HMODULE module, const PtxProfile& profile,
   }
   if (matches != 1) {
     std::ostringstream stream;
-    stream << "found " << matches << " exact PTX fatbins, expected one";
+    stream << "found " << matches << " structurally matching PTX fatbins, expected one";
     why = stream.str();
     located = {};
     return false;
@@ -553,24 +722,26 @@ inline bool PrepareRedirectSource(HMODULE module, const PtxProfile& profile,
   prepared.module = module;
   if (!LocateUniqueFatbin(module, profile, prepared.located, detail)) return false;
 
-  auto* base = reinterpret_cast<uint8_t*>(module);
-  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
-  const size_t image_size = nt->OptionalHeader.SizeOfImage;
+  provider::internal::Image image;
+  if (!provider::internal::InspectImage(module, image)) {
+    detail = "descriptor image changed during source resolution"; prepared = {}; return false;
+  }
+  auto* base = image.base;
+  const size_t image_size = image.bytes;
   prepared.expected = reinterpret_cast<uint64_t>(prepared.located.address);
   prepared.source_hash = Fnv1a64(prepared.located.address, prepared.located.size);
   prepared.source_rva = static_cast<size_t>(prepared.located.address - base);
 
-  const auto* section = IMAGE_FIRST_SECTION(nt);
-  for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
-    if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
-        (section->Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
-        section->VirtualAddress >= image_size) {
+  for (const auto& section : image.sections) {
+    if ((section.Characteristics & IMAGE_SCN_MEM_READ) == 0 ||
+        (section.Characteristics & IMAGE_SCN_MEM_EXECUTE) != 0 ||
+        section.VirtualAddress >= image_size) {
       continue;
     }
     const size_t section_size = std::min<size_t>(
-        section->Misc.VirtualSize, image_size - section->VirtualAddress);
-    uint8_t* bytes = base + section->VirtualAddress;
+        section.Misc.VirtualSize, image_size - section.VirtualAddress);
+    uint8_t* bytes = base + section.VirtualAddress;
+    if (!provider::internal::IsReadable(bytes, section_size, module)) continue;
     for (size_t offset = 0; offset + sizeof(uint64_t) <= section_size;
          offset += alignof(uint64_t)) {
       uint64_t value = 0;
@@ -579,10 +750,9 @@ inline bool PrepareRedirectSource(HMODULE module, const PtxProfile& profile,
         prepared.slots.push_back(reinterpret_cast<uint64_t*>(bytes + offset));
     }
   }
-  if (prepared.slots.size() != profile.descriptor_references) {
+  if (prepared.slots.empty()) {
     std::ostringstream stream;
-    stream << "found " << prepared.slots.size() << " descriptor reference(s), expected "
-           << profile.descriptor_references;
+    stream << "no materialized descriptor reference for resolved PTX payload";
     detail = stream.str();
     prepared = {};
     return false;

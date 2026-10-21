@@ -103,10 +103,16 @@ int main() {
   }
 
   for (const auto feature : kFeatures) {
-    Check(!features::Targets(nullptr, feature), "unresolved target capability fails closed");
-    Check(!features::BackendSupports(nullptr, feature),
-          "unresolved backend capability fails closed");
+    Check(features::Targets(nullptr, feature), "target parity is not a GPU admission whitelist");
+    Check(features::BackendSupports(nullptr, feature) ==
+              (feature != features::Feature::kConfidencePropagation),
+          "unknown architecture may attempt implemented shared operations");
   }
+  const ArchitectureProfile unknown{Architecture::kUnknown, ProviderBackend::kUnknown, 0, 0, 0};
+  Check(features::BackendSupports(&unknown, features::Feature::kDynamicMfg),
+        "unrecognized recipe cannot veto a typed Dynamic call");
+  Check(features::HasQualityBackend(nullptr), "shared quality operations do not require a target whitelist");
+  Check(!features::HasRetargetedQualityBackend(nullptr), "unknown GPU never invents a PTX target");
   Check(features::HasQualityBackend(&architecture::kAda),
         "native SM89 has the shared quality feature set");
   Check(!features::HasRetargetedQualityBackend(&architecture::kAda),

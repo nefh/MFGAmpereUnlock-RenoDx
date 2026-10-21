@@ -22,6 +22,12 @@ std::vector<HMODULE> g_dlssg_modules;
 unsigned refreshes=0, checks=0;
 void TryAttachRuntime() {}
 void RefreshRuntime();
+namespace mfgunlock::streamline::internal {
+inline SRWLOCK g_plugin_lock = SRWLOCK_INIT;
+struct TestGateway { mfgunlock::hook::ModuleIdentity identity{}; };
+struct TestPlugin { HMODULE module = nullptr; TestGateway gateway_hook; };
+inline std::array<TestPlugin,8> g_plugins{};
+}
 #include "addon_maintenance_seam.hpp"
 void RefreshRuntime() {
   ++refreshes;

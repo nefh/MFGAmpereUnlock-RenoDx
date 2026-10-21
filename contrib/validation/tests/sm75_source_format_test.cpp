@@ -34,7 +34,9 @@ int main(){try{
   auto malformed=Text(header+".file 1 \"broken\nret;\n");p::Plan plan;std::string reason;
   Check(p::HasTextPtxPrefix(malformed),"recognizable text still reaches real grammar validation");
   auto input=Container(malformed);
-  Check(p::Retarget(input,plan,reason,turing)==p::Result::kRejected&&reason=="SM75 unterminated quoted line","actual malformed PTX still rejected by syntax");
+  Check(p::Retarget(input,plan,reason,turing)==p::Result::kRejected&&
+        reason=="PTX header is not structurally valid"&&plan.replacement.empty(),
+        "malformed quoted source still rejected before publication or native fallback");
   // Kind-1 + valid LZ4 does not imply text. The old path interpreted the random
   // 0x22 as a PTX string start and produced the wrong diagnostic.
   Bytes opaque{0x1f,0x3a,0x3d,0xb6,0xbb,0x8d,0x7a,0xf5,0x22,0x41,0x0a,0x33,0};

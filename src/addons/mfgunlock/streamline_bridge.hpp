@@ -7,10 +7,12 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 #include <sstream>
 #include <vector>
 #include <sl_core_api.h>
 #include <string>
+#include <string_view>
 #include <winver.h>
 
 // Lifecycle callbacks only pass this pointer through. No private C++ interface
@@ -56,8 +58,7 @@ inline std::atomic_bool g_set_device_active{false};
 inline std::atomic_bool g_set_device_completed{false};
 
 inline bool LifecycleEnabled() {
-  if (!g_enabled.load(std::memory_order_relaxed)) return false;
-  return architecture::NeedsDetection() || architecture::ActiveProfile() != nullptr;
+  return g_enabled.load(std::memory_order_relaxed);
 }
 
 inline const char* LifecycleName(LifecycleState state) {
@@ -254,11 +255,90 @@ inline bool OwnExecutableExport(HMODULE module, const char* name) {
          protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
+// A renamed OTA plugin retains its role in NVIDIA's model directory. This is
+// only an identity hint: executable gateway ownership and current PE identity
+// are still required. No specific version, hash, cache file or GPU is admitted.
+inline bool IsOtaPluginPath(std::wstring_view path, std::wstring_view role) {
+  std::wstring normalized(path);
+  for (auto& c : normalized) {
+    if (c == L'/') c = L'\\';
+    else if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
+  }
+  const std::wstring prefix = L"\\models\\" + std::wstring(role) + L"_";
+  const auto at = normalized.find(prefix);
+  if (at == std::wstring::npos) return false;
+  size_t i = at + prefix.size(), start = i;
+  while (i < normalized.size() && normalized[i] >= L'0' && normalized[i] <= L'9') ++i;
+  if (i == start || normalized.compare(i, 10, L"\\versions\\") != 0) return false;
+  i += 10;
+  const auto slash = normalized.find(L'\\', i);
+  if (slash == std::wstring::npos || slash == i ||
+      normalized.compare(slash, 7, L"\\files\\") != 0) return false;
+  const auto filename = std::wstring_view(normalized).substr(slash + 7);
+  return filename.size() > 4 && filename.find(L'\\') == std::wstring_view::npos &&
+      filename.ends_with(L".dll");
+}
+
+inline bool IsOtaCommonPath(std::wstring_view path) {
+  return IsOtaPluginPath(path, L"sl_common");
+}
+
+enum class PluginRole { kFg, kSr, kCommon, kRr, kUnknown };
+inline PluginRole ModuleRole(HMODULE module) {
+  if (!module) return PluginRole::kUnknown;
+  std::wstring path(32768, L'\0');
+  const auto count = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+  if (!count || count >= path.size()) return PluginRole::kUnknown;
+  path.resize(count);
+  struct RoleName { const wchar_t* filename; const wchar_t* ota; PluginRole role; };
+  constexpr RoleName roles[] = {
+      {L"sl.dlss_g.dll", L"sl_dlss_g", PluginRole::kFg},
+      {L"sl.dlss.dll", L"sl_dlss", PluginRole::kSr},
+      {L"sl.dlss_d.dll", L"sl_dlss_d", PluginRole::kRr},
+      {L"sl.common.dll", L"sl_common", PluginRole::kCommon}};
+  for (const auto& role : roles)
+    if (ngx::internal::IsModuleNamed(module, role.filename) || IsOtaPluginPath(path, role.ota))
+      return role.role;
+  return PluginRole::kUnknown;
+}
+
+inline SRWLOCK g_common_lock = SRWLOCK_INIT;
+inline hook::ModuleIdentity g_common_identity{};
+
+inline bool ObserveCommonModule(HMODULE module) {
+  if (!module) return false;
+  std::wstring path(32768, L'\0');
+  const auto size = GetModuleFileNameW(module, path.data(), static_cast<DWORD>(path.size()));
+  if (!size || size >= path.size()) return false;
+  path.resize(size);
+  if (!ngx::internal::IsModuleNamed(module, L"sl.common.dll") && !IsOtaCommonPath(path))
+    return false;
+  hook::ModuleIdentity identity{};
+  if (!OwnExecutableExport(module, "slGetPluginFunction") ||
+      !hook::CaptureModule(module, identity) || !hook::IsCurrent(identity)) return false;
+  AcquireSRWLockExclusive(&g_common_lock);
+  g_common_identity = identity;
+  ReleaseSRWLockExclusive(&g_common_lock);
+  return true;
+}
+
+inline HMODULE CommonModule() {
+  // No enumeration or disk reads on the frame path. Existing discovery and
+  // actual gateway lookups populate this identity; stale images are not used.
+  hook::ModuleIdentity identity{};
+  if (TryAcquireSRWLockShared(&g_common_lock)) {
+    identity = g_common_identity;
+    ReleaseSRWLockShared(&g_common_lock);
+  }
+  if (identity.module && hook::IsCurrent(identity)) return identity.module;
+  return GetModuleHandleW(L"sl.common.dll");  // Preserve the original local path.
+}
+
 inline compatibility::InterposerContract GetInterposerContract(HMODULE module, bool require_common = true) {
-  if (!module || !ngx::internal::IsModuleNamed(module, L"sl.interposer.dll")) {
+  if (!module) {
     compatibility::InterposerContract missing;
     missing.admission = {compatibility::FeatureState::kUnavailable,
-                         "sl.interposer is missing or has an unexpected identity"};
+                         "interposer module is missing"};
     return missing;
   }
   constexpr std::array names{
@@ -274,7 +354,7 @@ inline compatibility::InterposerContract GetInterposerContract(HMODULE module, b
   hook::ModuleIdentity identity{};
   const bool current = hook::CaptureModule(module, identity) && hook::IsCurrent(identity);
   return compatibility::AssessInterposer(symbols,
-      !require_common || GetModuleHandleW(L"sl.common.dll") != nullptr, current);
+      !require_common || CommonModule() != nullptr, current);
 }
 
 inline InterposerAbi GetInterposerAbi(HMODULE module, bool require_common = true) {
@@ -285,6 +365,39 @@ inline InterposerAbi GetInterposerAbi(HMODULE module, bool require_common = true
   if (contract.typed_abi == compatibility::TypedInterposerAbi::kModern2)
     return InterposerAbi::kModern;
   return InterposerAbi::kUnknown;
+}
+
+// slGetFeatureFunction is the modern public resolver. Hook only the specific
+// exported function being used; optional tags/version/D3D helpers may be absent.
+inline bool HasModernFeatureResolver(HMODULE module) {
+  hook::ModuleIdentity identity{};
+  return module &&
+      OwnExecutableExport(module, "slGetFeatureFunction") &&
+      hook::CaptureModule(module, identity) && hook::IsCurrent(identity);
+}
+
+inline SRWLOCK g_observed_interposer_lock = SRWLOCK_INIT;
+inline hook::ModuleIdentity g_observed_interposer{};
+
+inline bool ObserveInterposerModule(HMODULE module) {
+  if (!module || GetInterposerAbi(module, false) == InterposerAbi::kUnknown) return false;
+  hook::ModuleIdentity identity{};
+  if (!hook::CaptureModule(module, identity) || !hook::IsCurrent(identity)) return false;
+  AcquireSRWLockExclusive(&g_observed_interposer_lock);
+  g_observed_interposer = identity;
+  ReleaseSRWLockExclusive(&g_observed_interposer_lock);
+  return true;
+}
+
+inline HMODULE InterposerModule() {
+  hook::ModuleIdentity identity{};
+  if (TryAcquireSRWLockShared(&g_observed_interposer_lock)) {
+    identity = g_observed_interposer;
+    ReleaseSRWLockShared(&g_observed_interposer_lock);
+  }
+  if (identity.module && hook::IsCurrent(identity)) return identity.module;
+  // The conventional filename remains a discovery fast path, not admission.
+  return GetModuleHandleW(L"sl.interposer.dll");
 }
 
 // SL 1.x passes an application ID and returns bool; SL 2.x passes an SDK
@@ -405,7 +518,7 @@ inline const std::vector<hook::HookItem> kLegacyDiscoveryHooks = {
 inline void RefreshPluginLifetimes();
 
 inline void InstallLegacyInitHook() {
-  if (!g_enabled.load() || !architecture::NeedsBridge()) return;
+  if (!g_enabled.load()) return;
   if (g_legacy_installing.test_and_set()) return;
   struct Guard {
     ~Guard() { g_legacy_installing.clear(); }
@@ -417,7 +530,7 @@ inline void InstallLegacyInitHook() {
     for (const auto& entry : kLegacyDiscoveryHooks) *std::get<1>(entry) = nullptr;
     g_legacy_init_hooked.store(false, std::memory_order_release);
   }
-  HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
+  HMODULE module = InterposerModule();
   if (!module || GetInterposerAbi(module) != InterposerAbi::kLegacy) return;
   if (g_interposer_identity.module && g_interposer_identity.module != module) return;
   if (!hook::CaptureModule(module, g_interposer_identity)) return;
@@ -435,7 +548,7 @@ inline void InstallLegacyInitHook() {
 inline bool HookedLegacyInit(const LegacyPreferences& preferences, int application_id) {
   if (!g_real_legacy_init) return false;
   g_init_observed.store(true, std::memory_order_release);
-  if (g_shutting_down.load() || !g_enabled.load() || !architecture::NeedsBridge() || g_init_depth)
+  if (g_shutting_down.load() || !g_enabled.load() || g_init_depth)
     return g_real_legacy_init(preferences, application_id);
 
   ++g_init_depth;
@@ -460,9 +573,9 @@ inline bool HookedLegacyInit(const LegacyPreferences& preferences, int applicati
 using GatewayFn = void* (*)(const char*);
 using LoadFn = bool (*)(sl::param::IParameters*, const char*, const char**);
 using StartupFn = bool (*)(const char*, void*);
-enum class PluginRole { kFg, kSr, kCommon };
 inline const char* PluginLabel(PluginRole role) {
-  return role == PluginRole::kFg ? "sl.dlss_g" : role == PluginRole::kSr ? "sl.dlss" : "sl.common";
+  return role == PluginRole::kFg ? "sl.dlss_g" : role == PluginRole::kSr ? "sl.dlss" :
+      role == PluginRole::kRr ? "sl.dlss_d" : role == PluginRole::kCommon ? "sl.common" : "unknown";
 }
 struct PluginRuntime {
   HMODULE module = nullptr;
@@ -479,7 +592,7 @@ inline std::atomic<HMODULE> g_last_unqualified_plugin{nullptr};
 
 inline void LifecyclePreflight() {
   if (g_shutting_down.load(std::memory_order_acquire)) return;
-  if (!architecture::NeedsBridge()) return;
+  if (!g_enabled.load()) return;
   // Called by the plugin manager after LoadLibrary returned, not by its load
   // notification. Patch cached NGX exports before the native plugin builds
   // supportedAdapters, required tags, and the common needNGX flag.
@@ -487,7 +600,7 @@ inline void LifecyclePreflight() {
     ngx::internal::ProbeAdapterBeforeInit();
     InstallLegacyInitHook();
     ngx::EnsureEntryHooks();
-    if (architecture::ActiveProfile() && ngx::g_prepare_loaded_providers)
+    if (ngx::g_prepare_loaded_providers)
       ngx::g_prepare_loaded_providers();
   } catch (...) {
     Log("DLSS-G preflight failed", true);
@@ -512,14 +625,43 @@ inline bool SupportAdapterMatchesBoundGpu(const sl::AdapterInfo& adapter) {
              ngx::internal::g_luid_high.load(std::memory_order_acquire);
 }
 
+inline void TraceFeatureResult(const char* api, sl::Feature feature,
+                               sl::Result result, int loaded = -1) noexcept {
+  // A hot FG poll must not consume SR/RR diagnostics, nor flood the log.
+  static std::atomic_uint calls[4][4]{};
+  const unsigned role = feature == sl::kFeatureDLSS_G ? 1u :
+      static_cast<unsigned>(feature) == 0 ? 0u : static_cast<unsigned>(feature) == 1001 ? 2u : 3u;
+  const unsigned query = std::strcmp(api, "slGetFeatureRequirements") == 0 ? 1u :
+      std::strcmp(api, "slIsFeatureLoaded") == 0 ? 2u :
+      std::strcmp(api, "slIsFeatureSupported.returned") == 0 ? 3u : 0u;
+  if (calls[role][query].fetch_add(1, std::memory_order_relaxed) >= 16) return;
+  ngx::internal::DiscoveryTrace([&](auto& message) {
+    message << "SL_FEATURE api=" << api << " feature=" << feature
+            << " result=0x" << std::hex << static_cast<uint32_t>(result)
+            << std::dec << " loaded=" << loaded;
+  });
+}
+
 inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::AdapterInfo& adapter) {
   if (!g_real_support) return sl::Result::eErrorNotInitialized;
   if (g_shutting_down.load(std::memory_order_acquire) || !g_enabled.load() ||
-      !LifecycleEnabled() || feature != sl::kFeatureDLSS_G)
-    return g_real_support(feature, adapter);
+      !LifecycleEnabled() || feature != sl::kFeatureDLSS_G) {
+    const auto result = g_real_support(feature, adapter);
+    TraceFeatureResult("slIsFeatureSupported.native", feature, result);
+    return result;
+  }
 
-  // A physical handle may be reused after instance recreation. Only a fresh
-  // nested requirements observation in THIS support call can relax admission.
+  // Native success needs no preparation, provider scan or identity reset.
+  // This API is commonly polled by the game every frame.
+  const sl::Result first_result = g_real_support(feature, adapter);
+  ngx::internal::DiscoveryLastError native_error;
+  if (first_result != sl::Result::eErrorNoSupportedAdapterFound &&
+      first_result != sl::Result::eErrorAdapterNotSupported) {
+    TraceFeatureResult("slIsFeatureSupported.native", feature, first_result);
+    return first_result;
+  }
+  // Only an actual architecture rejection needs the compatibility retry.
+  // Require a fresh Vulkan observation for any relaxed adapter decision.
   if (adapter.vkPhysicalDevice) vulkannative::ResetIdentity();
   LifecyclePreflight();
   RefreshPluginLifetimes();
@@ -534,12 +676,9 @@ inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::Adapte
     native_result = g_real_support(feature, adapter);
   }
 
+  native_error.value = GetLastError();
+  TraceFeatureResult("slIsFeatureSupported.native", feature, native_result);
   const auto native_value = static_cast<uint32_t>(native_result);
-  std::stringstream message;
-  message << "TuringDiag slIsFeatureSupported(DLSS_G) phase=" << SupportPhase()
-          << " result=0x" << std::hex << native_value
-          << " lifecycle=" << LifecycleName(g_lifecycle_state.load(std::memory_order_acquire));
-  Log(message.str(), native_result != sl::Result::eOk);
 
   const auto provider_status = GetProviderStatus();
   const policy::StreamlineSupportEvidence evidence{
@@ -550,6 +689,7 @@ inline sl::Result HookedIsFeatureSupported(sl::Feature feature, const sl::Adapte
     static std::atomic_bool adjusted_logged{false};
     if (!adjusted_logged.exchange(true, std::memory_order_relaxed))
       Log("Streamline DLSS-G adapter admission relaxed (0x6 -> eOk)");
+    TraceFeatureResult("slIsFeatureSupported.returned", feature, sl::Result::eOk);
     return sl::Result::eOk;
   }
   return native_result;
@@ -559,27 +699,17 @@ inline sl::Result HookedGetFeatureRequirements(sl::Feature feature,
                                                       sl::FeatureRequirements& requirements) {
   if (!g_real_requirements) return sl::Result::eErrorNotInitialized;
   const auto result = g_real_requirements(feature, requirements);
-  if (feature == sl::kFeatureDLSS_G) {
-    RefreshPluginLifetimes();
-    std::stringstream message;
-    message << "TuringDiag slGetFeatureRequirements(DLSS_G) phase=" << SupportPhase()
-            << " result=0x" << std::hex << static_cast<uint32_t>(result);
-    Log(message.str(), result != sl::Result::eOk);
-  }
+  ngx::internal::DiscoveryLastError native_error;
+  TraceFeatureResult("slGetFeatureRequirements", feature, result);
   return result;
 }
 
 inline sl::Result HookedIsFeatureLoaded(sl::Feature feature, bool& loaded) {
   if (!g_real_loaded) return sl::Result::eErrorNotInitialized;
   const auto result = g_real_loaded(feature, loaded);
-  if (feature == sl::kFeatureDLSS_G) {
-    RefreshPluginLifetimes();
-    std::stringstream message;
-    message << "TuringDiag slIsFeatureLoaded(DLSS_G) phase=" << SupportPhase()
-            << " result=0x" << std::hex << static_cast<uint32_t>(result)
-            << " loaded=" << (loaded ? "yes" : "no");
-    Log(message.str(), result != sl::Result::eOk || !loaded);
-  }
+  ngx::internal::DiscoveryLastError native_error;
+  TraceFeatureResult("slIsFeatureLoaded", feature, result,
+                     result == sl::Result::eOk ? (loaded ? 1 : 0) : -1);
   return result;
 }
 
@@ -612,12 +742,15 @@ inline void InstallDiagnosticHooks() {
     g_real_set_d3d_device = nullptr;
     g_diagnostic_hooked.store(false, std::memory_order_release);
   }
-  HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
-  if (!module || GetInterposerAbi(module) != InterposerAbi::kModern) return;
+  HMODULE module = InterposerModule();
+  if (!HasModernFeatureResolver(module)) return;
   if (g_diagnostic_hooked.load(std::memory_order_acquire)) return;
   if (g_diagnostic_identity.module && g_diagnostic_identity.module != module) return;
   if (!hook::CaptureModule(module, g_diagnostic_identity)) return;
-  if (hook::Install(module, kDiagnosticHooks, "Streamline lifecycle diagnostics")) {
+  std::vector<hook::HookItem> available;
+  for (const auto& item : kDiagnosticHooks)
+    if (OwnExecutableExport(module, std::get<0>(item))) available.push_back(item);
+  if (!available.empty() && hook::Install(module, available, "Streamline lifecycle diagnostics")) {
     g_diagnostic_hooked.store(true, std::memory_order_release);
     Log("TuringDiag Streamline lifecycle diagnostics installed");
   } else {
@@ -637,11 +770,11 @@ inline void InstallSupportHook() {
     g_real_support = nullptr;
     g_support_hooked.store(false, std::memory_order_release);
   }
-  HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
-  if (!module || GetInterposerAbi(module) != InterposerAbi::kModern) return;
+  HMODULE module = InterposerModule();
+  if (!HasModernFeatureResolver(module)) return;
   if (g_support_hooked.load(std::memory_order_acquire)) return;
   if (g_support_identity.module && g_support_identity.module != module) return;
-  if (GetProcAddress(module, "slIsFeatureSupported") == nullptr ||
+  if (!OwnExecutableExport(module, "slIsFeatureSupported") ||
       !hook::CaptureModule(module, g_support_identity)) return;
   if (hook::Install(module, kSupportHooks, "Streamline support"))
     g_support_hooked.store(true, std::memory_order_release);
@@ -706,6 +839,10 @@ bool OnLoad(sl::param::IParameters* parameters, const char* loader_json, const c
   } else {
     result = real(parameters, loader_json, plugin_json);
   }
+  ngx::internal::DiscoveryTrace([&](auto& message) {
+    message << "PLUGIN_LOAD_END plugin=sl.dlss_g result=" << result;
+    if (result && plugin_json) message << " json=" << DiscoveryJson(*plugin_json);
+  });
   if (result) SetLifecycleState(LifecycleState::kLoaded, "slOnPluginLoad succeeded");
   else Log("DLSS-G plugin load failed", true);
   Log(result ? "TuringDiag slOnPluginLoad returned true"
@@ -742,6 +879,9 @@ bool OnStartup(const char* json, void* device) {
   } else {
     result = real(json, device);
   }
+  ngx::internal::DiscoveryTrace([&](auto& message) {
+    message << "PLUGIN_STARTUP_END plugin=sl.dlss_g result=" << result;
+  });
   SetLifecycleState(result ? LifecycleState::kStartupSucceeded
                            : LifecycleState::kStartupFailed,
                     result ? "slOnPluginStartup returned true"
@@ -799,9 +939,14 @@ inline void ClearPluginRuntime(PluginRuntime& plugin) {
 inline void RefreshPluginLifetimes() {
   std::array<HMODULE, 8> unloaded{};
   size_t unloaded_count = 0;
+  bool live_fg = false;
   AcquireSRWLockExclusive(&g_plugin_lock);
   for (auto& plugin : g_plugins) {
-    if (!plugin.module || hook::IsCurrent(plugin.gateway_hook.identity)) continue;
+    if (!plugin.module) continue;
+    if (hook::IsCurrent(plugin.gateway_hook.identity)) {
+      live_fg |= plugin.role == PluginRole::kFg;
+      continue;
+    }
     if (plugin.role == PluginRole::kFg && unloaded_count < unloaded.size())
       unloaded[unloaded_count++] = plugin.module;
     ClearPluginRuntime(plugin);
@@ -811,22 +956,20 @@ inline void RefreshPluginLifetimes() {
     for (size_t i = 0; i < unloaded_count; ++i) {
       if (g_on_dlssg_plugin_unloaded) g_on_dlssg_plugin_unloaded(unloaded[i]);
     }
-    SetLifecycleState(LifecycleState::kUnloaded, "plugin image disappeared");
+    if (!live_fg) SetLifecycleState(LifecycleState::kUnloaded, "plugin image disappeared");
   }
 }
 
-inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
+inline FARPROC BindPlugin(HMODULE module, FARPROC original, PluginRole observed_role = PluginRole::kUnknown) {
   if (!LifecycleEnabled()) return original;
   RefreshPluginLifetimes();
-  const auto interposer = GetModuleHandleW(L"sl.interposer.dll");
-  const bool sr = ngx::internal::IsModuleNamed(module, L"sl.dlss.dll");
-  const bool common = ngx::internal::IsModuleNamed(module, L"sl.common.dll");
-  if (sr || common) {
+  const auto role = observed_role == PluginRole::kUnknown ? ModuleRole(module) : observed_role;
+  if (role == PluginRole::kCommon) ObserveCommonModule(module);
+  if (role == PluginRole::kSr || role == PluginRole::kRr || role == PluginRole::kCommon) {
     // Passive observer of the existing shared plugin lifecycle ABI. Do not
     // invoke the gateway to probe for features, prepare FG, or alter JSON.
     hook::ModuleIdentity identity{};
-    if (GetInterposerAbi(interposer, false) == InterposerAbi::kUnknown ||
-        !OwnExecutableExport(module, "slGetPluginFunction") ||
+    if (!OwnExecutableExport(module, "slGetPluginFunction") ||
         GetProcAddress(module, "slGetPluginFunction") != original ||
         !hook::CaptureModule(module, identity) || !hook::IsCurrent(identity)) return original;
     AcquireSRWLockExclusive(&g_plugin_lock);
@@ -837,7 +980,7 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
       auto& plugin = g_plugins[i];
       if (plugin.module) continue;
       plugin.module = module;
-      plugin.role = sr ? PluginRole::kSr : PluginRole::kCommon;
+      plugin.role = role;
       if (!hook::InstallAddress(plugin.gateway_hook, reinterpret_cast<void*>(original),
                                 reinterpret_cast<void*>(kGateways[i]), "DLSS discovery lifecycle D1")) {
         plugin.module = nullptr;
@@ -852,20 +995,18 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
     return original;
   }
   // An unrelated plugin is not a failed DLSS-G gateway.
-  if (!ngx::internal::IsModuleNamed(module, L"sl.dlss_g.dll")) return original;
-  const auto parent_abi = GetInterposerAbi(interposer);
+  if (role != PluginRole::kFg) return original;
   compatibility::PluginGatewayEvidence evidence{};
-  evidence.named_dlssg = ngx::internal::IsModuleNamed(module, L"sl.dlss_g.dll");
+  evidence.named_dlssg = role == PluginRole::kFg;
   evidence.own_code_gateway = OwnExecutableExport(module, "slGetPluginFunction") &&
       GetProcAddress(module, "slGetPluginFunction") == original;
   hook::ModuleIdentity module_identity{};
   evidence.current_image = hook::CaptureModule(module, module_identity) &&
       hook::IsCurrent(module_identity);
-  evidence.parent_abi_qualified = parent_abi != InterposerAbi::kUnknown;
   const auto lookup = compatibility::GatewayLookup(evidence);
   if (!lookup.Available()) {
     if (g_last_unqualified_plugin.exchange(module, std::memory_order_acq_rel) != module)
-      Log(std::string("DLSS-G gateway left native: ") + lookup.reason, true);
+      Log(std::string("DLSS-G gateway unavailable: ") + lookup.reason, true);
     return original;
   }
   // The same live binding needs no further vendor calls or bind notifications.
@@ -877,10 +1018,7 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
     for (const auto& plugin : g_plugins) {
       if (plugin.module == module &&
           plugin.gateway_hook.Targets(reinterpret_cast<void*>(original)) &&
-          hook::IsCurrent(plugin.gateway_hook.identity) &&
-          plugin.typed_abi == (parent_abi == InterposerAbi::kModern
-              ? compatibility::TypedInterposerAbi::kModern2
-              : compatibility::TypedInterposerAbi::kLegacy1)) {
+          hook::IsCurrent(plugin.gateway_hook.identity)) {
         bound = true;
         break;
       }
@@ -904,16 +1042,13 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
   // lock so a resolver callback cannot create a lock cycle here.
   evidence.set_options = gateway("slDLSSGSetOptions") != nullptr;
   evidence.get_state = gateway("slDLSSGGetState") != nullptr;
-  if (parent_abi == InterposerAbi::kLegacy) {
-    evidence.on_load = gateway("slOnPluginLoad") != nullptr;
-    evidence.on_startup = gateway("slOnPluginStartup") != nullptr;
-  }
-  const auto functions = compatibility::PluginFunctions(evidence,
-      parent_abi == InterposerAbi::kModern ? compatibility::TypedInterposerAbi::kModern2
-                                           : compatibility::TypedInterposerAbi::kLegacy1);
-  const bool modern = parent_abi == InterposerAbi::kModern && functions.Available();
-  const bool legacy = parent_abi == InterposerAbi::kLegacy &&
-      functions.state == compatibility::FeatureState::kDegraded;
+  // A runtime-selected OTA plugin can differ from the parent interposer.
+  // Discover its own API; keep legacy lifecycle pointers opaque. No private
+  // structure is accessed just because the gateway lookup succeeds.
+  evidence.on_load = gateway("slOnPluginLoad") != nullptr;
+  evidence.on_startup = gateway("slOnPluginStartup") != nullptr;
+  const bool modern = evidence.set_options || evidence.get_state;
+  const bool legacy = !modern && (evidence.on_load || evidence.on_startup);
   {
     std::stringstream message;
     message << "TuringDiag plugin classification modern=" << (modern ? "yes" : "no")
@@ -924,7 +1059,8 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
 
   AcquireSRWLockExclusive(&g_plugin_lock);
   struct Unlock {
-    ~Unlock() { ReleaseSRWLockExclusive(&g_plugin_lock); }
+    bool active = true;
+    ~Unlock() { if (active) ReleaseSRWLockExclusive(&g_plugin_lock); }
   } unlock;
 
   for (auto& plugin : g_plugins) {
@@ -957,6 +1093,8 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
       plugin.typed_abi = compatibility::TypedInterposerAbi::kNone;
       return original;
     }
+    ReleaseSRWLockExclusive(&g_plugin_lock);
+    unlock.active = false;
     SetLifecycleState(LifecycleState::kLoaded, "slGetPluginFunction gateway bound");
     Log("TuringDiag DLSS-G gateway bound");
     if (g_on_dlssg_plugin_bound) g_on_dlssg_plugin_bound(module);
@@ -968,7 +1106,7 @@ inline FARPROC BindPlugin(HMODULE module, FARPROC original) {
 }  // namespace internal
 
 inline bool CanHookInit(HMODULE module) {
-  if (!module || !ngx::internal::IsModuleNamed(module, L"sl.interposer.dll") ||
+  if (!module ||
       // slInit can precede sl.common loading: do not reintroduce the late-hook
       // regression by requiring that dependency for the init hook itself.
       internal::GetInterposerAbi(module, false) != internal::InterposerAbi::kModern ||
@@ -978,7 +1116,7 @@ inline bool CanHookInit(HMODULE module) {
 }
 
 inline bool FullModernContractReady(HMODULE module) {
-  return internal::GetInterposerAbi(module) == internal::InterposerAbi::kModern;
+  return internal::HasModernFeatureResolver(module);
 }
 
 // Reuses framecount's slInit detour without forcing OTA flags, removing any
@@ -986,6 +1124,26 @@ inline bool FullModernContractReady(HMODULE module) {
 inline sl::Result OnInit(const sl::Preferences& pref, uint64_t sdk, PFun_slInit* next) {
   if (!next) return sl::Result::eErrorNotInitialized;
   internal::g_init_observed.store(true, std::memory_order_release);
+  ngx::internal::DiscoveryTrace([&](auto& message) {
+    message << "SL_INIT_BEGIN sdk=0x" << std::hex << sdk << std::dec;
+    if (pref.structType == sl::Preferences::s_structType &&
+        pref.structVersion == sl::kStructVersion1) {
+      message << " render_api=" << static_cast<uint32_t>(pref.renderAPI)
+              << " flags=0x" << std::hex << static_cast<uint64_t>(pref.flags)
+              << std::dec << " features_count=" << pref.numFeaturesToLoad << " features=";
+      if (pref.featuresToLoad && pref.numFeaturesToLoad <= 256)
+        for (uint32_t i = 0; i < pref.numFeaturesToLoad; ++i)
+          message << (i ? "," : "") << pref.featuresToLoad[i];
+      else message << "UNREAD";
+    } else message << " preferences_abi=UNKNOWN";
+  });
+  const auto trace_result = [&](sl::Result value, const char* path) {
+    ngx::internal::DiscoveryTrace([&](auto& message) {
+      message << "SL_INIT_END result=0x" << std::hex << static_cast<uint32_t>(value)
+              << " path=" << path;
+    });
+    return value;
+  };
 
   int requested = -1;
   if (pref.structType == sl::Preferences::s_structType &&
@@ -1016,7 +1174,8 @@ inline sl::Result OnInit(const sl::Preferences& pref, uint64_t sdk, PFun_slInit*
     Log(message.str(), requested <= 0);
   }
   if (internal::g_shutting_down.load(std::memory_order_acquire) ||
-      !g_enabled.load() || !architecture::NeedsBridge() || internal::g_init_depth != 0) return next(pref, sdk);
+      !g_enabled.load() || internal::g_init_depth != 0)
+    return trace_result(next(pref, sdk), "NATIVE");
   ++internal::g_init_depth;
   struct Guard {
     ~Guard() { --internal::g_init_depth; }
@@ -1029,7 +1188,7 @@ inline sl::Result OnInit(const sl::Preferences& pref, uint64_t sdk, PFun_slInit*
     message << "slInit failed (0x" << std::hex << static_cast<uint32_t>(result) << ')';
     Log(message.str(), true);
   }
-  return result;
+  return trace_result(result, "WITH_EXISTING_PREFLIGHT");
 }
 
 inline FARPROC Resolve(HMODULE module, const char* name, FARPROC original, const void* caller) {
@@ -1054,7 +1213,7 @@ inline FARPROC Resolve(HMODULE module, const char* name, FARPROC original, const
     return original;
   }
   if (std::strncmp(name, "sl", 2) == 0 &&
-      ngx::internal::IsModuleNamed(module, L"sl.interposer.dll")) {
+      internal::ObserveInterposerModule(module)) {
     internal::InstallLegacyInitHook();
     internal::InstallSupportHook();
     internal::InstallDiagnosticHooks();
@@ -1074,8 +1233,11 @@ inline void Initialize(HMODULE self) {
   internal::g_set_device_active.store(false, std::memory_order_release);
   internal::g_set_device_completed.store(false, std::memory_order_release);
   internal::g_self = self;
+  AcquireSRWLockExclusive(&internal::g_observed_interposer_lock);
+  internal::g_observed_interposer = {};
+  ReleaseSRWLockExclusive(&internal::g_observed_interposer_lock);
   if (!g_enabled.load()) return;
-  Log("RuntimeRepairR5 DLSSDISC_D1 active");
+  Log("EMPIRICAL_COMPAT_R6 DLSSDISC_D1 active");
   Log(std::string("architecture: ") + architecture::Name(architecture::g_configured.load()));
 }
 
@@ -1147,79 +1309,97 @@ inline void Draw() {
   ImGui::Separator();
   const auto configured = architecture::g_configured.load();
   const auto active = architecture::g_active.load();
-  ImGui::Text("Architecture: %s | active %s", architecture::Name(configured),
-              architecture::Name(active));
+  const auto& status = ngx::g_status;
+  const char* fg_state = status.feature_active.load() ? "ACTIVE" :
+      status.feature_created.load() ? "CREATED" :
+      status.capabilities_seen.load() ? (status.available.load() ? "AVAILABLE" : "UNAVAILABLE") :
+      "--";
+  const char* backend = !status.capabilities_seen.load() ? "--" :
+      status.vulkan_capabilities.load() ? "Vulkan" : "D3D12";
+  ImGui::Text("GPU: %s (%s) | FG: %s | %s", architecture::Name(active),
+              architecture::Name(configured), fg_state, backend);
 
-  auto draw_module = [](const char* label, const wchar_t* name) {
-    if (HMODULE module = GetModuleHandleW(name)) {
-      const auto version = ReadModuleDisplayVersion(module);
-      ImGui::Text("%s: %u.%u.%u.%u | LOADED", label, version.major, version.minor,
+  // Format into local buffers: the overlay is refreshed every frame.
+  auto write_version = [](char* out, size_t cap, ModuleVersion version) {
+    std::snprintf(out, cap, "%u.%u.%u.%u", version.major, version.minor,
                   version.build, version.revision);
-    } else {
-      ImGui::TextDisabled("%s: NOT_LOADED", label);
-    }
   };
-  if (HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll")) {
-    const auto version = ReadModuleDisplayVersion(interposer);
-    const auto abi = GetInterposerAbi(interposer);
-    ImGui::Text("Streamline: %u.%u.%u.%u | %s", version.major, version.minor,
-        version.build, version.revision,
-        abi == InterposerAbi::kModern ? "MODERN" :
-        abi == InterposerAbi::kLegacy ? "LEGACY" : "CONTRACT_UNAVAILABLE");
-  } else {
-    ImGui::TextDisabled("Streamline: NOT_LOADED");
-  }
+  char streamline_version[48] = "--";
+  if (HMODULE interposer = InterposerModule())
+    write_version(streamline_version, sizeof(streamline_version),
+                  ReadModuleDisplayVersion(interposer));
   ModuleVersion plugin_version{};
-  compatibility::TypedInterposerAbi plugin_abi = compatibility::TypedInterposerAbi::kNone;
   bool plugin_bound = false;
   if (TryAcquireSRWLockShared(&g_plugin_lock)) {
     for (const auto& plugin : g_plugins) {
       if (plugin.role != PluginRole::kFg || !plugin.module ||
           !hook::IsCurrent(plugin.gateway_hook.identity)) continue;
       plugin_version = plugin.version;
-      plugin_abi = plugin.typed_abi;
       plugin_bound = true;
       break;
     }
     ReleaseSRWLockShared(&g_plugin_lock);
   }
+  char plugin_version_text[48] = "--";
   if (plugin_bound) {
-    ImGui::Text("DLSS-G plugin: %u.%u.%u.%u | %s", plugin_version.major,
-        plugin_version.minor, plugin_version.build, plugin_version.revision,
-        plugin_abi == compatibility::TypedInterposerAbi::kLegacy1 ? "LEGACY" : "MODERN");
-  } else {
-    draw_module("DLSS-G plugin", L"sl.dlss_g.dll");
+    write_version(plugin_version_text, sizeof(plugin_version_text), plugin_version);
+  } else if (HMODULE module = GetModuleHandleW(L"sl.dlss_g.dll")) {
+    write_version(plugin_version_text, sizeof(plugin_version_text),
+                  ReadModuleDisplayVersion(module));
   }
-  draw_module("DLSS SR plugin", L"sl.dlss.dll");
-  draw_module("DLSS SR", L"nvngx_dlss.dll");
+  // Group the three Streamline components on one compact row.
+  char sr_plugin_version[48] = "--";
+  if (HMODULE module = GetModuleHandleW(L"sl.dlss.dll")) {
+    write_version(sr_plugin_version, sizeof(sr_plugin_version),
+                  ReadModuleDisplayVersion(module));
+  }
+  ImGui::Text("Streamline: %s | FG plugin: %s | SR plugin: %s",
+              streamline_version, plugin_version_text, sr_plugin_version);
 
-  bool locked = TryAcquireSRWLockShared(&provider::internal::g_lock) != 0;
-  HMODULE provider_module = nullptr;
-  bool ready = false;
+  // NGX libraries have independent versions from Streamline plugins.
+  char sr_version[48] = "--";
+  if (HMODULE module = GetModuleHandleW(L"nvngx_dlss.dll")) {
+    write_version(sr_version, sizeof(sr_version), ReadModuleDisplayVersion(module));
+  }
+  const bool locked = TryAcquireSRWLockShared(&provider::internal::g_lock) != 0;
+  HMODULE fg_module = nullptr;
   if (locked) {
     for (const auto& item : provider::internal::g_providers) {
       if (!item.ready || !provider::internal::IsImageMapping(item.module)) continue;
-      provider_module = item.module;
-      ready = true;
+      fg_module = item.module;
       break;
     }
   }
-  if (!provider_module) provider_module = GetModuleHandleW(L"nvngx_dlssg.dll");
-  if (provider_module) {
-    const auto version = ReadModuleDisplayVersion(provider_module);
-    ImGui::Text("Provider: %u.%u.%u.%u | %s", version.major, version.minor,
-        version.build, version.revision, ready ? "PREPARED" : "LOADED");
-  } else {
-    ImGui::TextDisabled("Provider: NOT_LOADED");
+  if (!fg_module) fg_module = GetModuleHandleW(L"nvngx_dlssg.dll");
+  char fg_version[48] = "--";
+  if (fg_module) {
+    write_version(fg_version, sizeof(fg_version),
+                  ReadModuleDisplayVersion(fg_module));
   }
   if (locked) ReleaseSRWLockShared(&provider::internal::g_lock);
+  ImGui::Text("DLSS SR: %s | DLSS FG: %s", sr_version, fg_version);
+}
 
-  auto& status = ngx::g_status;
-  ImGui::Text("FG: %s | NGX: %s",
-      status.feature_active.load() ? "ACTIVE" : status.feature_created.load() ? "CREATED" :
-      status.capabilities_seen.load() ? (status.available.load() ? "AVAILABLE" : "UNAVAILABLE") :
-      "UNOBSERVED", !status.capabilities_seen.load() ? "UNOBSERVED" :
-      status.vulkan_capabilities.load() ? "VULKAN" : "D3D12");
+
+// Keep ABI identification in Diagnostics instead of the compact header.
+inline void DrawAbiDiagnostics() {
+  using namespace internal;
+  const auto abi = GetInterposerAbi(InterposerModule());
+  const char* streamline_abi = abi == InterposerAbi::kModern ? "MODERN" :
+      abi == InterposerAbi::kLegacy ? "LEGACY" : "--";
+  const char* plugin_abi = "--";
+  if (TryAcquireSRWLockShared(&g_plugin_lock)) {
+    for (const auto& plugin : g_plugins) {
+      if (plugin.role != PluginRole::kFg || !plugin.module ||
+          !hook::IsCurrent(plugin.gateway_hook.identity)) continue;
+      plugin_abi = plugin.typed_abi == compatibility::TypedInterposerAbi::kModern2
+          ? "MODERN" : plugin.typed_abi == compatibility::TypedInterposerAbi::kLegacy1
+          ? "LEGACY" : "--";
+      break;
+    }
+    ReleaseSRWLockShared(&g_plugin_lock);
+  }
+  ImGui::Text("Runtime ABI: Streamline %s | DLSS-G %s", streamline_abi, plugin_abi);
 }
 
 }  // namespace mfgunlock::streamline

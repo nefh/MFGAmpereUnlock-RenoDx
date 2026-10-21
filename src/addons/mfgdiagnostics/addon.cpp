@@ -23,8 +23,11 @@
 #include "../mfgunlock/runtime_lifecycle.hpp"
 #include "./nvapi_observer.hpp"
 #include "./trace.hpp"
+#include "./hud_tag_summary.hpp"
 #include "./mfg_probe.hpp"
 #include "./timeline.hpp"
+#include "./dynamic_probe.hpp"
+#include "./interposer_discovery.hpp"
 
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "bcrypt.lib")
@@ -66,6 +69,7 @@ std::atomic<uint32_t> g_truncated_tag_batches{0};
 std::atomic<uint32_t> g_optional_exports{0};
 SRWLOCK g_install_lock = SRWLOCK_INIT;
 std::vector<mfgunlock::hook::HookItem> g_hooks;
+interposer::InventoryRequest g_interposer_inventory;
 std::mutex g_output_mutex;
 std::string g_output_message;
 int g_label = 0;
@@ -150,13 +154,56 @@ SetTagFn g_set_tag = nullptr;
 PFun_slSetTagForFrame* g_set_tag_for_frame = nullptr;
 std::atomic<PFun_slDLSSGSetOptions*> g_set_options{nullptr};
 std::atomic<PFun_slDLSSGGetState*> g_get_state{nullptr};
-std::atomic_bool g_dynamic_probe_armed{false};
-std::atomic_bool g_dynamic_probe_attempted{false};
-std::atomic_bool g_dynamic_capability_seen{false};
-std::atomic_bool g_dynamic_supported{false};
-std::atomic_bool g_dynamic_capability_from_probe{false};
-std::atomic<uint32_t> g_dynamic_probe_result{UINT32_MAX};
-std::atomic<uint32_t> g_dynamic_state_version{0};
+dynamicprobe::ManualProbe g_dynamic_probe;
+std::mutex g_state_function_mutex;
+mfgunlock::hook::ModuleIdentity g_state_function_identity{};
+std::atomic<uint64_t> g_state_function_revision{0};
+
+void BindStateFunction(PFun_slDLSSGGetState* function) {
+  HMODULE module = nullptr;
+  mfgunlock::hook::ModuleIdentity identity{};
+  if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(function), &module))
+    mfgunlock::hook::CaptureModule(module, identity);
+  std::lock_guard lock(g_state_function_mutex);
+  if (g_get_state.load(std::memory_order_relaxed) == function &&
+      g_state_function_identity == identity) return;
+  g_state_function_revision.fetch_add(1, std::memory_order_acq_rel);
+  g_dynamic_probe.Invalidate();
+  g_state_function_identity = identity;
+  g_get_state.store(function, std::memory_order_release);
+  g_state_function_revision.fetch_add(1, std::memory_order_release);
+}
+
+void ObserveStateOwnerLoad(HMODULE module) {
+  // An identical image can be reloaded at the same base with the same PE
+  // identity. An observed load of the current owner still ends the old probe
+  // generation; pending presentation counts must not cross that boundary.
+  std::lock_guard lock(g_state_function_mutex);
+  if (!module || module != g_state_function_identity.module) return;
+  g_state_function_revision.fetch_add(1, std::memory_order_acq_rel);
+  g_dynamic_probe.Invalidate();
+  g_state_function_revision.fetch_add(1, std::memory_order_release);
+}
+
+// Take a temporary owner reference only for the extra manual query. Normal
+// native GetState forwarding does not acquire the loader lock on every frame.
+struct StateProbeLease {
+  HMODULE module = nullptr;
+  ~StateProbeLease() { if (module) FreeLibrary(module); }
+  bool Acquire(PFun_slDLSSGGetState* function) {
+    mfgunlock::hook::ModuleIdentity identity{};
+    {
+      std::lock_guard lock(g_state_function_mutex);
+      if (g_get_state.load(std::memory_order_relaxed) != function) return false;
+      identity = g_state_function_identity;
+    }
+    if (!identity.module || !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+          reinterpret_cast<LPCWSTR>(function), &module)) return false;
+    return module == identity.module && mfgunlock::hook::IsCurrent(identity);
+  }
+};
 using LoadWFn = HMODULE (WINAPI*)(LPCWSTR);
 using LoadExWFn = HMODULE (WINAPI*)(LPCWSTR, HANDLE, DWORD);
 LoadWFn g_load_w = nullptr;
@@ -582,54 +629,27 @@ void UninstallHotObservers() {
   g_core_module = nullptr;
 }
 
-bool ObserveDynamicCapability(const sl::DLSSGState& state, sl::Result result,
-                              bool from_probe) {
-  if (result != sl::Result::eOk || state.structType != sl::DLSSGState::s_structType ||
-      state.structVersion != sl::kStructVersion4) return false;
-  if (state.bIsDynamicMFGSupported != sl::Boolean::eTrue &&
-      state.bIsDynamicMFGSupported != sl::Boolean::eFalse) return false;
-  g_dynamic_supported.store(state.bIsDynamicMFGSupported == sl::Boolean::eTrue,
-                            std::memory_order_relaxed);
-  g_dynamic_state_version.store(static_cast<uint32_t>(state.structVersion),
-                                std::memory_order_relaxed);
-  g_dynamic_capability_from_probe.store(from_probe, std::memory_order_relaxed);
-  g_dynamic_capability_seen.store(true, std::memory_order_release);
-  g_dynamic_probe_result.store(static_cast<uint32_t>(result), std::memory_order_relaxed);
-  g_dynamic_probe_armed.store(false, std::memory_order_release);
-  return true;
-}
-
 sl::Result HookState(const sl::ViewportHandle& viewport, sl::DLSSGState& state,
                      const sl::DLSSGOptions* options) {
+  const uint64_t revision = g_state_function_revision.load(std::memory_order_acquire);
   auto* real = g_get_state.load(std::memory_order_acquire);
   const uint64_t ticket = Ticket();
   const uint64_t begin = ticket == 0 ? 0 : Ticks();
-  const auto result = real(viewport, state, options);
-  const bool capability_seen = ObserveDynamicCapability(state, result, false);
-
-  if (!capability_seen && g_dynamic_probe_armed.load(std::memory_order_acquire) &&
-      g_d3d12.load(std::memory_order_relaxed)) {
-    if (state.structType == sl::DLSSGState::s_structType &&
-        state.structVersion >= sl::kStructVersion1 && state.structVersion < sl::kStructVersion4 &&
-        g_dynamic_probe_armed.exchange(false, std::memory_order_acq_rel)) {
-      sl::DLSSGState extended{};
-      extended.next = state.next;
-      const auto probe_result = real(viewport, extended, options);
-      g_dynamic_probe_attempted.store(true, std::memory_order_release);
-      g_dynamic_probe_result.store(static_cast<uint32_t>(probe_result),
-                                   std::memory_order_relaxed);
-      g_dynamic_state_version.store(static_cast<uint32_t>(extended.structVersion),
-                                    std::memory_order_relaxed);
-      ObserveDynamicCapability(extended, probe_result, true);
-    } else if (g_dynamic_probe_armed.exchange(false, std::memory_order_acq_rel)) {
-      g_dynamic_probe_attempted.store(true, std::memory_order_release);
-      g_dynamic_probe_result.store(static_cast<uint32_t>(result),
-                                   std::memory_order_relaxed);
-      g_dynamic_state_version.store(static_cast<uint32_t>(state.structVersion),
-                                    std::memory_order_relaxed);
-    }
-  }
-
+  StateProbeLease lease;
+  const auto result = g_dynamic_probe.OnGetState(real, viewport, state, options,
+      [&] {
+        return (revision & 1) == 0 &&
+            g_state_function_revision.load(std::memory_order_acquire) == revision &&
+            g_get_state.load(std::memory_order_acquire) == real;
+      },
+      [&] { return lease.Acquire(real); },
+      [&](bool starting, sl::Result result) {
+        std::string message = "mfgdiagnostics: manual Dynamic GetState v4 ";
+        message += starting ? "BEGIN" : "END";
+        message += " viewport=" + std::to_string(static_cast<uint32_t>(viewport));
+        if (!starting) message += " result=" + std::to_string(static_cast<uint32_t>(result));
+        reshade::log::message(reshade::log::level::info, message.c_str());
+      });
   if (ticket != 0) {
     Submit(SnapshotState(state, result), ticket, begin, static_cast<uint32_t>(viewport),
            UINT32_MAX, result);
@@ -757,16 +777,17 @@ sl::Result HookFunction(sl::Feature feature, const char* name, void*& function) 
     function = reinterpret_cast<void*>(&HookOptions);
   } else if (std::strcmp(name, "slDLSSGGetState") == 0 &&
              function != reinterpret_cast<void*>(&HookState)) {
-    g_get_state.store(reinterpret_cast<PFun_slDLSSGGetState*>(function), std::memory_order_release);
+    BindStateFunction(reinterpret_cast<PFun_slDLSSGGetState*>(function));
     function = reinterpret_cast<void*>(&HookState);
   }
   return result;
 }
 
-void TryInstall() {
+void TryInstall(HMODULE observed = nullptr) {
   if (!g_enabled || g_installed.load(std::memory_order_acquire)) return;
   if (!TryAcquireSRWLockExclusive(&g_install_lock)) return;
-  HMODULE module = GetModuleHandleW(L"sl.interposer.dll");
+  HMODULE module = interposer::Modern(observed) ? observed : GetModuleHandleW(L"sl.interposer.dll");
+  if (!interposer::Modern(module)) module = nullptr;
   if (module != nullptr && !g_installed.load(std::memory_order_relaxed)) {
     g_hooks.clear();
     const mfgunlock::hook::HookItem candidates[] = {
@@ -777,7 +798,7 @@ void TryInstall() {
     };
     uint32_t exports = 0;
     for (size_t i = 0; i < std::size(candidates); ++i) {
-      if (GetProcAddress(module, std::get<0>(candidates[i])) == nullptr) continue;
+      if (!interposer::OwnExecutableExport(module, std::get<0>(candidates[i]))) continue;
       g_hooks.push_back(candidates[i]);
       exports |= 1u << i;
     }
@@ -789,16 +810,43 @@ void TryInstall() {
   ReleaseSRWLockExclusive(&g_install_lock);
 }
 
+// ReShade device/present/overlay callbacks are outside loader initialization.
+// Inventory runs initially or after an observed module load, never every frame
+// just because a conventional filename was absent.
+void DiscoverInterposer() {
+  if (!g_enabled || g_installed.load(std::memory_order_acquire) ||
+      !g_interposer_inventory.Take()) return;
+  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+  if (snapshot == INVALID_HANDLE_VALUE) return;
+  MODULEENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  if (Module32FirstW(snapshot, &entry)) {
+    do {
+      if (interposer::Modern(entry.hModule)) TryInstall(entry.hModule);
+      if (g_installed.load(std::memory_order_acquire)) break;
+    } while (Module32NextW(snapshot, &entry));
+  }
+  CloseHandle(snapshot);
+}
+
 HMODULE WINAPI HookLoadW(LPCWSTR path) {
   HMODULE module = g_load_w(path);
-  if (module != nullptr) TryInstall();
+  if (module != nullptr) {
+    ObserveStateOwnerLoad(module);
+    g_interposer_inventory.Loaded();
+    TryInstall(module);
+  }
   return module;
 }
 
 HMODULE WINAPI HookLoadExW(LPCWSTR path, HANDLE file, DWORD flags) {
   HMODULE module = g_load_ex_w(path, file, flags);
   if (module != nullptr && (flags & (LOAD_LIBRARY_AS_DATAFILE |
-      LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)) == 0) TryInstall();
+      LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE)) == 0) {
+    ObserveStateOwnerLoad(module);
+    g_interposer_inventory.Loaded();
+    TryInstall(module);
+  }
   return module;
 }
 
@@ -1496,10 +1544,29 @@ bool WriteTextFile(const std::filesystem::path& path, const std::string& data) {
 
 // Formatting, module inventory and file I/O run only on the explicitly requested
 // export worker after recording has stopped. Never enumerate modules in Present.
+// Reuse existing tag interception and its bounded capture. Never install a
+// parallel HUDTRACE hook in the production addon or start continuous logging.
+hudtags::Role HudTagRole(uint64_t type) {
+  if (type == static_cast<uint64_t>(sl::kBufferTypeHUDLessColor)) return hudtags::Role::hudless;
+  if (type == static_cast<uint64_t>(sl::kBufferTypeUIAlpha)) return hudtags::Role::ui_alpha;
+  if (type == static_cast<uint64_t>(sl::kBufferTypeUIColorAndAlpha)) return hudtags::Role::ui_color_alpha;
+  return hudtags::Role::other;
+}
+
+Json HudTagCountsJson(const hudtags::Counts& counts) {
+  return {{"observations", counts.total}, {"active_tags", counts.active},
+      {"clear_tags", counts.clear}, {"unframed_tags", counts.unframed},
+      {"native_identity_unavailable", counts.native_identity_unavailable},
+      {"distinct_native_resources", counts.distinct_native_resources.size()},
+      {"native_resource_changes", counts.native_resource_changes},
+      {"failed_calls", counts.failed_calls}};
+}
+
 DWORD WINAPI ExportWorker(LPVOID pinned_module) {
   std::string message;
   bool export_succeeded = false;
   try {
+    const auto dynamic = g_dynamic_probe.Read();
     Json root = {{"schema", 1}, {"label", kLabels[g_recorded_label]},
       {"qpc_frequency", g_frequency}, {"dropped_events", g_capture.dropped.load()},
       {"capacity_exhausted", g_capture.full.load()},
@@ -1511,17 +1578,19 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
       {"state_downstream_owner", FunctionOwner(reinterpret_cast<const void*>(g_get_state.load()))},
       {"nvapi_at_export", ObserveNvapi()},
       {"dynamic_mfg_capability", {
-          {"seen", g_dynamic_capability_seen.load(std::memory_order_acquire)},
-          {"supported", g_dynamic_capability_seen.load(std::memory_order_acquire)
-              ? Json(g_dynamic_supported.load(std::memory_order_relaxed)) : Json(nullptr)},
-          {"state_version", g_dynamic_state_version.load(std::memory_order_relaxed)},
-          {"source", g_dynamic_capability_seen.load(std::memory_order_acquire)
-              ? Json(g_dynamic_capability_from_probe.load(std::memory_order_relaxed)
+          {"seen", dynamic.seen},
+          {"supported", dynamic.seen
+              ? Json(dynamic.supported) : Json(nullptr)},
+          {"state_version", dynamic.state_version},
+          {"viewport", dynamic.viewport == UINT32_MAX ? Json(nullptr) : Json(dynamic.viewport)},
+          {"generation", dynamic.generation},
+          {"source", dynamic.seen
+              ? Json(dynamic.from_probe
                     ? "one-shot probe" : "game GetState")
               : Json(nullptr)},
-          {"probe_attempted", g_dynamic_probe_attempted.load(std::memory_order_acquire)},
-          {"probe_result", g_dynamic_probe_result.load(std::memory_order_relaxed) == UINT32_MAX
-              ? Json(nullptr) : Json(g_dynamic_probe_result.load(std::memory_order_relaxed))}}},
+          {"probe_attempted", dynamic.attempted},
+          {"probe_result", dynamic.result == UINT32_MAX
+              ? Json(nullptr) : Json(dynamic.result)}}},
       {"notes", "Read-only diagnostic boundary. NGX Evaluate events are provider-call observations, not GPU completion, "
                 "but generated candidates are not proof of displayed pixels because Streamline pacing may drop them. "
                 "Legacy tags have no explicit frame ID. Format does not establish color encoding. "
@@ -1540,6 +1609,7 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
     int last_dynamic_mode = -1;
     uint64_t fixed_count_events = 0, retry_count_events = 0, fallback_count_events = 0;
     std::unordered_map<uint64_t, uint64_t> ids;
+    hudtags::Summary hud_tag_summary;
     auto identity = [&](uint64_t value) -> Json {
       if (value == kUnknown || value == 0) return nullptr;
       auto [it, inserted] = ids.try_emplace(value, ids.size() + 1);
@@ -1591,9 +1661,34 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
         } else if (event.kind == Kind::tag) {
           row["values"][4] = identity(event.values[4]);
           row["values"][13] = identity(event.values[13]);
+          // Preserve existing schema-2 fields and append HUD-specific evidence.
+          // Resource pointers remain session-local identities in exported JSON.
+          const auto role = HudTagRole(event.values[0]);
           trace["resource_tag"] = {{"type", OptionalValue(event.values[0])},
               {"resource", identity(event.values[4])}, {"width", OptionalValue(event.values[5])},
-              {"height", OptionalValue(event.values[6])}, {"format", OptionalValue(event.values[7])}};
+              {"height", OptionalValue(event.values[6])}, {"format", OptionalValue(event.values[7])},
+              {"role", hudtags::Name(role)},
+              {"lifecycle", OptionalValue(event.values[1])},
+              {"tag_resource_present", event.values[2] == kUnknown
+                  ? Json(nullptr) : Json(event.values[2] != 0)},
+              {"native_handle_observed", event.values[4] == kUnknown
+                  ? Json(nullptr) : Json(event.values[4] != 0)},
+              {"native_state", OptionalValue(event.values[8])},
+              {"extent", {{"left", OptionalValue(event.values[9])},
+                          {"top", OptionalValue(event.values[10])},
+                          {"width", OptionalValue(event.values[11])},
+                          {"height", OptionalValue(event.values[12])}}},
+              {"tracked_descriptor", event.values[20] == 1 ? Json({
+                  {"width", OptionalValue(event.values[14])},
+                  {"height", OptionalValue(event.values[15])},
+                  {"format", OptionalValue(event.values[16])}}) : Json(nullptr)}};
+          if (event.recognized && role != hudtags::Role::other) {
+            hud_tag_summary.Observe({role, event.viewport, event.frame,
+                event.values[2] == 1,
+                event.values[4] == kUnknown ? 0 : event.values[4],
+                event.result != UINT32_MAX,
+                event.result == static_cast<uint32_t>(sl::Result::eOk)});
+          }
         } else if (event.kind == Kind::frame_count) {
           row["frame_count"] = CountEvent(event);
           trace["frame_count"] = row["frame_count"];
@@ -1768,6 +1863,19 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
                        {"missing", Json::array({"exact resource contents", "verified standalone DLSS-G initialization context", "verified resource-state/synchronization contract", "Streamline pacer context"})}}},
       };
     }
+    // Observations only: unframed/global tags may remain valid over many
+    // frames, and dropped events preclude claims of absent pairs.
+    const auto hud_frames = hud_tag_summary.FrameTotals();
+    summary["hud_tag_observations"] = {
+        {"hudless", HudTagCountsJson(hud_tag_summary.Hudless())},
+        {"ui_alpha", HudTagCountsJson(hud_tag_summary.UiAlpha())},
+        {"ui_color_alpha", HudTagCountsJson(hud_tag_summary.UiColorAlpha())},
+        {"frame_scoped", {
+            {"frames_with_any_hud_tag", hud_frames.frames_with_any_hud_tag},
+            {"frames_with_observed_pair", hud_frames.frames_with_observed_hud_pair},
+            {"frames_with_partial_observation", hud_frames.frames_with_partial_hud_observation}}},
+        {"coverage", "Captured Streamline calls only. Missing events are not missing GPU tags; "
+                     "resource identities and CPU success do not prove pixel content or correct pacing."}};
     summary["evaluate_capture_count"] = manifest.is_null() ? 0 : 1;
 
     const auto addon_path = ModulePath(static_cast<HMODULE>(pinned_module));
@@ -1805,6 +1913,7 @@ DWORD WINAPI ExportWorker(LPVOID pinned_module) {
 }
 
 void OnDevice(reshade::api::device* device) {
+  g_dynamic_probe.Invalidate();
   g_d3d12.store(device->get_api() == reshade::api::device_api::d3d12, std::memory_order_relaxed);
   IUnknown* native = nullptr;
   if (device->get_api() == reshade::api::device_api::d3d12 && device->get_native() != 0) {
@@ -1819,9 +1928,11 @@ void OnDevice(reshade::api::device* device) {
   }
   if (previous != nullptr) previous->Release();
   TryInstall();
+  DiscoverInterposer();
 }
 
 void OnDestroyDevice(reshade::api::device* device) {
+  g_dynamic_probe.Invalidate();
   if (device->get_api() != reshade::api::device_api::d3d12 || device->get_native() == 0) return;
   IUnknown* previous = nullptr;
   {
@@ -1832,6 +1943,18 @@ void OnDestroyDevice(reshade::api::device* device) {
   }
   previous->Release();
 }
+
+#if MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG == 0
+void OnProbeSwapchainLifetime(reshade::api::swapchain*) {
+  g_dynamic_probe.Invalidate();
+}
+#elif MFGUNLOCK_RESHADE_SWAPCHAIN_RESIZE_ARG == 1
+void OnProbeSwapchainLifetime(reshade::api::swapchain*, bool) {
+  g_dynamic_probe.Invalidate();
+}
+#else
+#error "Unsupported ReShade swapchain callback ABI"
+#endif
 
 void OnInitResource(reshade::api::device* device, const reshade::api::resource_desc& desc,
                     const reshade::api::subresource_data*, reshade::api::resource_usage,
@@ -1914,6 +2037,7 @@ void OnPushDescriptors(reshade::api::command_list*, reshade::api::shader_stage,
 void OnPresent(reshade::api::command_queue*, reshade::api::swapchain* swapchain,
                const reshade::api::rect*, const reshade::api::rect*, uint32_t,
                const reshade::api::rect*) {
+  DiscoverInterposer();
   const uint64_t present_qpc = Ticks();
   const uint32_t backbuffer_count = swapchain->get_back_buffer_count();
   if (backbuffer_count != 0) {
@@ -2007,6 +2131,7 @@ void LaunchExport() {
 }
 
 void OnOverlay(reshade::api::effect_runtime*) {
+  DiscoverInterposer();
   static bool enabled = g_enabled;
   if (ImGui::Checkbox("Enable observation hooks (restart required)", &enabled))
     reshade::set_config_value(nullptr, kSection, "Enabled", enabled ? 1 : 0);
@@ -2018,30 +2143,32 @@ void OnOverlay(reshade::api::effect_runtime*) {
       (g_optional_exports.load() & 4) ? "available" : "unavailable",
       (g_optional_exports.load() & 8) ? "available" : "unavailable");
 
-  if (g_dynamic_capability_seen.load(std::memory_order_acquire)) {
+  const auto dynamic = g_dynamic_probe.Read();
+  if (dynamic.seen) {
     ImGui::Text("Dynamic MFG capability: %s (state v%u, %s).",
-                g_dynamic_supported.load(std::memory_order_relaxed) ? "SUPPORTED" : "UNSUPPORTED",
-                g_dynamic_state_version.load(std::memory_order_relaxed),
-                g_dynamic_capability_from_probe.load(std::memory_order_relaxed)
+                dynamic.supported ? "SUPPORTED" : "UNSUPPORTED",
+                dynamic.state_version,
+                dynamic.from_probe
                     ? "one-shot probe" : "game GetState");
-  } else if (g_dynamic_probe_attempted.load(std::memory_order_acquire)) {
+  } else if (dynamic.attempted && dynamic.result == UINT32_MAX) {
+    ImGui::TextDisabled("Dynamic MFG capability query is in progress.");
+  } else if (dynamic.attempted) {
     ImGui::Text("Dynamic MFG probe returned 0x%x without a capability result.",
-                g_dynamic_probe_result.load(std::memory_order_relaxed));
+                dynamic.result);
   } else {
     ImGui::TextDisabled("Dynamic MFG capability: not observed.");
   }
-  const bool can_probe = g_d3d12.load(std::memory_order_relaxed) &&
-                         g_get_state.load(std::memory_order_acquire) != nullptr;
-  ImGui::BeginDisabled(!can_probe || g_dynamic_probe_armed.load(std::memory_order_acquire));
+  const bool can_probe = g_get_state.load(std::memory_order_acquire) != nullptr;
+  ImGui::BeginDisabled(!can_probe || g_dynamic_probe.Armed());
   if (ImGui::Button("Arm one-shot Dynamic MFG capability probe")) {
-    g_dynamic_probe_attempted.store(false, std::memory_order_release);
-    g_dynamic_capability_seen.store(false, std::memory_order_release);
-    g_dynamic_probe_result.store(UINT32_MAX, std::memory_order_relaxed);
-    g_dynamic_probe_armed.store(true, std::memory_order_release);
+    g_dynamic_probe.Arm();
   }
   ImGui::EndDisabled();
-  if (g_dynamic_probe_armed.load(std::memory_order_acquire))
-    ImGui::TextDisabled("Armed: waiting for the game's next slDLSSGGetState call.");
+  if (g_dynamic_probe.Armed())
+    ImGui::TextDisabled("Armed: waiting for the game's next current slDLSSGGetState call.");
+  if (dynamic.viewport != UINT32_MAX)
+    ImGui::TextDisabled("Observed viewport: %u; generation: %llu.", dynamic.viewport,
+                        static_cast<unsigned long long>(dynamic.generation));
 
   const bool saving = g_saving.load(std::memory_order_acquire);
   const bool active = Ticket() != 0;
@@ -2137,6 +2264,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       TryInstall();
       reshade::register_event<reshade::addon_event::init_device>(OnDevice);
       reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+      reshade::register_event<reshade::addon_event::init_swapchain>(OnProbeSwapchainLifetime);
+      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnProbeSwapchainLifetime);
       reshade::register_event<reshade::addon_event::init_resource>(OnInitResource);
       reshade::register_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::register_event<reshade::addon_event::init_resource_view>(OnInitResourceView);
@@ -2149,6 +2278,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
     }
     reshade::register_overlay("MFG Diagnostics", OnOverlay);
   } else if (reason == DLL_PROCESS_DETACH) {
+    g_dynamic_probe.Invalidate();
     g_capture.Stop();
     UninstallHotObservers();
     reshade::unregister_overlay("MFG Diagnostics", OnOverlay);
@@ -2162,6 +2292,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved) {
       reshade::unregister_event<reshade::addon_event::init_resource_view>(OnInitResourceView);
       reshade::unregister_event<reshade::addon_event::destroy_resource>(OnDestroyResource);
       reshade::unregister_event<reshade::addon_event::init_resource>(OnInitResource);
+      reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnProbeSwapchainLifetime);
+      reshade::unregister_event<reshade::addon_event::init_swapchain>(OnProbeSwapchainLifetime);
       reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
       reshade::unregister_event<reshade::addon_event::init_device>(OnDevice);
       IUnknown* device = nullptr;

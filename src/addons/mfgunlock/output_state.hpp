@@ -165,9 +165,11 @@ inline UiEncoding DetectedUiEncoding(FormatKind format_kind) {
 
 inline bool IsUiEncodingCompatible(const State& output, UiEncoding ui_encoding,
                                    bool native_streamline_tag) {
-  if (!SupportsHudSeparation(output)) return false;
+  // Coverage is independent of the output transfer function. Native tags also
+  // keep the application's own encoding contract, including unknown formats.
   if (ui_encoding == UiEncoding::kAlphaOnly) return true;
   if (ui_encoding == UiEncoding::kOutputEncoded) return native_streamline_tag;
+  if (!output.known) return false;
 
   // Existing automatic UI discovery observes RGBA8 SDR render targets. Preserve
   // that path for SDR outputs, but never treat those pixels as HDR10/PQ data.

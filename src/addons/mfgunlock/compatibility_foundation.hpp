@@ -129,25 +129,19 @@ inline size_t CountOwnCode(std::span<const ExportSymbol> symbols, std::string_vi
   }));
 }
 inline StreamlineFamily ClassifyStreamline(std::span<const ExportSymbol> symbols) {
-  constexpr std::array core{"slInit", "slShutdown", "slSetTag", "slEvaluateFeature"};
-  constexpr std::array modern{"slGetFeatureFunction", "slGetFeatureRequirements", "slGetFeatureVersion"};
-  constexpr std::array legacy{"slGetFeatureSettings", "slSetFeatureConstants"};
-  const auto complete = [&](const auto& names) {
-    return std::all_of(names.begin(), names.end(), [&](const auto* name) { return CountOwnCode(symbols, name) == 1; });
-  };
-  const auto any = [&](const auto& names) {
-    return std::any_of(names.begin(), names.end(), [&](const auto* name) { return CountOwnCode(symbols, name) != 0; });
-  };
-  const auto duplicate = [&](const auto& names) {
-    return std::any_of(names.begin(), names.end(), [&](const auto* name) { return CountOwnCode(symbols, name) > 1; });
-  };
-  if (duplicate(core) || duplicate(modern) || duplicate(legacy)) return StreamlineFamily::kAmbiguous;
-  if (!complete(core)) return StreamlineFamily::kUnknownSafe;
-  const bool m = complete(modern);
-  const bool l = complete(legacy);
-  if (m && !any(legacy)) return StreamlineFamily::kModernSurface;
-  if (l && !any(modern)) return StreamlineFamily::kLegacySurface;
-  return m && l ? StreamlineFamily::kAmbiguous : StreamlineFamily::kUnknownSafe;
+  // The public resolver identifies the modern adapter. Optional version,
+  // requirements, tag and lifecycle exports do not need to travel together;
+  // each installed hook still checks its own executable address and lifetime.
+  // Compatibility exports from the older surface do not invalidate a modern
+  // resolver that can actually be called.
+  const size_t modern = CountOwnCode(symbols, "slGetFeatureFunction");
+  if (modern > 1) return StreamlineFamily::kAmbiguous;
+  if (modern == 1) return StreamlineFamily::kModernSurface;
+  const size_t settings = CountOwnCode(symbols, "slGetFeatureSettings");
+  const size_t constants = CountOwnCode(symbols, "slSetFeatureConstants");
+  if (settings > 1 || constants > 1) return StreamlineFamily::kAmbiguous;
+  if (settings == 1 && constants == 1) return StreamlineFamily::kLegacySurface;
+  return StreamlineFamily::kUnknownSafe;
 }
 
 struct StreamlineIdentity {

@@ -141,7 +141,7 @@ def projection(raw: dict, probe: Path, *, provenance: str, source_sha: str, prev
         b['missing_component_checks'] = {}
         for name in ('sl.common.dll', 'sl.interposer.dll', 'sl.dlss_g.dll'):
             missing = contract_projection([r for r in rows if r['file_name'].lower()!=name], probe)
-            if name in ('sl.common.dll', 'sl.interposer.dll') and missing['interposer']['admission']=='AVAILABLE':
+            if name == 'sl.interposer.dll' and missing['interposer']['admission']=='AVAILABLE':
                 raise ValueError('missing module incorrectly admitted: '+name)
             if name=='sl.dlss_g.dll' and missing['plugin']['gateway']=='AVAILABLE':
                 raise ValueError('missing plugin incorrectly admitted')

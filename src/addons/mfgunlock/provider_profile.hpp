@@ -115,7 +115,8 @@ inline constexpr std::array<Region, 39> kEndpointPayloads{{
 }};
 
 
-// Exact pristine SM89 containers which the retarget transaction is allowed to edit.
+// Historical pristine SM89 inventory for diagnostics and regression comparison.
+// The retarget transaction inspects actual containers independently of this list.
 inline constexpr std::array<Region, 70> kRetargetPayloads{{
     {0x18da20, 0x1b40, 0x9a5ccecff5711c58ull},
     {0x1c1c60, 0x390, 0xa2041775a503e275ull},
@@ -191,7 +192,7 @@ inline constexpr std::array<Region, 70> kRetargetPayloads{{
 
 struct PtxProfile {
   uint32_t arch;
-  size_t declared_raw_size;  // zero when normalized identity is the authoritative guard
+  size_t declared_raw_size;  // historical reference, never runtime admission
   size_t normalized_size;
   uint64_t raw_fnv1a64;
   size_t descriptor_references;
@@ -271,8 +272,8 @@ inline constexpr ProviderProfile kDlssg31091{
     kEndpointSelectors, kEndpointVtables, kMfgGates, kQualityKernels, {89, 86, 75}, {2, 14, 1}, 5, 4, 5};
 inline constexpr std::array<ProviderProfile, 1> kProfiles{{kDlssg31091}};
 
-// This is discovery only. Callers still must match the exact relevant bytes,
-// descriptors and successful target preparation before publishing any patch.
+// This is diagnostic discovery only. Runtime transformations prove current
+// structure and commit witnesses without requiring any entry in this table.
 inline const ProviderProfile* Find(uint32_t timestamp, uint32_t image_size,
                                   std::span<const ProviderProfile> profiles = kProfiles) {
   for (const auto& profile : profiles)

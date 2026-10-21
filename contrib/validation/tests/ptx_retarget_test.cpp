@@ -25,10 +25,14 @@ constexpr std::string_view kPtx =
     ".address_size 64\n"
     ".visible .entry test() { ret; }\n";
 
-void Check(bool value) {
+void CheckAt(bool value, unsigned int line) {
   ++g_cases;
-  if (!value) throw std::runtime_error("case " + std::to_string(g_cases));
+  if (!value) throw std::runtime_error("case " + std::to_string(g_cases) + " at line " + std::to_string(line));
 }
+
+// Preserve call-site diagnostics without requiring std::source_location support.
+// Variadic arguments retain commas in template and initializer-list expressions.
+#define Check(...) CheckAt((__VA_ARGS__), __LINE__)
 
 template <class T>
 void Put(Bytes& bytes, size_t offset, T value) {
@@ -68,6 +72,60 @@ Bytes Container(std::string text, const Bytes* payload = nullptr,
   Put<uint64_t>(fatbin, 72, text.size());
   std::copy(compressed.begin(), compressed.end(), fatbin.begin() + payload_offset);
   return fatbin;
+}
+
+void GeneralSourceTargets() {
+  for (const uint32_t source_sm : {90u, 120u, 999u}) {
+    for (const bool compressed : {false, true}) {
+      auto text = std::string(kPtx);
+      text.replace(text.find("sm_89"), 5, "sm_" + std::to_string(source_sm));
+      text += "// arbitrary producer suffix preserved\n";
+      auto bin = Container(text, nullptr, 136, 0x10002041);
+      Put<uint32_t>(bin, 44, source_sm);
+      if (!compressed) {
+        bin.resize(16 + 136 + ((text.size() + 1 + 7) & ~size_t{7}));
+        Put<uint64_t>(bin, 8, bin.size() - 16);
+        Put<uint64_t>(bin, 24, bin.size() - 16 - 136);
+        Put<uint32_t>(bin, 32, 0); Put<uint64_t>(bin, 56, 0x10000041); Put<uint64_t>(bin, 72, 0);
+        std::fill(bin.begin() + 152, bin.end(), 0);
+        std::copy(text.begin(), text.end(), bin.begin() + 152);
+      }
+      const auto before = bin;
+      for (const auto& profile : {mfgunlock::architecture::kAmpere, mfgunlock::architecture::kTuring}) {
+        ptx::Plan plan; std::string why;
+        Check(ptx::Retarget(bin, plan, why, profile) == ptx::Result::kRetargeted);
+        std::vector<fb::Entry> entries; size_t end = 0; Bytes decoded;
+        Check(fb::Parse(plan.replacement, entries, end) && entries.size() == 1 &&
+              entries[0].architecture == profile.target_sm);
+        Check(fb::DecodePtx(plan.replacement, entries[0], decoded));
+        auto expected = text;
+        expected.replace(expected.find("sm_" + std::to_string(source_sm)),
+                         std::to_string(source_sm).size() + 3, "sm_" + std::to_string(profile.target_sm));
+        Check(std::string(reinterpret_cast<const char*>(decoded.data())) == expected);
+        Check(bin == before && plan.ptx_bytes > 0);
+      }
+    }
+  }
+  auto make = [](uint32_t sm, std::string_view marker) {
+    auto text = std::string(kPtx);
+    text.replace(text.find("sm_89"), 5, "sm_" + std::to_string(sm));
+    text += "// " + std::string(marker) + "\n";
+    auto bin = Container(text); Put<uint32_t>(bin, 44, sm); return bin;
+  };
+  auto combined = make(120, "higher source");
+  const auto near = make(90, "closest source");
+  combined.insert(combined.end(), near.begin() + 16, near.end());
+  Put<uint64_t>(combined, 8, combined.size() - 16);
+  ptx::Plan plan; std::string why;
+  Check(ptx::Retarget(combined, plan, why) == ptx::Result::kRetargeted);
+  std::vector<fb::Entry> entries; size_t end = 0; Bytes decoded;
+  Check(fb::Parse(plan.replacement, entries, end) && entries.size() == 1 &&
+        fb::DecodePtx(plan.replacement, entries[0], decoded));
+  Check(std::string(reinterpret_cast<const char*>(decoded.data())).find("closest source") != std::string::npos);
+  const auto native = make(86, "existing target");
+  combined.insert(combined.end(), native.begin() + 16, native.end());
+  Put<uint64_t>(combined, 8, combined.size() - 16);
+  Check(ptx::Retarget(combined, plan, why) == ptx::Result::kUnchanged && plan.replacement.empty());
 }
 
 void PackedHalfTests() {
@@ -324,8 +382,7 @@ void UnitTests() {
           ptx::Result::kRejected);
   }
 
-  for (const char* tail : {"\n.target sm_89\n", "\n.version 8.8\n", "\n/* open",
-                           "\nwgmma.mma_async;\n"}) {
+  for (const char* tail : {"\n.target sm_89\n", "\n.version 8.8\n", "\n/* open"}) {
     Check(ptx::Retarget(Container(std::string(kPtx) + tail), plan, reason) ==
           ptx::Result::kRejected);
   }
@@ -346,7 +403,7 @@ void UnitTests() {
 
   auto bad_flags = valid;
   Put<uint64_t>(bad_flags, 56, 0x2040);
-  Check(ptx::Retarget(bad_flags, plan, reason) == ptx::Result::kRejected);
+  Check(ptx::Retarget(bad_flags, plan, reason) == ptx::Result::kRetargeted);
 
   // 0x2011/120-byte entries are a second observed bounded LZ4 PTX layout.
   // Both targets accept this bounded envelope; the decoded PTX is still checked.
@@ -361,8 +418,8 @@ void UnitTests() {
   Check(fb::ReadU32(plan.replacement.data() + 44) == 75);
   const auto flags2011_bad_header = Container(std::string(kPtx), nullptr, 112, 0x2011);
   Check(ptx::Retarget(flags2011_bad_header, plan, reason,
-                      mfgunlock::architecture::kAmpere) == ptx::Result::kRejected);
-  Check(reason == "unreviewed PTX compression flags/layout");
+                      mfgunlock::architecture::kAmpere) == ptx::Result::kRetargeted);
+  Check(fb::ReadU64(plan.replacement.data() + 56) == 0x2011);
 
   auto overflow = valid;
   Put<uint64_t>(overflow, 24, UINT64_MAX);
@@ -379,8 +436,8 @@ void UnitTests() {
                                overlap_output.size()));
   Check(overlap_output == Bytes(9, 'a'));
 
-  // Same literal reused by a match: the target edit must be refused rather than
-  // silently changing another decoded byte through the back-reference.
+  // Same literal reused by a match: rebuild instead of refusing the trial, and
+  // verify the unrelated decoded occurrence does not change.
   std::string prefix(kPtx);
   auto block = LiteralBlock(prefix);
   block[0] |= 1;  // match length 5
@@ -391,12 +448,17 @@ void UnitTests() {
   block.push_back(0x10);
   block.push_back(0);
   Check(ptx::Retarget(Container(prefix + "sm_89", &block), plan, reason) ==
-        ptx::Result::kRejected);
-  Check(reason == "target literal is shared with another output byte");
+        ptx::Result::kRetargeted);
+  std::vector<fb::Entry> alias_entries; size_t alias_end = 0;
+  Check(fb::Parse(plan.replacement, alias_entries, alias_end));
+  Bytes alias_raw;
+  Check(fb::DecodePtx(plan.replacement, alias_entries.front(), alias_raw));
+  const std::string alias_text(alias_raw.begin(), alias_raw.end());
+  Check(alias_text.find(".target sm_86") != alias_text.npos && alias_text.find("sm_89") != alias_text.npos);
 
   Check(ptx::Retarget(Container(prefix + "sm_89", &block), plan, reason,
-                     mfgunlock::architecture::kTuring) == ptx::Result::kRejected);
-  Check(reason == "target literal is shared with another output byte");
+                     mfgunlock::architecture::kTuring) == ptx::Result::kRetargeted);
+  Check(reason.empty());
 
   Check(ptx::Retarget(valid, plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRetargeted);
   auto turing_expected = valid;
@@ -413,7 +475,7 @@ void UnitTests() {
                                   "mma.sp.sync", "cvt.rn.bf16.f32", "mma.sync.aligned.m16n8k16",
                                   "cvt.rn.f16x2.f32", "max.f16", "min.f16x2"}) {
     const auto input = Container(std::string(kPtx) + instruction + ";\n");
-    Check(ptx::Retarget(input, plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRejected);
+    Check(ptx::Retarget(input, plan, reason, mfgunlock::architecture::kTuring) == ptx::Result::kRetargeted);
     Check(ptx::Retarget(input, plan, reason, mfgunlock::architecture::kAmpere) == ptx::Result::kRetargeted);
   }
   Check(ptx::Retarget(Container(std::string(kPtx) + "// cp.async; .tf32; mbarrier.init;\n"),
@@ -449,6 +511,23 @@ void UnitTests() {
   invalid_entry = entry;
   invalid_entry.offset = roomy.size();
   Check(!ptx::RebuildLoweredProvider(roomy, invalid_entry, lowered, rebuilt));
+
+  // Rebuilding changes only the storage bit; unrelated producer flag bits
+  // are neither an admission table nor discarded metadata.
+  auto flagged = Container(std::string(kPtx), nullptr, 96, 0x102011);
+  Check(fb::Parse(flagged, entries, container_end));
+  const auto flagged_entry = entries.front();
+  flagged.resize(flagged.size() + 512);
+  Check(ptx::RebuildLoweredProvider(flagged, flagged_entry, lowered, rebuilt));
+  Check(fb::Parse(rebuilt, entries, container_end) && entries[0].flags == 0x100011);
+  auto raw_source = rebuilt;
+  const auto raw_entry = entries[0];
+  Check(ptx::RepackCompressedProvider(raw_source, raw_entry, lowered, rebuilt));
+  Check(fb::Parse(rebuilt, entries, container_end) && entries[0].flags == 0x102011 &&
+        entries[0].compressed_bytes != 0);
+  Bytes decoded;
+  Check(fb::DecodePtx(rebuilt, entries[0], decoded) &&
+        std::string(reinterpret_cast<const char*>(decoded.data())) == lowered);
 
   std::mt19937 random(13);
   for (unsigned int i = 0; i < 1000; ++i) {
@@ -629,11 +708,14 @@ void Corpus(const std::filesystem::path& path, const std::filesystem::path& outp
   std::cout << "corpus_retargeted=" << accepted << '\n';
 }
 
+#undef Check
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     UnitTests();
+    GeneralSourceTargets();
     TuringMmaFragments();
     StructuralSm75Tests();
     if (argc == 3) {

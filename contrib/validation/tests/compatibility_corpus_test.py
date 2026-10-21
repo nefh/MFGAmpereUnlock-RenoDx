@@ -182,10 +182,11 @@ class FoundationTests(unittest.TestCase):
         i=row('sl.interposer.dll',MODERN); co=row('sl.common.dll',['slGetPluginFunction'])
         self.assertEqual(c.classify_bundle([i,i,co])['assembly_family'],'unknown-safe')
 
-    def test_legacy_modern_ambiguous_surfaces(self):
+    def test_independent_typed_operation_surfaces(self):
         self.assertEqual(row('sl.interposer.dll',LEGACY)['family'],'legacy-export-surface')
-        self.assertEqual(row('sl.interposer.dll',MODERN+LEGACY[-2:])['family'],'ambiguous-export-surface')
-        self.assertEqual(row('sl.interposer.dll',CORE+['slGetFeatureFunction'])['family'],'unknown-safe')
+        self.assertEqual(row('sl.interposer.dll',MODERN+LEGACY[-2:])['family'],'modern-export-surface')
+        self.assertEqual(row('sl.interposer.dll',CORE+['slGetFeatureFunction'])['family'],'modern-export-surface')
+        self.assertEqual(row('sl.interposer.dll',['slGetFeatureFunction'])['family'],'modern-export-surface')
 
     def test_unknown_provider_no_authorization(self):
         data = c.analyze_bytes(fake_pe(),provider_requested=True)
@@ -198,6 +199,26 @@ class FoundationTests(unittest.TestCase):
         observations = c.transform_profile_observations([])
         self.assertEqual(len(observations['kPackedHalfProfiles']), 5)
         self.assertEqual(len(observations['kTuringMmaProfiles']), 27)
+
+    def test_temporal_inventory_uses_local_role_shape(self):
+        text = (b'.version 8.7\n.target sm_999\n.visible .entry main_kernel(\n'
+                b'.param .align 16 .b8 actual_name[144]) {\n.reg .f32 %v<2>;\n'
+                b'renamed_join:\n' + b'mul.ftz.f32 %v0, %v1, 0f3F000000;\n' * 104 + b'ret;\n}\n'
+                b'// mul.ftz.f32 %v0, %v1, 0f3F000000;\n'
+                b'.entry unrelated() {mul.ftz.f32 %v0, %v1, 0f3F000000;}\n')
+        entry = {'_text': text, 'architecture': 999, 'declared_raw_bytes': len(text),
+                 'normalized_sha256': c.sha(text)}
+        result = c.temporal_observations([{'rva': 0x2000, 'entries': [entry]}])
+        role = result['profiles'][0]
+        self.assertEqual(role['candidates'][0]['midpoint_count'], 104)
+        self.assertEqual(role['candidates'][0]['parameter_symbol'], 'actual_name')
+        self.assertTrue(role['candidates'][0]['local_shape_observed'])
+        self.assertEqual(role['status']['state'], 'OBSERVED')
+        self.assertEqual(result['transform_execution'], 'NOT_RUN')
+        self.assertFalse(result['runtime_authorized'])
+        entry['_text'] = text.replace(b'[144]', b'[140]')
+        result = c.temporal_observations([{'rva': 0x2000, 'entries': [entry]}])
+        self.assertFalse(result['profiles'][0]['candidates'][0]['local_shape_observed'])
 
     def test_random_bounded_header_mutations(self):
         rng=random.Random(20260929); base=fake_pe(MODERN,fatbin=envelope())

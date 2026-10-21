@@ -58,11 +58,23 @@ int main(int argc, char** argv) {
     Check(c::ClassifyStreamline(modern) == c::StreamlineFamily::kModernSurface, "modern surface");
     auto collision = modern;
     collision.insert(collision.end(), {{"slGetFeatureSettings", true}, {"slSetFeatureConstants", true}});
-    Check(c::ClassifyStreamline(collision) == c::StreamlineFamily::kAmbiguous, "ABI collision");
+    Check(c::ClassifyStreamline(collision) == c::StreamlineFamily::kModernSurface,
+          "modern resolver with old compatibility exports is still callable");
     modern.push_back({"slInit", true});
-    Check(c::ClassifyStreamline(modern) == c::StreamlineFamily::kAmbiguous, "duplicate core export");
+    Check(c::ClassifyStreamline(modern) == c::StreamlineFamily::kModernSurface,
+          "unrelated lifecycle ambiguity does not invalidate resolver");
+    modern.push_back({"slGetFeatureFunction", true});
+    Check(c::ClassifyStreamline(modern) == c::StreamlineFamily::kAmbiguous,
+          "duplicate resolver cannot select a unique operation");
     legacy[0].own_code = false;
-    Check(c::ClassifyStreamline(legacy) == c::StreamlineFamily::kUnknownSafe, "forwarder is not verified local code");
+    Check(c::ClassifyStreamline(legacy) == c::StreamlineFamily::kLegacySurface,
+          "unrelated forwarded lifecycle does not invalidate legacy operations");
+    legacy.back().own_code = false;
+    Check(c::ClassifyStreamline(legacy) == c::StreamlineFamily::kUnknownSafe,
+          "forwarded ABI discriminator is not verified local code");
+    std::array<c::ExportSymbol, 1> minimal{{{"slGetFeatureFunction", true}}};
+    Check(c::ClassifyStreamline(minimal) == c::StreamlineFamily::kModernSurface,
+          "single modern resolver can be used independently");
     // Owned identity strings survive the input string lifetime.
     { std::string input = "module.dll"; state.provider.library.path = input; }
     Check(state.provider.library.path == "module.dll", "identity has borrowed storage");

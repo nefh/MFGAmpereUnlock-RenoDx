@@ -67,8 +67,8 @@ inline size_t Length(const View& v,size_t at,size_t end) {
     else return 0;
   } else if(op==0x25||op==0x3d||op==0x05||op==0x0d||op==0x2d||op==0xa9) imm=op16?2:4;
   else if(op==0x3c||op==0x24||op==0xa8) imm=1;
-  else if(op==0x01||op==0x03||op==0x09||op==0x0b||op==0x21||op==0x23||
-      op==0x29||op==0x2b||op==0x31||op==0x33||op==0x38||op==0x39||op==0x3a||op==0x3b||
+  else if(op==0x01||op==0x03||op==0x09||op==0x0b||op==0x18||op==0x19||op==0x1a||op==0x1b||op==0x21||op==0x23||
+      op==0x29||op==0x2b||op==0x30||op==0x31||op==0x32||op==0x33||op==0x38||op==0x39||op==0x3a||op==0x3b||
       op==0x63||op==0x84||op==0x85||(op>=0x88&&op<=0x8d)||op==0xff||
       op==0xc6||op==0xc7||op==0x80||op==0x81||op==0x83||op==0xc0||op==0xc1||
       op==0x69||op==0x6b||(op>=0xd0&&op<=0xd3)||op==0xf6||op==0xf7) {
@@ -124,8 +124,11 @@ inline Instruction Decode(const View& v,uint32_t at,uint32_t end) {
     d.width=8;d.immediate_rva=static_cast<uint32_t>(p);d.immediate=v.image[p];return d;
   }
   if(d.op==0x3d||d.op==0x05||d.op==0x0d||d.op==0x2d||d.op==0x25) {d.rm=0;d.immediate_rva=static_cast<uint32_t>(p);d.immediate=d.width==16?fatbin::ReadU16(v.image.data()+p):v.U32(p);return d;}
-  const bool modrm=d.op==0x01||d.op==0x03||d.op==0x09||d.op==0x0b||d.op==0x21||d.op==0x23||
-      d.op==0x29||d.op==0x2b||d.op==0x31||d.op==0x33||d.op==0x38||d.op==0x39||d.op==0x3a||d.op==0x3b||
+  // These byte forms ignore REX.W. Preserve the encoded register lane;
+  // WritesRegister maps AH/CH/DH/BH to their parent only when no REX exists.
+  if(d.op==0x18||d.op==0x1a||d.op==0x30||d.op==0x32)d.width=8;
+  const bool modrm=d.op==0x01||d.op==0x03||d.op==0x09||d.op==0x0b||d.op==0x18||d.op==0x19||d.op==0x1a||d.op==0x1b||d.op==0x21||d.op==0x23||
+      d.op==0x29||d.op==0x2b||d.op==0x30||d.op==0x31||d.op==0x32||d.op==0x33||d.op==0x38||d.op==0x39||d.op==0x3a||d.op==0x3b||
       d.op==0x63||d.op==0x84||d.op==0x85||(d.op>=0x88&&d.op<=0x8d)||d.op==0xff||
       d.op==0xc6||d.op==0xc7||d.op==0x80||d.op==0x81||d.op==0x83||d.op==0xc0||d.op==0xc1||
       d.op==0x69||d.op==0x6b||(d.op>=0xd0&&d.op<=0xd3)||d.op==0xf6||d.op==0xf7||
@@ -150,6 +153,7 @@ inline Instruction Decode(const View& v,uint32_t at,uint32_t end) {
 struct Graph {
   uint32_t begin=0,end=0;
   std::map<uint32_t,Instruction> instructions;
+  std::map<uint32_t,std::vector<uint32_t>> predecessors;
   bool overlap=false;
   unsigned stopped=0;
   const Instruction* At(uint32_t at) const {
@@ -161,6 +165,7 @@ struct Graph {
     --it;return it->second.next==at?&it->second:nullptr;
   }
   bool Build(const View& v,std::pair<uint32_t,uint32_t> f) {
+    instructions.clear();predecessors.clear();overlap=false;stopped=0;
     begin=f.first;end=f.second;
     if(begin>=end||end-begin>kMaxFunctionBytes||!v.InSection(begin,end-begin,true))return false;
     std::vector<int32_t> owner(end-begin,-1);std::vector<uint32_t> pending{begin};
@@ -176,6 +181,10 @@ struct Graph {
       instructions.emplace(at,d);
       if(d.jump) {if(d.target>=begin&&d.target<end)pending.push_back(d.target);else ++stopped;}
       if(!d.terminal&&(!d.jump||d.conditional)&&d.next<end)pending.push_back(d.next);
+    }
+    for(const auto& [at,d]:instructions) {
+      if(d.jump&&At(d.target))predecessors[d.target].push_back(at);
+      if(!d.terminal&&(!d.jump||d.conditional)&&At(d.next))predecessors[d.next].push_back(at);
     }
     return !overlap;
   }
@@ -330,7 +339,7 @@ inline std::vector<Graph> Anchored(const View& v,std::string_view name) {
   return out;
 }
 struct Advertise { Site site;uint32_t ceiling=0;unsigned count_reg=0; };
-inline std::vector<Advertise> Advertisements(const View& v,const Graph& g) {
+inline std::vector<Advertise> ClassicAdvertisements(const View& v,const Graph& g) {
   std::vector<Advertise> out;
   for(const auto& [at,i]:g.instructions) {
     if(!IsCmpArch(i))continue;
@@ -383,7 +392,7 @@ inline std::vector<Execution> Executions(const View& v,const Graph& g) {
   }
   return out;
 }
-inline bool ValidateCountFlow(const View& v,const Graph& g,uint32_t ceiling) {
+inline bool ClassicValidateCountFlow(const View& v,const Graph& g,uint32_t ceiling) {
   bool named=false;
   for(const auto& [at,i]:g.instructions){(void)at;named|=StringRef(v,i,"EndpointCoreInputs::ComputeAndValidateTimeFactor");}
   if(!named)return false;
@@ -513,6 +522,13 @@ inline std::pair<uint32_t,uint32_t> CallableExtent(const View& v,uint32_t target
   return {};
 }
 inline bool WritesRegister(const Instruction& d,unsigned r) {
+  if(d.op==0x18||d.op==0x19||d.op==0x1a||d.op==0x1b||d.op==0x30||d.op==0x32) {
+    const bool register_destination=d.op==0x1a||d.op==0x1b||d.op==0x32;
+    if(!register_destination&&d.memory)return false;
+    unsigned destination=register_destination?d.reg:d.rm;
+    if(d.width==8&&!d.rex&&destination>=4&&destination<8)destination-=4;
+    return destination==r;
+  }
   if(d.call)return r==0||r==1||r==2||r==8||r==9||r==10||r==11;
   if(d.op>=0xb0&&d.op<=0xbf)return d.reg==r;
   if(d.op>=0x58&&d.op<=0x5f)return (d.op-0x58+((d.rex&1)?8:0))==r;
@@ -551,7 +567,7 @@ inline bool ZeroBefore(const Graph& g,uint32_t at,unsigned reg) {
   }
   return initialized;
 }
-inline bool ArchitectureOperand(const View& v,const Graph& g,const Site& site,uint32_t slot,
+inline bool LegacyArchitectureOperand(const View& v,const Graph& g,const Site& site,uint32_t slot,
                                 std::vector<std::pair<uint32_t,uint32_t>>& helpers) {
   const auto* compare=g.At(site.instruction);if(!compare)return false;
   const unsigned acc=compare->rm;
@@ -595,6 +611,339 @@ inline bool ArchitectureOperand(const View& v,const Graph& g,const Site& site,ui
   }
   return sources>0&&definitions>=sources;
 }
+// R5: recognize data flow, not a provider identity or a fixed instruction layout.
+// These helpers run only during discovery. They never execute vendor code.
+inline std::vector<const Instruction*> Definitions(const Graph& g,uint32_t before,unsigned reg) {
+  std::vector<uint32_t> todo{before};std::set<uint32_t> seen,defs;
+  bool entry=false;
+  while(!todo.empty()) {
+    const auto at=todo.back();todo.pop_back();if(!seen.insert(at).second)continue;
+    if(at==g.begin){entry=true;continue;}
+    const auto it=g.predecessors.find(at);
+    if(it==g.predecessors.end()){entry=true;continue;}
+    for(auto p:it->second) {
+      const auto& d=*g.At(p);
+      if(WritesRegister(d,reg))defs.insert(p);else todo.push_back(p);
+    }
+  }
+  std::vector<const Instruction*> out;
+  if(entry)out.push_back(nullptr);
+  for(auto at:defs)out.push_back(g.At(at));
+  return out;
+}
+inline bool ConstantBefore(const Graph& g,uint32_t before,unsigned reg,uint32_t& value,unsigned depth=0) {
+  if(depth>16)return false;
+  const auto defs=Definitions(g,before,reg);if(defs.empty())return false;
+  bool first=true;
+  for(const auto* d:defs) {
+    if(!d)return false;
+    uint32_t x=0;unsigned dst=0;
+    if(IsImmMov(d,dst,x)){}
+    else if((d->op==0x31||d->op==0x33)&&!d->memory&&d->reg==d->rm&&d->width==32)x=0;
+    else if(!d->memory&&d->width==32&&(d->op==0x89||d->op==0x8b)) {
+      if(!ConstantBefore(g,d->rva,d->op==0x89?d->reg:d->rm,x,depth+1))return false;
+    } else return false;
+    if(!first&&value!=x)return false;
+    value=x;first=false;
+  }
+  return !first;
+}
+// Equality of pointer provenance is useful even when its numeric value is
+// unknown. Entry tokens and instruction tokens are disjoint, and MOV aliases
+// are folded. Divergent definitions do not become the same unknown pointer.
+inline uint64_t PointerOrigin(const Graph& g,uint32_t before,unsigned reg,unsigned depth=0) {
+  if(depth>16)return 0;
+  const auto defs=Definitions(g,before,reg);if(defs.empty())return 0;
+  uint64_t result=0;
+  for(const auto* d:defs) {
+    uint64_t x=0;
+    if(!d)x=uint64_t{1}<<32|reg;
+    else if(d->width==64&&!d->memory&&(d->op==0x89||d->op==0x8b))
+      x=PointerOrigin(g,d->rva,d->op==0x89?d->reg:d->rm,depth+1);
+    else if(d->width==64&&(d->op==0x8b||d->op==0x8d))x=uint64_t{2}<<32|d->rva;
+    if(!x||(result&&result!=x))return 0;
+    result=x;
+  }
+  return result;
+}
+inline const Instruction* SingleDefinition(const Graph& g,uint32_t before,unsigned reg) {
+  const auto d=Definitions(g,before,reg);return d.size()==1?d.front():nullptr;
+}
+inline const Instruction* DefinitionThroughMoves(const Graph& g,uint32_t before,unsigned reg,unsigned width=64) {
+  for(unsigned n=0;n<16;++n) {
+    const auto* d=SingleDefinition(g,before,reg);if(!d)return nullptr;
+    if(d->width!=width)return nullptr;
+    if(!d->memory&&(d->op==0x89||d->op==0x8b)){before=d->rva;reg=d->op==0x89?d->reg:d->rm;}
+    else return d;
+  }
+  return nullptr;
+}
+inline bool SetterCall(const View& v,const Graph& g,const Instruction& call,uint64_t& object) {
+  if(!RaxDispatch(v,&call))return false;
+  const auto* key=DefinitionThroughMoves(g,call.rva,2);
+  if(!key||!StringRef(v,*key,"DLSSG.MultiFrameCountMax"))return false;
+  const auto* setter=DefinitionThroughMoves(g,call.rva,0);
+  if(!setter||setter->op!=0x8b||!setter->memory||setter->rip||setter->sib||setter->displacement!=0x20)return false;
+  const auto* vt=DefinitionThroughMoves(g,setter->rva,setter->rm);
+  if(!vt||vt->op!=0x8b||!vt->memory||vt->rip||vt->sib||vt->displacement!=0)return false;
+  object=PointerOrigin(g,vt->rva,vt->rm);
+  return object&&object==PointerOrigin(g,call.rva,1);
+}
+inline bool ArchitectureCondition(unsigned cc,bool high,bool& taken) {
+  // CMP arch, threshold: all valid enum values are nonnegative. Support both
+  // signed and unsigned boundary tests, in either branch/CMOV polarity.
+  if(cc==2||cc==12)taken=!high;
+  else if(cc==3||cc==13)taken=high;
+  else return false;
+  return true;
+}
+struct Publication {uint32_t call=0,value=0;uint64_t object=0;};
+inline bool PublicationPath(const View& v,const Graph& g,const Instruction& cmp,bool high,Publication& out) {
+  std::array<uint32_t,16> values{};std::array<bool,16> known{};
+  for(unsigned r=0;r<16;++r)known[r]=ConstantBefore(g,cmp.rva,r,values[r]);
+  uint32_t at=cmp.next;std::set<uint32_t> visited;
+  for(unsigned step=0;step<64;++step) {
+    const auto* d=g.At(at);if(!d||!visited.insert(at).second)return false;
+    if(d->call) {
+      if(!known[8]||!SetterCall(v,g,*d,out.object))return false;
+      out.call=at;out.value=values[8];return true;
+    }
+    if(d->conditional) {
+      bool take=false;if(!ArchitectureCondition(d->op==0x0f?d->op2&15:d->op&15,high,take))return false;
+      at=take?d->target:d->next;continue;
+    }
+    if(d->op==0xe9||d->op==0xeb){at=d->target;continue;}
+    unsigned reg=0;uint32_t value=0;
+    if(IsImmMov(d,reg,value)){known[reg]=true;values[reg]=value;}
+    else if(d->op==0x0f&&d->op2>=0x40&&d->op2<=0x4f&&!d->memory&&d->width==32) {
+      bool take=false;if(!ArchitectureCondition(d->op2&15,high,take))return false;
+      if(take){known[d->reg]=known[d->rm];values[d->reg]=values[d->rm];}
+    } else if(d->op==0x89&&!d->memory&&(d->width==32||d->width==64)) {
+      known[d->rm]=known[d->reg];values[d->rm]=values[d->reg];
+    } else if(d->op==0x8b&&(d->width==32||d->width==64)) {
+      known[d->reg]=!d->memory&&known[d->rm];values[d->reg]=values[d->rm];
+    } else if(d->op==0x8d){known[d->reg]=false;}
+    else if(d->op==0x90||(d->op==0x0f&&d->op2==0x1f)){}
+    else return false; // Including an intervening flag writer or memory store.
+    at=d->next;
+  }
+  return false;
+}
+inline std::vector<Advertise> Advertisements(const View& v,const Graph& g) {
+  auto out=ClassicAdvertisements(v,g);
+  for(const auto& [at,d]:g.instructions) {
+    if(!IsCmpArch(d))continue;
+    Publication low,high;
+    if(!PublicationPath(v,g,d,false,low)||!PublicationPath(v,g,d,true,high)||
+        low.object!=high.object||low.value!=1||high.value<=1||high.value>32)continue;
+    // A different path must not enter the decision slice without its CMP.
+    bool dominated=true;
+    for(auto sink:{low.call,high.call}) {
+      std::vector<uint32_t> todo{sink};std::set<uint32_t> seen;
+      while(!todo.empty()&&dominated) {
+        auto p=todo.back();todo.pop_back();if(p==at||!seen.insert(p).second)continue;
+        auto it=g.predecessors.find(p);
+        if(p==g.begin||it==g.predecessors.end()){dominated=false;break;}
+        todo.insert(todo.end(),it->second.begin(),it->second.end());
+      }
+    }
+    if(!dominated)continue;
+    if(std::none_of(out.begin(),out.end(),[instruction=at](const auto& a){return a.site.instruction==instruction;}))
+      out.push_back({{at,d.immediate_rva,static_cast<unsigned>(d.next-at)},high.value,8});
+  }
+  return out;
+}
+
+// Follow only reaching definitions of the architecture accumulator. The old
+// lexical walk also visited register writes on error paths which return before
+// the capability publication. Such writes cannot affect the candidate.
+inline bool ArchitectureOperand(const View& v,const Graph& g,const Site& site,uint32_t slot,
+                                std::vector<std::pair<uint32_t,uint32_t>>& helpers) {
+  const auto* cmp=g.At(site.instruction);if(!cmp)return false;
+  struct Work {uint32_t at;unsigned reg;};
+  std::vector<Work> todo{{cmp->rva,cmp->rm}};std::set<std::pair<uint32_t,unsigned>> seen;
+  unsigned queries=0;
+  while(!todo.empty()) {
+    auto w=todo.back();todo.pop_back();if(!seen.emplace(w.at,w.reg).second)continue;
+    auto defs=Definitions(g,w.at,w.reg);if(defs.empty())return false;
+    for(const auto* d:defs) {
+      if(!d)return false;
+      unsigned dst=0;uint32_t x=0;
+      if((IsImmMov(d,dst,x)&&x==0)||
+          ((d->op==0x31||d->op==0x33)&&!d->memory&&d->reg==d->rm&&d->width==32))continue;
+      if(d->call&&w.reg==0) {
+        if(GetterCall(v,g,*d,slot)){++queries;continue;}
+        if(d->op!=0xe8)return false;
+        const auto f=CallableExtent(v,d->target);if(!f.first)return false;
+        Graph helper;if(!helper.Build(v,f))return false;
+        bool mapped=false;
+        const auto* arg=g.Previous(d->rva);
+        if(IsMovReg(arg,1,0,32)) {
+          const auto* query=g.Previous(arg->rva);
+          if(query&&GetterCall(v,g,*query,slot)&&EnumMapper(v,f.first,f.second,0,1))mapped=true;
+        }
+        if(!mapped)for(const auto& [p,q]:helper.instructions) {
+          (void)p;if(GetterCall(v,helper,q,slot)&&EnumMapper(v,q.next,f.second,0,0)){mapped=true;break;}
+        }
+        if(!mapped)return false;
+        helpers.push_back(f);++queries;continue;
+      }
+      if(d->width==32&&!d->memory&&(d->op==0x8b||d->op==0x89)) {
+        todo.push_back({d->rva,d->op==0x8b?d->rm:d->reg});continue;
+      }
+      if(d->op==0x0f&&(d->op2==0x4f||d->op2==0x4c)&&d->width==32&&!d->memory) {
+        const auto* c=g.Previous(d->rva);
+        // signed max(acc, returned_arch), with either operand order
+        const bool max_gt=d->op2==0x4f&&c&&((c->op==0x3b&&c->reg==d->rm&&c->rm==d->reg)||
+            (c->op==0x39&&c->rm==d->rm&&c->reg==d->reg));
+        const bool max_lt=d->op2==0x4c&&c&&((c->op==0x3b&&c->reg==d->reg&&c->rm==d->rm)||
+            (c->op==0x39&&c->rm==d->reg&&c->reg==d->rm));
+        if(!c||c->memory||c->width!=32||(!max_gt&&!max_lt)||!LinearEdge(g,c,d))return false;
+        todo.push_back({c->rva,d->reg});todo.push_back({c->rva,d->rm});continue;
+      }
+      // Retain the existing independently checked inlined enum-map variant.
+      return LegacyArchitectureOperand(v,g,site,slot,helpers);
+    }
+  }
+  return queries!=0;
+}
+
+inline uint32_t SkipJumps(const Graph& g,uint32_t at) {
+  std::set<uint32_t> seen;
+  for(unsigned n=0;n<16;++n) {
+    const auto* d=g.At(at);if(!d||!seen.insert(at).second)return 0;
+    if(d->op==0xeb||d->op==0xe9)at=d->target;
+    else if(d->op==0x90||(d->op==0x0f&&d->op2==0x1f))at=d->next;
+    else return at;
+  }
+  return 0;
+}
+struct CountBranch {unsigned reg=0;uint32_t accepted=0,rejected=0,compare=0;};
+inline bool CountBranchAt(const Graph& g,uint32_t start,uint32_t limit,bool upper,CountBranch& out) {
+  const Instruction* d=g.At(SkipJumps(g,start));
+  // Scheduling of a register limit or a NOP does not change the predicate.
+  for(unsigned n=0;n<8&&d;++n) {
+    unsigned reg=0;uint32_t x=0;
+    if(IsImmMov(d,reg,x)||(d->op==0x8b&&d->memory&&d->width==32)||d->op==0x90||(d->op==0x0f&&d->op2==0x1f))d=g.Next(d);
+    else break;
+  }
+  if(!d||d->memory||d->width!=32)return false;
+  uint32_t immediate=0;unsigned count=0;
+  if(d->op==0x3d){count=0;immediate=static_cast<uint32_t>(d->immediate);}
+  else if((d->op==0x83||d->op==0x81)&&(d->reg&7)==7){count=d->rm;immediate=static_cast<uint32_t>(d->immediate);}
+  else if(d->op==0x3b||d->op==0x39) {
+    count=d->op==0x3b?d->reg:d->rm;
+    if(!ConstantBefore(g,d->rva,d->op==0x3b?d->rm:d->reg,immediate))return false;
+  } else return false;
+  const auto* b=g.Next(d);if(!b||!b->conditional||!LinearEdge(g,d,b))return false;
+  const auto cc=b->op==0x0f?b->op2&15:b->op&15;
+  bool on_jump=false;
+  if(upper) {
+    if(immediate==limit&&(cc==6||cc==7))on_jump=cc==6; // <= versus >
+    else if(immediate==limit+1&&(cc==2||cc==3))on_jump=cc==2; // < versus >=
+    else return false;
+  } else {if(immediate!=limit||(cc!=4&&cc!=5))return false;on_jump=cc==4;}
+  out={count,SkipJumps(g,on_jump?b->target:b->next),SkipJumps(g,on_jump?b->next:b->target),d->rva};
+  return g.At(out.accepted)&&g.At(out.rejected);
+}
+inline const Instruction* CountLoad(const Graph& g,uint32_t before,unsigned reg) {
+  const auto* d=DefinitionThroughMoves(g,before,reg,32);
+  if(!d||d->op!=0x8b||!d->memory||d->rip||d->index!=16)return nullptr;
+  // Either a decoded input on the stack, or a field reached via a this alias.
+  if(d->rm!=4&&d->rm!=5&&!HasThisAlias(g,d->rm,d->rva))return nullptr;
+  return d;
+}
+inline bool ErrorPath(const View& v,const Graph& g,uint32_t start,uint32_t join,
+                      std::string_view anchor="EndpointCore::ValidateMultiFrameCount") {
+  // Named count-validation rejection must terminate without reaching success.
+  bool named=false;std::set<uint32_t> seen;std::vector<uint32_t> todo{start};
+  unsigned steps=0;
+  while(!todo.empty()) {
+    const auto at=todo.back();todo.pop_back();if(at==join)return false;
+    if(!seen.insert(at).second)return false; // rejection must actually terminate
+    const auto* d=g.At(at);if(!d||++steps>256)return false;
+    named|=StringRef(v,*d,anchor);
+    if(d->terminal){if(d->op!=0xc3&&d->op!=0xc2)return false;continue;}
+    if(d->conditional)return false; // complex handlers do not prove a rejection
+    if(d->jump)todo.push_back(d->target);else todo.push_back(d->next);
+  }
+  return named;
+}
+inline std::vector<Execution> InlineExecutions(const View& v,const Graph& g,uint32_t ceiling) {
+  std::vector<Execution> out;
+  for(const auto& [at,cmp]:g.instructions) {
+    if(!IsCmpArch(cmp)||cmp.rm!=0)continue;
+    const auto* call=g.Previous(at);if(!call||!LinearEdge(g,call,&cmp))continue;
+    const auto* getter=g.Previous(call->rva);
+    if(!getter||getter->displacement<=0||getter->displacement>512||getter->displacement%8||
+        !GetterCall(v,g,*call,static_cast<uint32_t>(getter->displacement)))continue;
+    const auto* vt=g.Previous(getter->rva);const auto* object=vt?g.Previous(vt->rva):nullptr;
+    if(!object||object->op!=0x8b||object->width!=64||object->reg!=1||!object->memory||
+        object->rip||object->sib||!HasThisAlias(g,object->rm,object->rva)||!LinearEdge(g,object,vt))continue;
+    const auto* branch=g.Next(&cmp);bool high_jump=false;
+    if(!branch||!branch->conditional||!LinearEdge(g,&cmp,branch)||
+        !ArchitectureCondition(branch->op==0x0f?branch->op2&15:branch->op&15,true,high_jump))continue;
+    CountBranch high,low;
+    if(!CountBranchAt(g,high_jump?branch->target:branch->next,ceiling,true,high)||
+        !CountBranchAt(g,high_jump?branch->next:branch->target,1,false,low))continue;
+    const auto* hi=CountLoad(g,high.compare,high.reg);const auto* lo=CountLoad(g,low.compare,low.reg);
+    if(!hi||!lo||hi->rva!=lo->rva)continue;
+    uint32_t join=high.accepted;
+    if(low.accepted!=join) {
+      CountBranch index;
+      if(!CountBranchAt(g,low.accepted,1,false,index)||index.accepted!=join||index.reg==low.reg)continue;
+      const auto* il=CountLoad(g,index.compare,index.reg);
+      if(!il||il->rm!=hi->rm||il->displacement==hi->displacement||
+          PointerOrigin(g,il->rva,il->rm)!=PointerOrigin(g,hi->rva,hi->rm)||
+          !ErrorPath(v,g,index.rejected,join))continue;
+    }
+    if(!ErrorPath(v,g,high.rejected,join)||!ErrorPath(v,g,low.rejected,join))continue;
+    out.push_back({{at,cmp.immediate_rva,static_cast<unsigned>(cmp.next-at)},0,
+        static_cast<uint32_t>(getter->displacement),object->rm});
+  }
+  return out;
+}
+
+// The same count contract may reside in a helper selected by a stored boolean.
+// Compare immediate/register limits and both branch polarities are normalized;
+// register allocation and the position of the index load are not identities.
+inline bool SameInputField(const Graph& g,const Instruction* a,const Instruction* b) {
+  if(!a||!b||a->op!=0x8b||b->op!=0x8b||!a->memory||!b->memory||a->rip||b->rip||
+      a->index!=16||b->index!=16||a->width!=32||b->width!=32||a->displacement!=b->displacement)return false;
+  const auto origin=PointerOrigin(g,a->rva,a->rm);
+  return origin&&origin==PointerOrigin(g,b->rva,b->rm);
+}
+inline bool ValidateCountFlow(const View& v,const Graph& g,uint32_t ceiling) {
+  if(ClassicValidateCountFlow(v,g,ceiling))return true;
+  constexpr std::string_view name="EndpointCoreInputs::ComputeAndValidateTimeFactor";
+  for(const auto& [at,i]:g.instructions) {
+    if(i.op!=0x84||i.memory||i.reg!=2||i.rm!=2||!PreservedArgument(g,2,at))continue;
+    const auto* b=g.Next(&i);if(!b||!b->conditional||!LinearEdge(g,&i,b))continue;
+    const unsigned cc=b->op==0x0f?b->op2&15:b->op&15;
+    if(cc!=4&&cc!=5)continue;
+    CountBranch high,low;
+    if(!CountBranchAt(g,cc==5?b->target:b->next,ceiling,true,high)||
+        !CountBranchAt(g,cc==4?b->target:b->next,1,false,low))continue;
+    const auto* hi=CountLoad(g,high.compare,high.reg);const auto* lo=CountLoad(g,low.compare,low.reg);
+    if(!hi||!lo||hi->rva!=lo->rva)continue;
+    uint32_t join=high.accepted;
+    if(low.accepted!=join) {
+      CountBranch index;
+      if(!CountBranchAt(g,low.accepted,1,false,index)||index.reg==low.reg)continue;
+      const auto* il=CountLoad(g,index.compare,index.reg);
+      if(!il||il->displacement==hi->displacement)continue;
+      if(index.accepted!=join) {
+        const auto* hl=g.At(join);
+        if(!SameInputField(g,hl,il)||hl->reg!=il->reg||hl->next!=index.accepted||!g.At(index.accepted))continue;
+        join=index.accepted;
+      }
+      if(!ErrorPath(v,g,index.rejected,join,name))continue;
+    }
+    if(ErrorPath(v,g,high.rejected,join,name)&&ErrorPath(v,g,low.rejected,join,name))return true;
+  }
+  return false;
+}
+
 inline void AddWitness(Plan& plan,const View& v,uint32_t at,size_t n) {
   if(!v.Fits(at,n)||!n)return;
   plan.witnesses.push_back({at,{v.image.begin()+at,v.image.begin()+at+n}});
@@ -618,7 +967,7 @@ inline bool FindPlan(std::span<const unsigned char> image,std::span<const Range>
   auto caps=Anchored(v,"DLSSG.MultiFrameCountMax");
   auto creates=Anchored(v,"EndpointCore::Create");
   auto evaluates=Anchored(v,"EndpointCore::Evaluate");
-  if(caps.empty()||creates.empty()||evaluates.empty()) {plan.reason="SEMANTIC_ANCHOR_NOT_RESOLVED";return false;}
+  if(caps.empty()||evaluates.empty()) {plan.reason="SEMANTIC_ANCHOR_NOT_RESOLVED";return false;}
   std::vector<Plan> verified;
   for(const auto& cg:caps)for(const auto& cap:Advertisements(v,cg))
     for(const auto& rg:creates)for(const auto& runtime:Executions(v,rg)) {
@@ -643,6 +992,25 @@ inline bool FindPlan(std::span<const unsigned char> image,std::span<const Range>
         for(const auto& h:helpers)AddWitness(p,v,h.first,h.second-h.first);
         verified.push_back(std::move(p));
       }
+    }
+  // Inline validation does not have a Create-time architecture flag. It is
+  // paired directly with the advertisement through the same architecture getter
+  // and the same advertised count bound, independent of DLL name/version/RVA.
+  for(const auto& cg:caps)for(const auto& cap:Advertisements(v,cg))
+    for(const auto& eg:evaluates)for(const auto& runtime:InlineExecutions(v,eg,cap.ceiling)) {
+      ++plan.candidates;
+      std::vector<std::pair<uint32_t,uint32_t>> helpers;
+      if(!ArchitectureOperand(v,cg,cap.site,runtime.query_slot,helpers))continue;
+      Plan p;p.result=Result::kVerified;p.reason="ADVERTISE_INLINE_COUNT_CONTRACT";
+      p.sites={cap.site,runtime.site};p.ceiling=cap.ceiling;p.query_slot=runtime.query_slot;
+      p.functions={cg.begin,0,eg.begin,eg.begin};
+      AddWitness(p,v,0,static_cast<size_t>(v.U32(opt+60)));
+      AddWitness(p,v,v.U32(opt+136),v.U32(opt+140));
+      const auto lc=v.U32(opt+192);if(lc&&v.InSection(lc,128,false))AddWitness(p,v,lc,128);
+      if(const auto slot=DispatchSlot(v))AddWitness(p,v,slot,8);
+      AddGraph(p,v,cg);AddGraph(p,v,eg);
+      for(const auto& h:helpers)AddWitness(p,v,h.first,h.second-h.first);
+      verified.push_back(std::move(p));
     }
   if(verified.size()!=1) {
     plan.result=verified.empty()?Result::kUnresolved:Result::kAmbiguous;

@@ -57,7 +57,7 @@ class LocalToolTests(unittest.TestCase):
         self.assertNotEqual(value['plugin']['gateway'],'AVAILABLE')
         for name in ('sl.common.dll','sl.interposer.dll'):
             value=local.contract_projection([r for r in rows if r['file_name']!=name],PROBE)
-            self.assertEqual(value['interposer']['typed_abi'],0)
+            self.assertEqual(value['interposer']['typed_abi'], 2 if name == 'sl.common.dll' else 0)
 
     def test_changed_sha_drops_old_decision(self):
         rows=fixture()

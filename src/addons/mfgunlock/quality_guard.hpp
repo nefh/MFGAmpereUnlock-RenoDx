@@ -1,5 +1,5 @@
 /*
- * Conservative Streamline DLSS-G input quality guard.
+ * Streamline DLSS-G resource observations and memory-correctness checks.
  * SPDX-License-Identifier: MIT
  */
 
@@ -76,11 +76,11 @@ inline bool IsHudSeparationType(sl::BufferType type) {
 }
 
 inline bool HasStructuralIssues(const Assessment& assessment) {
-  constexpr uint32_t kStructuralIssues =
-      kInvalidOptionalResource | kHudlessExtentMismatch |
-      kHudlessFormatMismatch | kUiExtentMismatch |
-      kUiColorAlphaLowPrecision | kDuplicateOptionalTag;
-  return (assessment.issues & kStructuralIssues) != 0;
+  // A valid native resource can have a different extent/format or low alpha
+  // precision. Those facts may explain quality, but are not proof that a native
+  // request cannot work. Only a malformed structure/lifecycle/bounds is an
+  // addon-side correctness failure, independent of provider compatibility.
+  return (assessment.issues & kInvalidOptionalResource) != 0;
 }
 
 inline OutputDescription Describe(const sl::ResourceTag& tag, bool* valid = nullptr) {
@@ -176,8 +176,9 @@ inline Assessment AssessTags(const sl::ResourceTag* tags, uint32_t count,
     if (outputstate::GetResourceApi() == outputstate::ResourceApi::kVulkan) {
       const auto kind = vulkancontract::ClassifyFormat(resource.format);
       // Vulkan has no COM retention and state is a VkImageLayout, not a D3D12
-      // usage mask. Unknown metadata blocks only OUR recomposition request;
-      // native tags, including extension layouts, are still forwarded unchanged.
+      // usage mask. These observations explain the native resources; the addon
+      // does not transition or acquire them and must not suppress a request
+      // because metadata or an extension format is unfamiliar.
       if (!tag.resource->view || !vulkancontract::DefinedLayout(tag.resource->state) ||
           !resource.HasDimensions() || !resource.HasFormat() ||
           (tag.type == sl::kBufferTypeUIColorAndAlpha &&
@@ -257,11 +258,11 @@ inline bool IsStructurallyValidForUiRecomposition(const Assessment& assessment) 
 
 inline bool CanAutomaticallyUseUiRecomposition(
     const Assessment& assessment, const outputstate::State& output_state) {
-  return !(assessment.issues & kVulkanResourceMetadataUnknown) &&
-         outputstate::SupportsHudSeparation(output_state) &&
-         IsStructurallyValidForUiRecomposition(assessment) &&
-         outputstate::IsUiEncodingCompatible(
-             output_state, NativeUiEncoding(assessment), true);
+  (void)output_state;
+  // This selects an options request against resources already provided by the
+  // native application. It does not synthesize GPU pixels or ownership. The
+  // runtime, not a static output/API table, decides whether it accepts UIR.
+  return IsStructurallyValidForUiRecomposition(assessment);
 }
 
 inline SuppressionPolicy ResolveSuppression(
@@ -271,22 +272,22 @@ inline SuppressionPolicy ResolveSuppression(
   if (HasStructuralIssues(accumulated))
     return SuppressionPolicy::kAllHudSeparation;
 
-  // If the output domain is unknown or unsupported, do not rewrite a native
-  // game's optional tags. The addon simply declines automatic UIR.
-  if (!outputstate::SupportsHudSeparation(output_state))
-    return SuppressionPolicy::kNone;
-
   // A native application may deliver UI and HUDless in separate calls and
   // in either order before Present. Withholding the first valid UI tag makes
   // the accumulated model claim a pair that the provider never received.
   // Keep readiness conservative, but do not rewrite native intent merely
   // because the pair is temporarily incomplete on the CPU.
   (void)was_recomposition_eligible;
+  (void)output_state;
   return SuppressionPolicy::kNone;
 }
 
 inline bool ShouldRequestAutomaticUiPath(const outputstate::State& output_state) {
-  return outputstate::SupportsHudSeparation(output_state);
+  (void)output_state;
+  // Option negotiation is independent of output-color capability guesses.
+  // Native tags and separately synthesized candidate resources retain their
+  // own resource existence, ownership and buffer-bounds checks.
+  return true;
 }
 
 inline size_t ConstantsCopySize(const sl::Constants& source) {

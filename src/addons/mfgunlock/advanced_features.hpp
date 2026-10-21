@@ -227,9 +227,9 @@ inline const integration::ResourceState& Resource(
 }
 
 inline FallbackReason ProviderGate(const Inputs& input, Feature feature) {
-  if (!input.architecture) return FallbackReason::kNoArchitecture;
-  if (!features::BackendSupports(input.architecture, CapabilityFor(feature)))
-    return FallbackReason::kNoVerifiedBackend;
+  (void)feature;
+  // Applied code and observed resources are direct evidence. A missing GPU
+  // profile or historical capability bit cannot negate that evidence.
   // Individual applied-backend and resource proofs below determine features;
   // a private registry entry is not evidence that all (or none) can execute.
   if (!input.provider_ready) return FallbackReason::kProviderNotReady;

@@ -27,8 +27,6 @@ inline bool SupportsAlphaExtraction(uint32_t format) {
 
 inline Path Select(const outputstate::State& output, const Candidate& candidate,
                    bool alpha_backend_available) {
-  if (!outputstate::SupportsHudSeparation(output)) return Path::kUnavailable;
-
   const bool encoding_compatible =
       outputstate::IsUiEncodingCompatible(output, candidate.encoding, false);
   const bool sdr_output = output.encoding == outputstate::Encoding::kSdrSrgb ||

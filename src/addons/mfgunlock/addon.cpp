@@ -20,13 +20,17 @@
 #include <atomic>
 #include <cwchar>
 #include <cstring>
+#include <cstdio>
 #include <sstream>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "./imgui_compat.hpp"
 #include "./reshade_compat.hpp"
+#include "./addon_entry.hpp"
+#include "./registration_trace.hpp"
 #include <embed/shaders.h>
 
 #include "./blackwell_temporal.hpp"
@@ -56,8 +60,6 @@ constexpr const char* kConfigSection = "RenoDX.MFGUnlock";
 constexpr const char* kAddonSection = "ADDON";
 constexpr const char* kEarlyLoadKey = "LoadFromDllMain";
 constexpr const char* kAddonFileName = "renodx-mfgunlock.addon64";
-constexpr unsigned int kMinCount = 2;
-constexpr unsigned int kMaxCount = 5;
 
 using mfgunlock::g_enabled;
 std::atomic<unsigned int> g_max_count{4};
@@ -241,6 +243,7 @@ std::atomic_bool g_bootstrap_shutting_down{false};
 std::atomic_bool g_streamline_scan_pending{true};
 std::atomic_bool g_ngx_scan_pending{true};
 void TryAttachRuntime();
+void DumpDlssStartupEvidence(const char* phase);
 
 // ------------------------------------------------------- in-memory arch gate
 // The provider uses comparisons against the Blackwell NVAPI architecture ID for
@@ -446,6 +449,7 @@ const std::vector<HMODULE>& DiscoverDlssgModules() {
   if (Module32FirstW(snap, &me)) {
     do {
       if (me.hModule == g_self_module) continue;
+      mfgunlock::streamline::internal::ObserveCommonModule(me.hModule);
       mfgunlock::hook::ModuleIdentity identity{};
       if (!mfgunlock::hook::CaptureModule(me.hModule, identity)) continue;
       if (std::find(g_inspected_modules.begin(), g_inspected_modules.end(), identity) !=
@@ -474,9 +478,22 @@ bool HasTemporalPatch(HMODULE mod);
 void PatchArchGatesInModule(HMODULE mod) {
   if (mod == nullptr) return;
   const auto* profile = mfgunlock::architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile) return;
+  if (!g_enabled.load()) return;
+  // This byte rewrite needs the actual numeric architecture operand. It is
+  // independent of admission to the public native MFG/SetOptions operations.
+  if (!profile) {
+    g_mfg_gate_status.store("NATIVE_ARCH_VALUE_MISSING", std::memory_order_release);
+    return;
+  }
   const bool retarget = profile->RequiresProviderRetarget();
-  if (retarget && (!mfgunlock::provider::PrepareProvider(mod) || !HasTemporalPatch(mod))) return;
+  if (retarget) mfgunlock::provider::PrepareProvider(mod);
+  // Only an incomplete memory transaction prevents another image mutation.
+  if (mfgunlock::provider::internal::g_registry_failed.load(std::memory_order_acquire)) {
+    g_mfg_gate_status.store("MEMORY_TRANSACTION_INCOMPLETE", std::memory_order_release);
+    return;
+  }
+  // Optional temporal/warp transforms are not prerequisites for discovering
+  // and opening this provider's independent MFG capability gates.
   if (std::find(g_gate_modules.begin(), g_gate_modules.end(), mod) != g_gate_modules.end()) return;
   if (!g_gate_sites.empty() && !g_gate_patched.load(std::memory_order_acquire)) {
     g_mfg_gate_status.store("ROLLBACK_INCOMPLETE", std::memory_order_release);
@@ -537,8 +554,8 @@ void RestoreDlssgArchGate() {
 }
 
 // --------------------------------------------------- validated warp blend
-// Optional cross-generation quality patch for the exact 310.9.1 provider.
-// Native SM89 uses the qualified payload directly; retargeted backends rebuild
+// Optional cross-generation quality transform discovered from kernel structure.
+// Native SM89 uses the matching payload directly; retargeted backends rebuild
 // it for their target SM and keep provider-owned descriptors available for orderly rollback.
 
 struct ValidatedWarpModulePatch {
@@ -562,6 +579,13 @@ void KeepFailedQualityRedirects(std::vector<mfgunlock::validatedwarp::Redirect>&
   redirects.clear();
 }
 
+bool PrepareProviderForOptionalRedirect(HMODULE mod) {
+  mfgunlock::provider::PrepareProvider(mod);
+  // The independently rebuilt quality payload may still be tried after an
+  // unrelated recipe fails. An incomplete memory transaction retains ownership.
+  return !mfgunlock::provider::internal::g_registry_failed.load(std::memory_order_acquire);
+}
+
 void PatchValidatedWarpInModule(HMODULE mod) {
   if (mod == nullptr || mfgunlock::provider::g_create_seen.load(std::memory_order_acquire)) return;
   if (!PreparedQuality().warp) return;
@@ -582,7 +606,7 @@ void PatchValidatedWarpInModule(HMODULE mod) {
   std::string provider_version;
   const auto mode = static_cast<mfgunlock::validatedwarp::Mode>(PreparedQuality().warp_mode);
   const auto prepare_provider = profile->RequiresProviderRetarget()
-      ? mfgunlock::provider::PrepareProvider : nullptr;
+      ? PrepareProviderForOptionalRedirect : nullptr;
   const bool applied = mfgunlock::validatedwarp::Apply(
       mod, redirects, result, provider_version, mode,
       prepare_provider, target_sm);
@@ -596,7 +620,7 @@ void PatchValidatedWarpInModule(HMODULE mod) {
             << mfgunlock::validatedwarp::ModeLabel(mode, target_sm)
             << " not applied"
             << (provider_version.empty() ? "" : " to DLSS-G " + provider_version)
-            << " -- " << (detail.empty() ? "provider/kernel did not match the validated profile" : detail)
+            << " -- " << (detail.empty() ? "required kernel operands were not located" : detail)
             << ".";
     reshade::log::message(reshade::log::level::warning, message.str().c_str());
     return;
@@ -720,7 +744,7 @@ void RejectBlackwellTemporal(HMODULE mod, const std::string& provider_version,
           << (detail.empty() ? "full Blackwell temporal backend did not match" : detail)
           << (midpoint_fallback
                   ? "; midpoint temporal fallback will be used."
-                  : "; MFG remains fail-closed for this provider.");
+                  : "; native temporal path retained; MFG discovery is independent.");
   reshade::log::message(reshade::log::level::warning, message.str().c_str());
 }
 
@@ -728,8 +752,9 @@ void PatchMidpointInModule(HMODULE mod) {
   if (mfgunlock::provider::g_create_seen.load(std::memory_order_acquire)) return;
   if (mod == nullptr) return;
   const auto* profile = mfgunlock::architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile) return;
-  if (profile->RequiresProviderRetarget() && !mfgunlock::provider::PrepareProvider(mod)) return;
+  if (!g_enabled.load()) return;
+  if (profile && profile->RequiresProviderRetarget()) mfgunlock::provider::PrepareProvider(mod);
+  if (mfgunlock::provider::internal::g_registry_failed.load(std::memory_order_acquire)) return;
   const auto already_patched = std::find_if(
       g_midpoint_modules.begin(), g_midpoint_modules.end(),
       [mod](const MidpointModulePatch& patch) { return patch.module == mod; });
@@ -812,11 +837,11 @@ void PatchQualityProviderInModule(HMODULE mod) {
   }
 
   if (temporal_prepared) {
-    const bool provider_ready = !profile->RequiresProviderRetarget() ||
-        mfgunlock::provider::PrepareProvider(mod);
-    if (!provider_ready) {
+    const bool redirect_memory_ready = !profile->RequiresProviderRetarget() ||
+        PrepareProviderForOptionalRedirect(mod);
+    if (!redirect_memory_ready) {
       RejectBlackwellTemporal(mod, temporal_version,
-                              "provider preparation failed before temporal redirect",
+                              "provider memory transaction is incomplete before temporal redirect",
                               scatter_requested, boundary_mode, false);
       return;
     } else {
@@ -907,10 +932,10 @@ void RunProviderMaintenance() {
   SyncProviderLifecycleLocked();
   if (mfgunlock::runtime::Read().restart_required) return;
   const auto* profile = mfgunlock::architecture::ActiveProfile();
-  if (!g_enabled.load() || !profile) {
+  if (!g_enabled.load()) {
     return;
   }
-  if (mfgunlock::features::HasQualityBackend(profile)) {
+  if (profile && mfgunlock::features::HasQualityBackend(profile)) {
     TryPatchQualityProviders();
   } else {
     if (PreparedQuality().temporal) TryPatchMidpoint();
@@ -923,7 +948,7 @@ void RunProviderMaintenance() {
 
 // A preset edit must not apply unrelated pending Warp/temporal changes live.
 void InstallPresetForLoadedProviders() {
-  if (!mfgunlock::architecture::ActiveProfile()) return;
+  if (!g_enabled.load()) return;
   AcquireSRWLockExclusive(&g_provider_maintenance_lock);
   for (HMODULE mod : g_dlssg_modules) mfgunlock::fgpreset::TryInstall(mod);
   ReleaseSRWLockExclusive(&g_provider_maintenance_lock);
@@ -968,32 +993,195 @@ void RestoreMidpoint() {
 constexpr char kFlipMarker[] = "FG1 DLL has been detected";
 
 struct FlipSite {
-  unsigned char* address;
-  unsigned char original[7];
-  unsigned char length;
+  struct Protection {
+    unsigned char* address = nullptr;
+    unsigned char length = 0;
+    DWORD original = 0;
+  };
+  unsigned char* address = nullptr;
+  HMODULE module = nullptr;
+  unsigned char original[7]{};
+  unsigned char replacement[7]{};
+  unsigned char length = 0;
+  // Seven bytes can cross protection boundaries. Keep each original protection
+  // separately; VirtualProtect reports only the first page of a range.
+  std::array<Protection, 7> protections{};
+  size_t protection_count = 0;
+  bool committed = false;
+  bool rollback_pending = false;
 };
 
 std::atomic_bool g_flip_meter_patched{false};
 std::atomic_bool g_flip_meter_failed{false};
+std::atomic_bool g_flip_meter_rollback_pending{false};
 std::vector<FlipSite> g_flip_meter_sites;
+// One explicit process-lifetime reference for each image submitted to a write.
+// Do not call FreeLibrary for these references from DLL_PROCESS_DETACH: cleanup
+// runs under the loader lock, and incomplete undo still owns these addresses.
+std::vector<HMODULE> g_flip_meter_modules;
+SRWLOCK g_flip_meter_scan_lock = SRWLOCK_INIT;
+enum class FlipPatchResult { kNotApplied, kApplied, kRollbackIncomplete };
+struct FlipAttempt {
+  HMODULE module = nullptr;
+  mfgunlock::provider::internal::ImageIdentity identity{};
+  uint64_t epoch = 0;
+  uint64_t revision = 0;
+  FlipPatchResult result = FlipPatchResult::kNotApplied;
+};
+std::vector<FlipAttempt> g_flip_meter_attempts;
+
+struct FlipModuleReference {
+  HMODULE module = nullptr;
+  bool temporary = false;
+  explicit FlipModuleReference(HMODULE requested) {
+    if (!requested) return;
+    if (std::find(g_flip_meter_modules.begin(), g_flip_meter_modules.end(), requested) !=
+        g_flip_meter_modules.end()) {
+      module = requested;
+    } else if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                   reinterpret_cast<LPCWSTR>(requested), &module)) {
+      temporary = true;
+      if (module != requested) {
+        FreeLibrary(module);
+        module = nullptr;
+        temporary = false;
+      }
+    }
+  }
+  FlipModuleReference(const FlipModuleReference&) = delete;
+  FlipModuleReference& operator=(const FlipModuleReference&) = delete;
+  ~FlipModuleReference() { if (temporary) FreeLibrary(module); }
+  bool Keep() {
+    if (!module) return false;
+    if (!temporary) return true;
+    // Allocation happens before any byte or protection is changed.
+    try { g_flip_meter_modules.push_back(module); } catch (...) { return false; }
+    temporary = false;
+    return true;
+  }
+};
+
+void RefreshFlipTransactionState() {
+  const bool pending = std::any_of(g_flip_meter_sites.begin(), g_flip_meter_sites.end(),
+      [](const auto& site) { return site.rollback_pending; });
+  g_flip_meter_rollback_pending.store(pending, std::memory_order_release);
+  g_flip_meter_patched.store(!pending && std::any_of(
+      g_flip_meter_sites.begin(), g_flip_meter_sites.end(),
+      [](const auto& site) { return site.committed; }), std::memory_order_release);
+}
 
 // Records the original bytes before writing, so the instruction can be put back
 // exactly as it was. Patches here are either one byte (an immediate flipped in
 // place) or seven (a whole store rewritten), never anything else.
 bool WriteFlipSite(unsigned char* at, const unsigned char* bytes, size_t length) {
-  if (length == 0 || length > sizeof(FlipSite::original)) return false;
-  DWORD old_protect = 0;
-  if (VirtualProtect(at, length, PAGE_EXECUTE_READWRITE, &old_protect) == 0) return false;
+  if (!at || !bytes || (length != 1 && length != 7) ||
+      g_flip_meter_rollback_pending.load(std::memory_order_acquire)) return false;
   FlipSite site = {};
   site.address = at;
   site.length = static_cast<unsigned char>(length);
+  size_t offset = 0;
+  while (offset < length) {
+    MEMORY_BASIC_INFORMATION memory{};
+    const auto current = reinterpret_cast<uintptr_t>(at) + offset;
+    if (current < reinterpret_cast<uintptr_t>(at) ||
+        !VirtualQuery(reinterpret_cast<void*>(current), &memory, sizeof(memory)) ||
+        memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE ||
+        (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+    const auto start = reinterpret_cast<uintptr_t>(memory.BaseAddress);
+    if (start > current || current - start >= memory.RegionSize) return false;
+    if (!site.module) site.module = static_cast<HMODULE>(memory.AllocationBase);
+    if (memory.AllocationBase != site.module) return false;
+    const size_t span = (std::min)(length - offset, memory.RegionSize - (current - start));
+    site.protections[site.protection_count++] = {
+        reinterpret_cast<unsigned char*>(current), static_cast<unsigned char>(span), 0};
+    offset += span;
+  }
+  if (std::find(g_flip_meter_modules.begin(), g_flip_meter_modules.end(), site.module) ==
+          g_flip_meter_modules.end() ||
+      !mfgunlock::provider::internal::IsReadable(at, length, site.module)) return false;
   std::memcpy(site.original, at, length);
-  g_flip_meter_sites.push_back(site);
-  std::memcpy(at, bytes, length);
-  DWORD ignored = 0;
-  VirtualProtect(at, length, old_protect, &ignored);
-  FlushInstructionCache(GetCurrentProcess(), at, length);
-  return true;
+  std::memcpy(site.replacement, bytes, length);
+  try { g_flip_meter_sites.push_back(site); } catch (...) { return false; }
+  auto& undo = g_flip_meter_sites.back();
+  bool writable = true;
+  size_t opened = 0;
+  for (auto& protection : undo.protections) {
+    if (opened == undo.protection_count) break;
+    DWORD old_protect = 0;
+    if (!VirtualProtect(protection.address, protection.length, PAGE_EXECUTE_READWRITE,
+                        &old_protect)) {
+      writable = false;
+      break;
+    }
+    protection.original = old_protect;
+    ++opened;
+  }
+  if (opened == 0) {
+    g_flip_meter_sites.pop_back();  // Nothing was changed; no undo obligation.
+    return false;
+  }
+  if (writable) std::memcpy(at, undo.replacement, length);
+  bool protected_again = true;
+  for (size_t i = opened; i != 0; --i) {
+    const auto& protection = undo.protections[i - 1];
+    DWORD ignored = 0;
+    if (!VirtualProtect(protection.address, protection.length, protection.original, &ignored))
+      protected_again = false;
+  }
+  const bool flushed = !writable ||
+      FlushInstructionCache(GetCurrentProcess(), at, length) != FALSE;
+  const bool matches = writable && mfgunlock::provider::internal::IsReadable(at, length, undo.module) &&
+      std::memcmp(at, undo.replacement, length) == 0;
+  if (writable && protected_again && flushed && matches) return true;
+  undo.rollback_pending = true;
+  RefreshFlipTransactionState();
+  return false;
+}
+
+bool RestoreFlipSite(FlipSite& site) {
+  bool ok = true;
+  for (size_t i = site.protection_count; i != 0; --i) {
+    const auto& protection = site.protections[i - 1];
+    if (protection.original == 0) continue;  // This region was never opened.
+    if (!mfgunlock::provider::internal::IsReadable(protection.address, protection.length,
+                                                 site.module)) {
+      ok = false;
+      continue;
+    }
+    DWORD ignored = 0;
+    if (!VirtualProtect(protection.address, protection.length, PAGE_EXECUTE_READWRITE, &ignored)) {
+      ok = false;
+      continue;
+    }
+    const size_t offset = static_cast<size_t>(protection.address - site.address);
+    std::memcpy(protection.address, site.original + offset, protection.length);
+    if (!VirtualProtect(protection.address, protection.length, protection.original, &ignored))
+      ok = false;
+  }
+  const bool flushed = FlushInstructionCache(GetCurrentProcess(), site.address, site.length) != FALSE;
+  const bool matches = mfgunlock::provider::internal::IsReadable(site.address, site.length, site.module) &&
+      std::memcmp(site.address, site.original, site.length) == 0;
+  return ok && flushed && matches;
+}
+
+bool RestoreFlipSitesFrom(size_t first) {
+  if (first > g_flip_meter_sites.size()) return false;
+  bool ok = true;
+  for (size_t i = g_flip_meter_sites.size(); i > first; --i) {
+    auto& site = g_flip_meter_sites[i - 1];
+    site.committed = false;
+    site.rollback_pending = true;
+    if (RestoreFlipSite(site))
+      g_flip_meter_sites.erase(g_flip_meter_sites.begin() + static_cast<ptrdiff_t>(i - 1));
+    else {
+      ok = false;
+      // Keep reverse undo order even if two selected instruction ranges touch.
+      // An older snapshot must not be restored ahead of a failed newer one.
+      break;
+    }
+  }
+  RefreshFlipTransactionState();
+  return ok;
 }
 
 bool ModuleImage(HMODULE mod, unsigned char** out_base, const IMAGE_NT_HEADERS64** out_nt) {
@@ -1023,13 +1211,28 @@ bool ModuleImage(HMODULE mod, unsigned char** out_base, const IMAGE_NT_HEADERS64
 
 std::atomic_bool g_ceiling_patched{false};
 unsigned char* g_ceiling_site = nullptr;
-HMODULE g_ceiling_module = nullptr;
+std::atomic<HMODULE> g_ceiling_module{nullptr};
+std::recursive_mutex g_ceiling_lock;
+mfgunlock::hook::ModuleIdentity g_ceiling_identity{};
 unsigned char g_ceiling_cmov_original = 0;
 unsigned int g_ceiling_compiled = 0;
 
+void RestoreFrameCountCeiling();
+
 void ObserveFrameCountCeiling(HMODULE mod) {
+  const std::lock_guard ceiling_guard(g_ceiling_lock);
+  if (!mod) return;
+  if (mod == g_ceiling_module && mfgunlock::hook::IsCurrent(g_ceiling_identity)) return;
+  RestoreFrameCountCeiling();
+  // The loader/public resolver selected a different current plugin. Do not
+  // retain a ceiling or instruction address from an earlier local/OTA image.
+  g_ceiling_site = nullptr;
+  g_ceiling_module = mod;
+  mfgunlock::hook::CaptureModule(mod, g_ceiling_identity);
+  g_ceiling_compiled = 0;
+  g_ceiling_patched.store(false, std::memory_order_release);
   mfgunlock::framecount::g_streamline_plugin_seen.store(true, std::memory_order_release);
-  if (g_ceiling_site != nullptr) return;
+  mfgunlock::framecount::g_streamline_max_generated.store(0, std::memory_order_release);
 
   unsigned char* base = nullptr;
   const IMAGE_NT_HEADERS64* nt = nullptr;
@@ -1078,9 +1281,26 @@ void ObserveFrameCountCeiling(HMODULE mod) {
   reshade::log::message(reshade::log::level::info, message.str().c_str());
 }
 
-void PatchFrameCountCeiling(HMODULE mod) {
-  if (g_ceiling_patched.load(std::memory_order_acquire)) return;
+void ObserveDlssgFeatureEntry(void* entry) {
+  static std::atomic_bool announced{false};
+  if (!announced.exchange(true, std::memory_order_relaxed))
+    mfgunlock::provider::Log("EMPIRICAL_COMPAT_R6 native-selected FG plugin; native operation trials");
+  MEMORY_BASIC_INFORMATION memory{};
+  if (!entry || !VirtualQuery(entry, &memory, sizeof(memory)) ||
+      memory.State != MEM_COMMIT || memory.Type != MEM_IMAGE ||
+      (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+      !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) return;
+  const auto mod = static_cast<HMODULE>(memory.AllocationBase);
+  const auto gateway = GetProcAddress(mod, "slGetPluginFunction");
+  if (gateway) mfgunlock::streamline::internal::BindPlugin(
+      mod, gateway, mfgunlock::streamline::internal::PluginRole::kFg);
   ObserveFrameCountCeiling(mod);
+}
+
+void PatchFrameCountCeiling(HMODULE mod) {
+  const std::lock_guard ceiling_guard(g_ceiling_lock);
+  ObserveFrameCountCeiling(mod);
+  if (g_ceiling_patched.load(std::memory_order_acquire)) return;
   if (g_ceiling_site == nullptr) return;
 
   DWORD old_protect = 0;
@@ -1101,7 +1321,9 @@ void PatchFrameCountCeiling(HMODULE mod) {
 }
 
 void RestoreFrameCountCeiling() {
-  if (g_ceiling_patched.load(std::memory_order_acquire) && g_ceiling_site != nullptr) {
+  const std::lock_guard ceiling_guard(g_ceiling_lock);
+  if (g_ceiling_patched.load(std::memory_order_acquire) && g_ceiling_site != nullptr &&
+      mfgunlock::hook::IsCurrent(g_ceiling_identity)) {
     DWORD old_protect = 0;
     if (VirtualProtect(g_ceiling_site, 10, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
       g_ceiling_site[9] = g_ceiling_cmov_original;
@@ -1112,6 +1334,7 @@ void RestoreFrameCountCeiling() {
   }
   g_ceiling_site = nullptr;
   g_ceiling_module = nullptr;
+  g_ceiling_identity = {};
   g_ceiling_cmov_original = 0;
   g_ceiling_compiled = 0;
   mfgunlock::framecount::g_streamline_plugin_seen.store(false, std::memory_order_release);
@@ -1167,7 +1390,16 @@ bool FindFlipMeteringFallback(const unsigned char* base, const IMAGE_NT_HEADERS6
 
 // Handles the DLSS-G Streamline plugin wherever it was loaded from. Returns true
 // once a module has been dealt with, so the caller stops scanning.
-bool TryPatchFlipMeteringInModule(HMODULE mod) {
+bool TryPatchFlipMeteringInModule(HMODULE mod, FlipPatchResult* result = nullptr) {
+  if (result) *result = FlipPatchResult::kNotApplied;
+  // Pending undo forbids another memory mutation, never the caller's native
+  // SetOptions attempt. The pacing callback remains best effort.
+  if (g_flip_meter_rollback_pending.load(std::memory_order_acquire)) {
+    if (result) *result = FlipPatchResult::kRollbackIncomplete;
+    return true;
+  }
+  FlipModuleReference reference(mod);
+  if (!reference.module) return false;
   unsigned char* base = nullptr;
   const IMAGE_NT_HEADERS64* nt = nullptr;
   if (!ModuleImage(mod, &base, &nt)) return false;
@@ -1218,12 +1450,14 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
     return true;
   }
 
+  const size_t sites_before = g_flip_meter_sites.size();
+  bool writes_ok = true;
   // Pin the derived field to the fallback value. Handle the immediate store
   // directly; rewrite only the seven-byte REX register form whose instruction
   // boundary is identical to the replacement. Other encodings are left alone.
   const unsigned char opposite = static_cast<unsigned char>(1 - want_value);
   section = IMAGE_FIRST_SECTION(nt);
-  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+  for (WORD i = 0; i < nt->FileHeader.NumberOfSections && writes_ok; ++i, ++section) {
     if ((section->Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0) continue;
     unsigned char* start = base + section->VirtualAddress;
     const size_t size = section->Misc.VirtualSize;
@@ -1237,7 +1471,10 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
         if (field != want_offset) continue;
         if (start[off + 6] != opposite) continue;
         const unsigned char imm = static_cast<unsigned char>(want_value);
-        WriteFlipSite(start + off + 6, &imm, 1);
+        if (!reference.Keep() || !WriteFlipSite(start + off + 6, &imm, 1)) {
+          writes_ok = false;
+          break;
+        }
         continue;
       }
 
@@ -1256,15 +1493,29 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
                                       0,    0,
                                       static_cast<unsigned char>(want_value)};
       std::memcpy(replacement + 2, &want_offset, sizeof(want_offset));
-      WriteFlipSite(start + off, replacement, sizeof(replacement));
+      if (!reference.Keep() || !WriteFlipSite(start + off, replacement, sizeof(replacement))) {
+        writes_ok = false;
+        break;
+      }
     }
   }
 
   char module_path[MAX_PATH] = {};
   GetModuleFileNameA(mod, module_path, MAX_PATH);
 
+  if (!writes_ok) {
+    const bool restored = RestoreFlipSitesFrom(sites_before);
+    if (result) *result = restored ? FlipPatchResult::kNotApplied
+                                   : FlipPatchResult::kRollbackIncomplete;
+    g_flip_meter_failed.store(true, std::memory_order_release);
+    mfgunlock::provider::Log(restored
+        ? "flip-metering write transaction failed; rollback complete; native requests remain enabled"
+        : "flip-metering rollback incomplete; undo and module retained; native requests remain enabled", true);
+    return true;
+  }
+
   // Deriving the field alone is not success; at least one write must change.
-  if (g_flip_meter_sites.empty()) {
+  if (g_flip_meter_sites.size() == sites_before) {
     std::stringstream s;
     s << "mfgunlock: flip-metering field +0x" << std::hex << want_offset << std::dec
       << " derived from " << module_path
@@ -1275,21 +1526,57 @@ bool TryPatchFlipMeteringInModule(HMODULE mod) {
     return true;
   }
 
-  g_flip_meter_patched.store(true, std::memory_order_release);
+  for (size_t i = sites_before; i < g_flip_meter_sites.size(); ++i)
+    g_flip_meter_sites[i].committed = true;
+  if (result) *result = FlipPatchResult::kApplied;
+  RefreshFlipTransactionState();
+  g_flip_meter_failed.store(false, std::memory_order_release);
 
   std::stringstream s;
   s << "mfgunlock: forced flip-metering off in " << module_path << " -- field +0x" << std::hex
     << want_offset << std::dec << " pinned to " << want_value << " at "
-    << g_flip_meter_sites.size() << " site(s); multi-frame should pace in software (RSYNC).";
+    << (g_flip_meter_sites.size() - sites_before)
+    << " site(s); native runtime will determine pacing behavior.";
   reshade::log::message(reshade::log::level::info, s.str().c_str());
 
   return true;
 }
 
+bool TryPatchFlipMeteringOnce(HMODULE mod, uint64_t epoch, uint64_t revision) {
+  if (g_flip_meter_rollback_pending.load(std::memory_order_acquire)) return false;
+  // The snapshot's HMODULE is not a loader reference. Hold it before reading
+  // identity or scanning; successful journals retain a separate durable owner.
+  FlipModuleReference reference(mod);
+  if (!reference.module) return false;
+  mfgunlock::provider::internal::ImageIdentity identity{};
+  if (!mfgunlock::provider::internal::ReadIdentity(mod, identity)) return false;
+  auto found = std::find_if(g_flip_meter_attempts.begin(), g_flip_meter_attempts.end(),
+      [mod](const auto& attempt) { return attempt.module == mod; });
+  if (found != g_flip_meter_attempts.end() && found->identity == identity &&
+      (found->result == FlipPatchResult::kApplied ||
+       (found->epoch == epoch && found->revision == revision)))
+    return found->result == FlipPatchResult::kApplied;
+  // Reserve the cache record before invoking the writer. Publishing success
+  // must not allocate after executable bytes have changed.
+  const size_t index = static_cast<size_t>(found - g_flip_meter_attempts.begin());
+  try {
+    if (found == g_flip_meter_attempts.end()) g_flip_meter_attempts.emplace_back();
+  } catch (...) {
+    g_flip_meter_failed.store(true, std::memory_order_release);
+    return false;
+  }
+  FlipPatchResult result = FlipPatchResult::kNotApplied;
+  TryPatchFlipMeteringInModule(mod, &result);
+  g_flip_meter_attempts[index] = {mod, identity, epoch, revision, result};
+  return result == FlipPatchResult::kApplied;
+}
+
 void TryPatchFlipMetering() {
-  if (!g_enabled.load() || !mfgunlock::architecture::ActiveProfile()) return;
-  if (g_flip_meter_patched.load(std::memory_order_acquire)) return;
-  if (g_flip_meter_failed.load(std::memory_order_acquire)) return;
+  if (!g_enabled.load()) return;
+  if (!TryAcquireSRWLockExclusive(&g_flip_meter_scan_lock)) return;
+  struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&g_flip_meter_scan_lock); } } unlock;
+  const auto epoch = mfgunlock::framecount::g_options_cache_epoch.load(std::memory_order_acquire);
+  const auto revision = mfgunlock::framecount::g_options_revision.load(std::memory_order_acquire);
 
   HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
   if (snap == INVALID_HANDLE_VALUE) return;
@@ -1299,86 +1586,61 @@ void TryPatchFlipMetering() {
   if (Module32FirstW(snap, &me)) {
     do {
       if (me.hModule == g_self_module) continue;
-      if (TryPatchFlipMeteringInModule(me.hModule)) break;
+      TryPatchFlipMeteringOnce(me.hModule, epoch, revision);
     } while (Module32NextW(snap, &me));
   }
   CloseHandle(snap);
 }
 
 void RestoreFlipMetering() {
-  if (!g_flip_meter_patched.load(std::memory_order_acquire)) return;
-  for (const auto& site : g_flip_meter_sites) {
-    DWORD old_protect = 0;
-    if (VirtualProtect(site.address, site.length, PAGE_EXECUTE_READWRITE, &old_protect) != 0) {
-      std::memcpy(site.address, site.original, site.length);
-      DWORD ignored = 0;
-      VirtualProtect(site.address, site.length, old_protect, &ignored);
-      FlushInstructionCache(GetCurrentProcess(), site.address, site.length);
+  AcquireSRWLockExclusive(&g_flip_meter_scan_lock);
+  struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&g_flip_meter_scan_lock); } } unlock;
+  const bool restored = RestoreFlipSitesFrom(0);
+  g_flip_meter_failed.store(!restored, std::memory_order_release);
+  if (restored) {
+    g_flip_meter_attempts.clear();
+  } else {
+    // Do not preserve cached APPLIED after any of its stores were restored.
+    for (auto& attempt : g_flip_meter_attempts) {
+      const bool pending = std::any_of(g_flip_meter_sites.begin(), g_flip_meter_sites.end(),
+          [&](const auto& site) { return site.module == attempt.module; });
+      attempt.result = pending ? FlipPatchResult::kRollbackIncomplete : FlipPatchResult::kNotApplied;
     }
+    mfgunlock::provider::Log(
+        "flip-metering restore incomplete; undo and module retained for retry", true);
   }
-  g_flip_meter_sites.clear();
-  g_flip_meter_patched.store(false, std::memory_order_release);
-  g_flip_meter_failed.store(false, std::memory_order_release);
 }
 
 bool DynamicRuntimeStackReady() {
-  const auto* profile = mfgunlock::architecture::ActiveProfile();
+  namespace fc = mfgunlock::framecount;
   mfgunlock::compatibility::DynamicEvidence e{};
-  e.architecture_supports = g_enabled.load(std::memory_order_acquire) && profile &&
-      mfgunlock::features::BackendSupports(profile, mfgunlock::features::Feature::kDynamicMfg);
-  e.d3d12 = mfgunlock::framecount::g_dynamic_d3d12.load(std::memory_order_acquire);
-  e.provider_qualified = mfgunlock::runtime::ProviderReady();
-  // This includes provider preparation, structural host gate qualification and the
-  // temporal backend. A shared GPU payload alone cannot satisfy the host gate.
-  e.target_ready = mfgunlock::framecount::g_multi_frame_ready &&
-                   mfgunlock::framecount::g_multi_frame_ready();
-  HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
-  e.typed_modern_interposer = interposer &&
-      mfgunlock::streamline::internal::GetInterposerAbi(interposer) ==
-          mfgunlock::streamline::internal::InterposerAbi::kModern;
-  e.hook_entries_current =
-      mfgunlock::framecount::internal::g_set_options_entry.installed.load(std::memory_order_acquire) &&
-      mfgunlock::framecount::internal::g_get_state_entry.installed.load(std::memory_order_acquire) &&
-      mfgunlock::hook::IsCurrent(mfgunlock::framecount::internal::g_set_options_entry.identity) &&
-      mfgunlock::hook::IsCurrent(mfgunlock::framecount::internal::g_get_state_entry.identity);
-  e.ceiling_observed = mfgunlock::framecount::g_streamline_plugin_seen.load(std::memory_order_acquire) &&
-      mfgunlock::framecount::g_streamline_max_generated.load(std::memory_order_acquire) > 0;
-  if (TryAcquireSRWLockShared(&mfgunlock::streamline::internal::g_plugin_lock)) {
-    for (const auto& plugin : mfgunlock::streamline::internal::g_plugins) {
-      if (plugin.module != g_ceiling_module ||
-          plugin.typed_abi != mfgunlock::compatibility::TypedInterposerAbi::kModern2 ||
-          !mfgunlock::hook::IsCurrent(plugin.gateway_hook.identity)) continue;
-      e.typed_modern_plugin = true;
-      break;
-    }
-    ReleaseSRWLockShared(&mfgunlock::streamline::internal::g_plugin_lock);
-  }
-  // This is the local typed adapter's negotiation envelope, not a claim that
-  // a provider version supports Dynamic MFG. GetState's native success and
-  // dynamic-support bit still supply the behavioural confirmation.
-  e.options_v5 = e.typed_modern_interposer && e.typed_modern_plugin &&
-      sl::DLSSGOptions{}.structVersion >= sl::kStructVersion5;
-  e.state_v4 = e.typed_modern_interposer && e.typed_modern_plugin &&
-      sl::DLSSGState{}.structVersion >= sl::kStructVersion4;
-  e.api_support_observed = mfgunlock::framecount::g_dynamic_support_seen.load(std::memory_order_acquire);
-  e.api_supports_dynamic = mfgunlock::framecount::g_dynamic_supported.load(std::memory_order_acquire);
-  const auto probe = mfgunlock::compatibility::DynamicProbe(e);
-  const bool ready = probe.Available();
+  // These are our own buffers and current typed native entrypoints. Capability
+  // reports, render API, retarget recipes and unrelated hooks are observations.
+  e.live_set_options = fc::internal::RealSetOptions() != nullptr;
+  e.live_get_state = fc::internal::RealGetState() != nullptr;
+  e.options_v5 = sl::DLSSGOptions{}.structVersion >= sl::kStructVersion5;
+  e.state_v4 = sl::DLSSGState{}.structVersion >= sl::kStructVersion4;
+  e.api_support_observed = fc::g_dynamic_support_seen.load(std::memory_order_acquire);
+  e.api_supports_dynamic = fc::g_dynamic_supported.load(std::memory_order_relaxed);
+  const auto operation = mfgunlock::compatibility::DynamicStack(e);
+  const bool ready = g_enabled.load(std::memory_order_acquire) && operation.Available();
   const bool previous = g_dynamic_stack_validated.exchange(ready, std::memory_order_acq_rel);
-  const char* prior_reason = g_dynamic_last_reason.exchange(probe.reason, std::memory_order_acq_rel);
-  if (previous != ready || prior_reason != probe.reason) {
-    mfgunlock::provider::Log(std::string("Dynamic MFG contract ") +
-        (ready ? "ready: " : "degraded: ") + probe.reason);
+  const char* prior_reason = g_dynamic_last_reason.exchange(operation.reason, std::memory_order_acq_rel);
+  if (previous != ready || prior_reason != operation.reason) {
+    mfgunlock::provider::Log(std::string("R6 Dynamic native trial ") +
+        (ready ? "callable: " : "waiting: ") + operation.reason);
   }
   return ready;
 }
 
 void OnDlssgPluginUnloaded(HMODULE module) {
+  const std::lock_guard ceiling_guard(g_ceiling_lock);
+  if (module != g_ceiling_module || mfgunlock::hook::IsCurrent(g_ceiling_identity)) return;
   mfgunlock::framecount::NotifyDlssgPluginUnloaded(module);
   g_dynamic_stack_validated.store(false, std::memory_order_release);
-  if (module != g_ceiling_module) return;
   g_ceiling_site = nullptr;
   g_ceiling_module = nullptr;
+  g_ceiling_identity = {};
   g_ceiling_cmov_original = 0;
   g_ceiling_compiled = 0;
   g_ceiling_patched.store(false, std::memory_order_release);
@@ -1391,6 +1653,7 @@ void PollRuntimeModuleChanges(bool remember_only) {
   static SRWLOCK poll_lock = SRWLOCK_INIT;
   static std::array<mfgunlock::hook::ModuleIdentity, 6> named{};
   static std::vector<mfgunlock::hook::ModuleIdentity> providers;
+  static std::vector<mfgunlock::hook::ModuleIdentity> plugins;
   if (!TryAcquireSRWLockExclusive(&poll_lock)) return;
   struct Unlock {
     ~Unlock() { ReleaseSRWLockExclusive(&poll_lock); }
@@ -1408,6 +1671,12 @@ void PollRuntimeModuleChanges(bool remember_only) {
     named[i] = now;
   }
   if (remember_only) {
+    if (TryAcquireSRWLockShared(&mfgunlock::streamline::internal::g_plugin_lock)) {
+      plugins.clear();
+      for (const auto& plugin : mfgunlock::streamline::internal::g_plugins)
+        if (plugin.module) plugins.push_back(plugin.gateway_hook.identity);
+      ReleaseSRWLockShared(&mfgunlock::streamline::internal::g_plugin_lock);
+    }
     if (!TryAcquireSRWLockShared(&g_provider_maintenance_lock)) return;
     providers.clear();
     for (HMODULE module : g_dlssg_modules) {
@@ -1416,6 +1685,9 @@ void PollRuntimeModuleChanges(bool remember_only) {
     }
     ReleaseSRWLockShared(&g_provider_maintenance_lock);
   } else {
+    for (const auto& identity : plugins)
+      if (!mfgunlock::hook::IsCurrent(identity))
+        g_streamline_scan_pending.store(true, std::memory_order_release);
     // Also cover providers loaded under a renamed/cache path.
     for (const auto& identity : providers) {
       if (!mfgunlock::hook::IsCurrent(identity))
@@ -1442,7 +1714,7 @@ void RefreshRuntime() {
 }
 
 bool UiCandidateObservationEnabled() {
-  return g_show_debug_options.load(std::memory_order_relaxed) ||
+  return mfgunlock::diagnostic::g_verbose.load(std::memory_order_relaxed) ||
          mfgunlock::framecount::g_ui_candidate_injection_enabled.load(
              std::memory_order_relaxed);
 }
@@ -3173,8 +3445,10 @@ void ReserveDebugRows(float start_y, float rows) {
 }
 
 void DrawWarpStatus(bool requested) {
+  // UI-only last complete status; lock contention is not a feature transition.
+  static std::string last_status = "Warp: INACTIVE";
   if (!TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
-    ImGui::TextDisabled("Warp: UPDATING");
+    ImGui::TextUnformatted(last_status.c_str());
     return;
   }
   struct Unlock {
@@ -3186,23 +3460,25 @@ void DrawWarpStatus(bool requested) {
     const bool matches = std::all_of(g_validated_warp_modules.begin(), g_validated_warp_modules.end(),
                                     [mode](const auto& patch) { return patch.mode == mode; });
     if (!requested) {
-      ImGui::TextWrapped("Warp: ACTIVE | REQUESTED_OFF");
+      last_status = "Warp: ACTIVE | REQUESTED_OFF";
     } else if (!matches) {
-      ImGui::TextWrapped("Warp: ACTIVE | MODE_PENDING");
+      last_status = "Warp: ACTIVE | MODE_PENDING";
     } else if (mode == mfgunlock::validatedwarp::Mode::kValidatedWarp) {
-      ImGui::TextUnformatted("Warp: ACTIVE");
+      last_status = "Warp: ACTIVE";
     } else {
-      ImGui::Text("Warp: ACTIVE | %s",
-                  mfgunlock::validatedwarp::ModeLabel(
-                      mode, g_validated_warp_modules.front().target_sm).c_str());
+      last_status = "Warp: ACTIVE | " + mfgunlock::validatedwarp::ModeLabel(
+          mode, g_validated_warp_modules.front().target_sm);
     }
   } else if (requested) {
     if (!g_validated_warp_detail.empty()) {
-      ImGui::TextWrapped("Warp: UNAVAILABLE");
+      last_status = "Warp: UNAVAILABLE";
     } else {
-      ImGui::TextDisabled("Warp: PENDING");
+      last_status = "Warp: PENDING";
     }
+  } else {
+    last_status = "Warp: DISABLED";
   }
+  ImGui::TextUnformatted(last_status.c_str());
 }
 
 const char* DlssgModeName(uint32_t mode) {
@@ -3234,8 +3510,8 @@ void DrawMfgRuntimeDiagnostics() {
       g_mfg_gate_candidates.load(std::memory_order_relaxed),
       g_mfg_gate_ceiling.load(std::memory_order_acquire));
   ImGui::Text("MFG native capability: %s", fc::g_state_seen.load(std::memory_order_acquire)
-      ? (fc::g_runtime_max_generated.load(std::memory_order_relaxed) > 1 ? "OBSERVED" : "NOT_ADVERTISED")
-      : "UNOBSERVED");
+      ? (fc::g_runtime_max_generated.load(std::memory_order_relaxed) > 1 ? "available" : "unavailable")
+      : "--");
   ImGui::TextUnformatted("MFG runtime contract");
   ImGui::Separator();
   ImGui::Text("Mode: requested %s, forwarded %s, accepted %s.",
@@ -3248,7 +3524,7 @@ void DrawMfgRuntimeDiagnostics() {
     ImGui::Text("Generated-frame request: game %u, forwarded %u, accepted %u.",
                 requested_generated, forwarded_generated, accepted_generated);
   } else {
-    ImGui::TextDisabled("Generated-frame request: UNOBSERVED");
+    ImGui::TextDisabled("Generated-frame request: --");
   }
 
   const uint32_t structural = fc::g_streamline_max_generated.load(std::memory_order_relaxed);
@@ -3267,9 +3543,9 @@ void DrawMfgRuntimeDiagnostics() {
         fc::g_dynamic_supported.load(std::memory_order_relaxed) ? "yes" : "no",
         fc::g_dynamic_mfg_enabled.load(std::memory_order_relaxed) ? "yes" : "no",
         fc::g_dynamic_applied.load(std::memory_order_relaxed) ? "yes" : "no");
-    ImGui::TextDisabled("Dynamic provider mode: UNOBSERVED");
+    ImGui::TextDisabled("Dynamic provider mode: --");
   } else {
-    ImGui::TextDisabled("Dynamic MFG support: UNOBSERVED");
+    ImGui::TextDisabled("Dynamic MFG support: --");
   }
 
   const auto output_state = mfgunlock::outputstate::Read();
@@ -3284,7 +3560,7 @@ void DrawMfgRuntimeDiagnostics() {
           mfgunlock::outputstate::EncodingName(output_state.encoding));
     }
     if (!output_state.dlssg_supported)
-      ImGui::TextDisabled("DLSS-G output: UNSUPPORTED");
+      ImGui::TextDisabled("Output: unsupported color format");
   } else {
     ImGui::TextDisabled("Output encoding/color space: unknown.");
   }
@@ -3300,10 +3576,10 @@ void DrawMfgRuntimeDiagnostics() {
         static_cast<unsigned long long>(metrics.invalid_events));
     if (metrics.source_callbacks.valid) ImGui::Text("Source callbacks: %.3f /s (%llu intervals)",
         metrics.source_callbacks.hz, static_cast<unsigned long long>(metrics.source_callbacks.intervals));
-    else ImGui::TextDisabled("Source callbacks/s: UNKNOWN/STALE");
+    else ImGui::TextDisabled("Source callbacks/s: --");
     if (metrics.native_presented.valid) ImGui::Text("SL-reported presented: %.3f /s (%llu intervals)",
         metrics.native_presented.hz, static_cast<unsigned long long>(metrics.native_presented.intervals));
-    else ImGui::TextDisabled("SL-reported presented/s: UNKNOWN/STALE");
+    else ImGui::TextDisabled("SL-reported presented/s: --");
     for (size_t index = 0; index < passive::kCpuKinds; ++index) {
       const auto& stat = metrics.cpu[index];
       if (stat.valid) ImGui::Text("%s own CPU us: p50 %.2f | p95 %.2f | p99 %.2f | n=%llu",
@@ -3311,7 +3587,7 @@ void DrawMfgRuntimeDiagnostics() {
           stat.p50_ns / 1000.0, stat.p95_ns / 1000.0, stat.p99_ns / 1000.0,
           static_cast<unsigned long long>(stat.retained));
     }
-    ImGui::TextDisabled("Display scan-out / generated / dropped / duplicate: UNKNOWN");
+    ImGui::TextDisabled("Display scan-out / generated / dropped / duplicate: --");
     if (ImGui::Button("Write passive snapshot to log")) {
       std::stringstream row;
       row << "F2Metrics generation=" << metrics.generation
@@ -3391,6 +3667,7 @@ void DrawMfgRuntimeDiagnostics() {
         }
         mfgunlock::provider::Log(detail.str());
       }
+      DumpDlssStartupEvidence("manual-passive-snapshot");
 
     }
   }
@@ -3402,7 +3679,7 @@ void DrawMfgRuntimeDiagnostics() {
         static_cast<unsigned long long>(presentation.correlated_source_presents),
         static_cast<unsigned long long>(presentation.correlated_provider_presented));
   } else {
-    ImGui::TextDisabled("Presentation multiplier: UNOBSERVED");
+    ImGui::TextDisabled("Presentation multiplier: --");
   }
   if (presentation.accepted_mode_known &&
       presentation.accepted_mode == mfgunlock::presentation::ProviderMode::kFixed &&
@@ -3417,7 +3694,7 @@ void DrawMfgRuntimeDiagnostics() {
     ImGui::TextDisabled("Provider accepted mode/multiplier: unknown.");
   }
   ImGui::TextDisabled(
-      "Generated multiplier: UNOBSERVED");
+      "Generated multiplier: --");
   if (presentation.swap_effect_known || presentation.window_mode_known) {
     ImGui::Text("DXGI: swap effect %s, mode %s.",
         presentation.swap_effect_known
@@ -3440,7 +3717,7 @@ void DrawMfgRuntimeDiagnostics() {
   if (presentation.allow_tearing_flag_known)
     ImGui::Text("ALLOW_TEARING creation flag: %s.", presentation.allow_tearing_flag ? "yes" : "no");
   ImGui::TextDisabled(
-      "Present flags / SyncInterval / Independent Flip: UNOBSERVED");
+      "Present flags / SyncInterval / Independent Flip: --");
 
   const auto ui_debug = fc::ReadUiDebugSnapshot();
   const auto candidate = ReadUiCandidateDebugSnapshot();
@@ -3452,8 +3729,6 @@ void DrawMfgRuntimeDiagnostics() {
       : mfgunlock::diagnostic::kUiAutoNoCandidate;
   if (!fc::g_ui_candidate_injection_enabled.load(std::memory_order_relaxed))
     reject |= mfgunlock::diagnostic::kUiAutoDisabled;
-  if (!mfgunlock::outputstate::SupportsHudSeparation(output_state))
-    reject |= mfgunlock::diagnostic::kUiAutoOutputUnsupported;
   if (candidate.present && !mfgunlock::outputstate::IsUiEncodingCompatible(
           output_state,
           static_cast<mfgunlock::outputstate::UiEncoding>(candidate.ui_encoding), false))
@@ -3471,130 +3746,73 @@ void DrawMfgRuntimeDiagnostics() {
 
 void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
   TryAttachRuntime();
-  if (g_early_load_restart_required.load(std::memory_order_acquire)) {
-    ImGui::Text("Early load: RESTART_REQUIRED");
-    ImGui::Separator();
+  bool advanced = g_show_debug_options.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Advanced", &advanced)) {
+    g_show_debug_options.store(advanced, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "ShowDebugOptions", advanced ? 1 : 0);
   }
-  mfgunlock::streamline::Draw();
-  const auto runtime_snapshot = mfgunlock::runtime::Read();
-  HMODULE interposer = GetModuleHandleW(L"sl.interposer.dll");
-  const auto contract = mfgunlock::streamline::internal::GetInterposerContract(interposer);
-  const auto compat_ngx = mfgunlock::ngx::internal::LifecycleSnapshot();
-  ImGui::Text("Provider preparation: %s | identity %016llx",
-      mfgunlock::runtime::ProviderReady() ? "STRUCTURAL_PREPARED" :
-          mfgunlock::runtime::FallbackReasonName(runtime_snapshot.fallback_reason),
-      static_cast<unsigned long long>(runtime_snapshot.provider_identity));
-  ImGui::Text("Admission: %s | NGX query: %s",
-      mfgunlock::compatibility::Name(contract.admission.state),
-      mfgunlock::ngx::g_status.capabilities_seen.load(std::memory_order_acquire)
-          ? "OBSERVED" : "UNOBSERVED");
-  const bool compat_mfg_ready = g_enabled.load(std::memory_order_relaxed) &&
-      mfgunlock::framecount::g_multi_frame_ready &&
-      mfgunlock::framecount::g_multi_frame_ready() &&
-      mfgunlock::framecount::g_streamline_max_generated.load(std::memory_order_acquire) > 1;
-  ImGui::Text("MFG policy: %s | Preset observer: %s",
-      !g_enabled.load(std::memory_order_relaxed) ? "DISABLED" :
-          compat_mfg_ready ? "AVAILABLE" : "UNAVAILABLE",
-      mfgunlock::fgpreset::HasObserver() ? "AVAILABLE" : "UNAVAILABLE");
+  if (advanced) {
+    if (g_early_load_restart_required.load(std::memory_order_acquire))
+      ImGui::Text("Restart game to finish setup");
+    mfgunlock::streamline::Draw();
   const bool warp_lock = TryAcquireSRWLockShared(&g_provider_maintenance_lock) != 0;
-  const bool warp_active = warp_lock && !g_validated_warp_modules.empty();
-  if (warp_lock) ReleaseSRWLockShared(&g_provider_maintenance_lock);
+  static bool warp_active = false;
+  if (warp_lock) {
+    warp_active = !g_validated_warp_modules.empty();
+    ReleaseSRWLockShared(&g_provider_maintenance_lock);
+  }
   ImGui::Text("Temporal: %s | Warp: %s",
       (g_midpoint_patched.load(std::memory_order_acquire) ||
        g_blackwell_temporal_patched.load(std::memory_order_acquire)) ? "ACTIVE" : "INACTIVE",
-      !warp_lock ? "UPDATING" : warp_active ? "ACTIVE" : "INACTIVE");
-  ImGui::Text("Lifecycle: %s | slInit: %s | NGX Creates in flight: %u",
-      mfgunlock::streamline::internal::LifecycleName(
-          mfgunlock::streamline::internal::g_lifecycle_state.load(std::memory_order_acquire)),
-      mfgunlock::streamline::internal::g_init_observed.load(std::memory_order_acquire)
-          ? "OBSERVED" : "UNOBSERVED", compat_ngx.creates);
+      warp_active ? "ACTIVE" : "INACTIVE");
+  }
   bool enabled = g_enabled.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Enable multi-frame override", &enabled)) {
+  if (ImGui::Checkbox("Enable MFG Unlock", &enabled)) {
     g_enabled.store(enabled, std::memory_order_relaxed);
     mfgunlock::framecount::NotifyLiveOptionsChanged();
     reshade::set_config_value(nullptr, kConfigSection, "Enabled", enabled ? 1 : 0);
     if (enabled) InstallPresetForLoadedProviders();
   }
-  bool debug_options = g_show_debug_options.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Show advanced/debug options", &debug_options)) {
-    g_show_debug_options.store(debug_options, std::memory_order_relaxed);
-    mfgunlock::diagnostic::g_verbose.store(debug_options, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "ShowDebugOptions", debug_options ? 1 : 0);
-  }
 
-  static const char* kRuntimeModes[] = {
-      "Game default", "Prefer local runtime", "Force NVIDIA OTA runtime"};
-  int runtime_mode = static_cast<int>(
-      mfgunlock::framecount::g_runtime_selection_mode.load(std::memory_order_relaxed));
-  bool runtime_changed = false;
-  if (debug_options) {
-    runtime_changed = ImGui::Combo("Streamline runtime", &runtime_mode, kRuntimeModes, ARRAYSIZE(kRuntimeModes));
-  } else {
-    bool local = runtime_mode == 1;
-    if (ImGui::Checkbox("Prefer local runtime", &local)) {
-      runtime_mode = local ? 1 : 0;
-      runtime_changed = true;
-    }
-    if (runtime_mode == 2) ImGui::TextDisabled("Runtime policy: NVIDIA_OTA");
-  }
-  if (runtime_changed) {
-    mfgunlock::framecount::g_runtime_selection_mode.store(
-        static_cast<unsigned int>(runtime_mode), std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "RuntimeSelectionMode", runtime_mode);
-  }
-
-  if (debug_options) {
-    int count = static_cast<int>(g_max_count.load(std::memory_order_relaxed));
-    if (ImGui::SliderInt("Reported MultiFrameCountMax", &count,
-                         static_cast<int>(kMinCount), static_cast<int>(kMaxCount))) {
-      if (count < static_cast<int>(kMinCount)) count = static_cast<int>(kMinCount);
-      if (count > static_cast<int>(kMaxCount)) count = static_cast<int>(kMaxCount);
-      g_max_count.store(static_cast<unsigned int>(count), std::memory_order_relaxed);
-      reshade::set_config_value(nullptr, kConfigSection, "MaxCount", count);
-    }
-
-    bool flip_off = g_force_flip_meter_off.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Force legacy software pacing", &flip_off)) {
-      g_force_flip_meter_off.store(flip_off, std::memory_order_relaxed);
-      reshade::set_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", flip_off ? 1 : 0);
-    }
-
-    ImGui::Separator();
-    if (g_flip_meter_patched.load(std::memory_order_acquire)) {
-      ImGui::TextUnformatted("Software pacing: active");
-    } else if (g_flip_meter_failed.load(std::memory_order_acquire)) {
-      ImGui::TextDisabled("Software pacing: UNAVAILABLE");
-    } else {
-      ImGui::TextDisabled("Software pacing: inactive.");
-    }
-    const unsigned int streamline_max =
-        mfgunlock::framecount::g_streamline_max_generated.load(std::memory_order_acquire);
-    if (streamline_max != 0)
-      ImGui::Text("Streamline structural maximum: %ux.", streamline_max + 1);
-    if (mfgunlock::framecount::g_capacity_advertised.load(std::memory_order_relaxed)) {
-      ImGui::Text("Native menu maximum: runtime %ux, Streamline %ux.",
-                  mfgunlock::framecount::g_runtime_max_generated.load(std::memory_order_relaxed) + 1,
-                  streamline_max + 1);
-    }
-  }
-  if (mfgunlock::framecount::g_state_seen.load(std::memory_order_relaxed)) {
-    const unsigned int status =
-        mfgunlock::framecount::g_dlssg_status.load(std::memory_order_relaxed);
-    if (status != 0) ImGui::Text("DLSS-G runtime status: 0x%x.", status);
-  }
-
-  int force = static_cast<int>(
+  // Commit one selected value after the slider is released.
+  const int configured_force = static_cast<int>(
       mfgunlock::framecount::g_force_multiplier.load(std::memory_order_relaxed));
-  // The Streamline API expresses this as generated frames, so 6x maps to 5.
-  if (ImGui::SliderInt("Force frame multiplier", &force, 0, 6,
-                       force == 0 ? "OFF" : "%dx")) {
-    if (force != 0 && force < 2) force = 2;
-    mfgunlock::framecount::g_force_multiplier.store(static_cast<unsigned int>(force),
-                                                    std::memory_order_relaxed);
-    mfgunlock::framecount::NotifyFixedMultiplierChanged();
-    reshade::set_config_value(nullptr, kConfigSection, "ForceMultiplier", force);
+  const int selected_force = configured_force >= 2 ? (std::min)(configured_force, 6) : 1;
+  static int pending_force = selected_force;
+  static bool multiplier_editing = false;
+  if (!multiplier_editing) pending_force = selected_force;
+  ImGui::SliderInt("FG multiplier", &pending_force, 1, 6,
+                   pending_force <= 1 ? "Game / Auto" : "%dx");
+  const bool commit_multiplier = ImGui::IsItemDeactivatedAfterEdit();
+  multiplier_editing = ImGui::IsItemActive();
+  if (commit_multiplier) {
+    const int force = pending_force <= 1 ? 0 : (std::min)(pending_force, 6);
+    if (force != configured_force) {
+      mfgunlock::framecount::g_force_multiplier.store(
+          static_cast<unsigned int>(force), std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyFixedMultiplierChanged();
+      reshade::set_config_value(nullptr, kConfigSection, "ForceMultiplier", force);
+    }
+    pending_force = force == 0 ? 1 : force;
   }
-
+  const int force = configured_force;
+  const auto sl_native = mfgunlock::framecount::g_native_maximum.load(std::memory_order_acquire);
+  const auto ngx_native = mfgunlock::ngx::g_status.native_maximum.load(std::memory_order_acquire);
+  const uint64_t native_maximum = mfgunlock::runtimecontrols::MaximumKnown(sl_native)
+      ? sl_native : ngx_native;
+  if (mfgunlock::runtimecontrols::MaximumKnown(native_maximum)) {
+    const unsigned long long native =
+        static_cast<unsigned long long>(mfgunlock::runtimecontrols::MaximumGenerated(native_maximum)) + 1;
+    if (force >= 2 && mfgunlock::runtimecontrols::AboveMaximum(
+        static_cast<uint32_t>(force - 1), native_maximum)) {
+      ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.22f, 1.0f),
+                         "Library max: %llux | Selected: %dx", native, force);
+    } else {
+      ImGui::Text("Library max: %llux", native);
+    }
+  } else {
+    ImGui::TextDisabled("Library max: --");
+  }
   if (force >= 2 && !mfgunlock::framecount::g_dynamic_applied.load(std::memory_order_relaxed)) {
     const auto fixed_status = mfgunlock::framecount::g_fixed_override_status.load(
         std::memory_order_relaxed);
@@ -3605,58 +3823,71 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     using Status = mfgunlock::framecount::FixedOverrideStatus;
     switch (fixed_status) {
       case Status::kPending:
-        ImGui::TextDisabled("Fixed multiplier: pending.");
+        ImGui::TextDisabled("FG: pending");
         break;
       case Status::kApplied:
-        ImGui::Text("Fixed request accepted: %ux -> %ux.", requested + 1, effective + 1);
+        ImGui::Text("FG: %ux", effective + 1);
         break;
       case Status::kAppliedAfterRetry:
-        ImGui::Text("Fixed request accepted: %ux -> %ux (retry).",
-                    requested + 1, effective + 1);
+        ImGui::Text("FG: %ux", effective + 1);
         break;
       case Status::kAlreadyMatched:
-        ImGui::Text("Fixed multiplier: NATIVE_ACCEPTED %ux", requested + 1);
+        ImGui::Text("FG: %ux", requested + 1);
         break;
       case Status::kNativeRejected:
-        ImGui::TextDisabled("Fixed multiplier: NATIVE_REJECTED");
+        ImGui::Text("FG: rejected by runtime");
         break;
       case Status::kRejectedNativeFallback:
-        ImGui::Text("Fixed multiplier: REJECTED | NATIVE_ACCEPTED %ux", effective + 1);
+        ImGui::Text("FG: fallback %ux", effective + 1);
         break;
       case Status::kFallbackRejected:
-        ImGui::Text("Fixed multiplier: REJECTED | FALLBACK_REJECTED");
+        ImGui::Text("FG: rejected");
         break;
       case Status::kBlockedBackend:
-        ImGui::TextDisabled("Fixed multiplier: BACKEND_UNAVAILABLE");
+        ImGui::Text("FG: unavailable");
         break;
       case Status::kBlockedPacing:
-        ImGui::TextDisabled("Fixed multiplier: PACING_UNAVAILABLE");
+        ImGui::Text("FG: pacing unavailable");
         break;
       case Status::kBlockedStructuralCeiling: {
         const unsigned int ceiling =
             mfgunlock::framecount::g_streamline_max_generated.load(std::memory_order_relaxed);
-        ImGui::Text("Fixed multiplier: CEILING_EXCEEDED | %dx / %ux",
-                    force, ceiling + 1);
+        ImGui::Text("FG: ceiling %ux", ceiling + 1);
         break;
       }
       case Status::kUnknownStructuralCeiling:
-        ImGui::TextDisabled("Fixed multiplier: CEILING_UNKNOWN");
+        ImGui::Text("FG: ceiling unknown");
         break;
       case Status::kUnknownOptionsAbi:
-        ImGui::TextDisabled("Fixed multiplier: OPTIONS_ABI_UNSUPPORTED");
+        ImGui::Text("FG: unsupported API");
         break;
       default:
         break;
     }
-  } else if (debug_options && mfgunlock::framecount::g_feature_function_hooked.load(std::memory_order_acquire)) {
-    ImGui::TextDisabled("Streamline functions: HOOKED");
-  } else if (debug_options && mfgunlock::framecount::g_init_hooked.load(std::memory_order_acquire)) {
-    ImGui::TextDisabled("Streamline init: HOOKED | FeatureFunction: ABSENT");
-  } else if (debug_options && GetModuleHandleW(L"sl.interposer.dll")) {
-    ImGui::TextDisabled("Streamline multiplier control: UNAVAILABLE");
   }
 
-  ImGui::Separator();
+  static const char* kFgPresets[] = {"Application / driver default", "Preset A", "Preset B", "Preset C"};
+  int preset = static_cast<int>(mfgunlock::fgpreset::g_requested.load(std::memory_order_relaxed));
+  if (ImGui::Combo("Frame Generation model", &preset, kFgPresets, ARRAYSIZE(kFgPresets))) {
+    mfgunlock::fgpreset::g_requested.store(mfgunlock::fgpreset::Parse(preset), std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "FrameGenerationPreset", preset);
+    mfgunlock::fgpreset::g_last_supplied.store(-1, std::memory_order_relaxed);
+    mfgunlock::fgpreset::g_last_applied.store(-1, std::memory_order_relaxed);
+    InstallPresetForLoadedProviders();
+  }
+
+  if (preset != 0 && enabled) {
+    const int supplied = mfgunlock::fgpreset::g_last_supplied.load(std::memory_order_relaxed);
+    if (supplied == preset) {
+      ImGui::Text("Preset supplied: %s", mfgunlock::fgpreset::Name(
+          mfgunlock::fgpreset::Parse(preset)));
+    } else if (!mfgunlock::fgpreset::HasHook()) {
+      ImGui::TextDisabled("Preset: waiting for DLSS-G");
+    } else {
+      ImGui::TextDisabled("Preset: next FG model");
+    }
+  }
+
   bool dynamic_mfg = mfgunlock::framecount::g_dynamic_mfg_enabled.load(
       std::memory_order_relaxed);
   if (ImGui::Checkbox("NVIDIA Dynamic MFG", &dynamic_mfg)) {
@@ -3666,72 +3897,152 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     reshade::set_config_value(nullptr, kConfigSection, "DynamicMFG",
                               dynamic_mfg ? 1 : 0);
   }
-  int dynamic_target = static_cast<int>(
-      mfgunlock::framecount::g_dynamic_target_fps.load(std::memory_order_relaxed));
-  if (ImGui::SliderInt("Dynamic output target", &dynamic_target, 0, 480,
-                                     dynamic_target == 0 ? "display refresh" : "%d FPS")) {
-    mfgunlock::framecount::g_dynamic_target_fps.store(
-        static_cast<unsigned int>(dynamic_target), std::memory_order_relaxed);
-    mfgunlock::framecount::NotifyDynamicModeChanged();
-    reshade::set_config_value(nullptr, kConfigSection, "DynamicTargetFPS", dynamic_target);
-  }
 
-  const auto* active_profile = mfgunlock::architecture::ActiveProfile();
-  if (!active_profile ||
-      !mfgunlock::features::BackendSupports(active_profile, mfgunlock::features::Feature::kDynamicMfg)) {
-    ImGui::TextDisabled("Dynamic MFG: BACKEND_UNAVAILABLE");
-  } else if (!mfgunlock::framecount::g_dynamic_d3d12.load(std::memory_order_relaxed)) {
-    ImGui::TextDisabled("Dynamic MFG: WAIT_D3D12");
-  } else if (!mfgunlock::framecount::DynamicStackReady()) {
-    ImGui::TextDisabled("Dynamic MFG: CONTRACT_UNAVAILABLE");
-  } else if (!mfgunlock::framecount::g_dynamic_support_seen.load(std::memory_order_acquire)) {
-    ImGui::TextDisabled("Dynamic MFG: CAPABILITY_PENDING");
-  } else if (!mfgunlock::framecount::g_dynamic_supported.load(std::memory_order_relaxed)) {
-    ImGui::TextDisabled("Dynamic MFG: RUNTIME_UNSUPPORTED");
-  } else if (mfgunlock::framecount::g_dynamic_applied.load(std::memory_order_relaxed)) {
-    ImGui::TextUnformatted("Dynamic MFG: ACCEPTED");
-  } else if (mfgunlock::framecount::g_dynamic_fell_back.load(std::memory_order_relaxed)) {
-    ImGui::Text("Dynamic MFG: REJECTED 0x%x | FIXED_FALLBACK",
+  if (dynamic_mfg && mfgunlock::framecount::g_dynamic_applied.load(std::memory_order_relaxed)) {
+    ImGui::TextUnformatted("Dynamic MFG: active");
+  } else if (dynamic_mfg && mfgunlock::framecount::g_dynamic_fell_back.load(std::memory_order_relaxed)) {
+    ImGui::Text("Dynamic MFG: rejected (0x%x)",
                 mfgunlock::framecount::g_dynamic_result.load(std::memory_order_relaxed));
-  } else if (dynamic_mfg) {
-    ImGui::TextDisabled("Dynamic MFG: PENDING");
+  } else if (!dynamic_mfg) {
+    // Nothing to report while disabled.
+  } else if (!mfgunlock::framecount::DynamicStackReady()) {
+    ImGui::TextDisabled("Dynamic MFG: pending");
+  } else {
+    ImGui::TextDisabled("Dynamic MFG: waiting for FG");
   }
 
-  ImGui::Separator();
-  static const char* kFgPresets[] = {"Application / driver default", "Preset A", "Preset B"};
-  int preset = static_cast<int>(mfgunlock::fgpreset::g_requested.load(std::memory_order_relaxed));
-  if (ImGui::Combo("Frame Generation model", &preset, kFgPresets, ARRAYSIZE(kFgPresets))) {
-    mfgunlock::fgpreset::g_requested.store(mfgunlock::fgpreset::Parse(preset), std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "FrameGenerationPreset", preset);
-    InstallPresetForLoadedProviders();
-  }
 
-  if (preset != 0) {
-    if (!enabled) {
-      ImGui::TextDisabled("Preset: DISABLED");
-    } else if (!mfgunlock::fgpreset::HasHook()) {
-      ImGui::TextDisabled("Preset: OBSERVER_UNAVAILABLE");
-    } else {
-      ImGui::Text("Preset requested: %s",
-                  mfgunlock::fgpreset::Name(mfgunlock::fgpreset::Parse(preset)));
+  // Settings: visible only in Advanced; hidden settings keep their values.
+  if (advanced && ImGui::CollapsingHeader("Image quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+  bool warp = g_validated_warp_blend.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Validated Warp Blend", &warp)) {
+    g_validated_warp_blend.store(warp, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", warp ? 1 : 0);
+  }
+  ImGui::Indent();
+  // Keep the existing WarpDiagnosticMode INI values (2, 1, 0); only the
+  // presentation order changes, with the normal quality mode first.
+  static const char* kWarpModes[] = {
+      "Validated Warp - improved thin geometry",
+      "Blackwell baseline - NVIDIA blending, retargeted",
+      "Redirect control - unchanged shader copy (test)",
+  };
+  static constexpr std::array<int, 3> kWarpValues = {
+      static_cast<int>(mfgunlock::validatedwarp::Mode::kValidatedWarp),
+      static_cast<int>(mfgunlock::validatedwarp::Mode::kBlackwellBaseline),
+      static_cast<int>(mfgunlock::validatedwarp::Mode::kRedirectControl),
+  };
+  const int saved_warp_mode = g_validated_warp_mode.load(std::memory_order_relaxed);
+  int warp_mode_index = 0;
+  for (size_t i = 0; i < kWarpValues.size(); ++i) {
+    if (kWarpValues[i] == saved_warp_mode) {
+      warp_mode_index = static_cast<int>(i);
+      break;
     }
   }
-  const int supplied = mfgunlock::fgpreset::g_last_supplied.load(std::memory_order_relaxed);
-  if (supplied >= 0) {
-    ImGui::Text("Preset supplied: %s",
-                mfgunlock::fgpreset::Name(mfgunlock::fgpreset::Parse(supplied)));
-
+  ImGui::TextUnformatted("Warp blend mode");
+  ImGui::PushItemWidth(-1.0f);
+  if (ImGui::Combo("##mfg_warp_blend_mode", &warp_mode_index, kWarpModes,
+                   ARRAYSIZE(kWarpModes))) {
+    SetWarpMode(kWarpValues[static_cast<size_t>(warp_mode_index)]);
   }
-  const int applied = mfgunlock::fgpreset::g_last_applied.load(std::memory_order_relaxed);
-  if (applied >= 0) {
-    ImGui::Text("Preset applied: %s",
-                mfgunlock::fgpreset::Name(mfgunlock::fgpreset::Parse(applied)));
+  ImGui::PopItemWidth();
+  DrawWarpStatus(warp);
+  ImGui::Unindent();
 
-  } else if (supplied >= 0 && mfgunlock::fgpreset::HasObserver()) {
-    ImGui::TextDisabled("Preset applied: UNOBSERVED");
+  ImGui::Spacing();
+  bool scatter = g_intermediate_scatter_retention.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Intermediate Scatter Retention", &scatter)) {
+    g_intermediate_scatter_retention.store(scatter, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "IntermediateScatterRetention",
+                              scatter ? 1 : 0);
   }
+  ImGui::TextDisabled("Preserves thin details in motion.");
+  ImGui::Indent();
+  // Display stronger edge protection first while preserving INI values (2, 1, 0).
+  static const char* kBoundaryModes[] = {
+      "Aggressive - prioritizes clean boundaries",
+      "Balanced - detail and cleaner edges",
+      "Off - original ISR, no edge protection",
+  };
+  static constexpr std::array<int, 3> kBoundaryValues = {
+      static_cast<int>(mfgunlock::blackwelltemporal::BoundaryArtifactMode::kAggressive),
+      static_cast<int>(mfgunlock::blackwelltemporal::BoundaryArtifactMode::kBalanced),
+      static_cast<int>(mfgunlock::blackwelltemporal::BoundaryArtifactMode::kOff),
+  };
+  const int saved_boundary_mode = static_cast<int>(g_boundary_artifact_mode.load(std::memory_order_relaxed));
+  int boundary_mode_index = 2;  // Off on an unrecognized saved value.
+  for (size_t i = 0; i < kBoundaryValues.size(); ++i) {
+    if (kBoundaryValues[i] == saved_boundary_mode) {
+      boundary_mode_index = static_cast<int>(i);
+      break;
+    }
+  }
+  // BAM is meaningful only with ISR. Keep the saved mode for re-enabling ISR.
+  ImGui::BeginDisabled(!scatter);
+  ImGui::TextUnformatted("Boundary Artifact Mitigation (ISR only)");
+  ImGui::PushItemWidth(-1.0f);
+  if (ImGui::Combo("##mfg_isr_boundary_mode", &boundary_mode_index,
+                   kBoundaryModes, ARRAYSIZE(kBoundaryModes))) {
+    const auto parsed = mfgunlock::blackwelltemporal::ParseBoundaryArtifactMode(
+        kBoundaryValues[static_cast<size_t>(boundary_mode_index)]);
+    g_boundary_artifact_mode.store(static_cast<unsigned int>(parsed), std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "BoundaryArtifactMitigationMode",
+                              static_cast<int>(parsed));
+  }
+  ImGui::PopItemWidth();
+  ImGui::EndDisabled();
+  // A failed try-lock is not a change of feature state. Keep exactly one row.
+  static std::string isr_status = "ISR: INACTIVE";
+  if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
+    if (!g_blackwell_temporal_modules.empty()) {
+      isr_status = std::string("ISR: ACTIVE | Boundary: ") +
+          mfgunlock::blackwelltemporal::BoundaryArtifactModeName(
+              g_blackwell_temporal_modules.front().boundary_mode);
+      if (!scatter) isr_status += " | REQUESTED_OFF";
+    } else if (!scatter) {
+      isr_status = "ISR: DISABLED";
+    } else if (!g_temporal_fix.load(std::memory_order_relaxed)) {
+      isr_status = "ISR: DEPENDENCY_TEMPORAL";
+    } else if (!g_blackwell_temporal_detail.empty()) {
+      isr_status = g_midpoint_patched.load(std::memory_order_acquire)
+          ? "ISR: UNAVAILABLE | MIDPOINT_ACTIVE" : "ISR: INACTIVE";
+    } else {
+      isr_status = "ISR: PENDING";
+    }
+    ReleaseSRWLockShared(&g_provider_maintenance_lock);
+  }
+  ImGui::TextUnformatted(isr_status.c_str());
+  if (scatter && !g_temporal_fix.load(std::memory_order_relaxed))
+    ImGui::TextDisabled("Requires Temporal correction.");
+  ImGui::Unindent();
 
-  ImGui::Separator();
+  {
+    ImGui::Spacing();
+    bool temporal = g_temporal_fix.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Temporal correction", &temporal)) {
+      g_temporal_fix.store(temporal, std::memory_order_relaxed);
+      reshade::set_config_value(nullptr, kConfigSection, "TemporalFix", temporal ? 1 : 0);
+    }
+    static std::string temporal_status = "Temporal: INACTIVE";
+    if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
+      if (!g_blackwell_temporal_modules.empty()) {
+        temporal_status = "Temporal: BLACKWELL_SM" +
+            std::to_string(g_blackwell_temporal_modules.front().target_sm) +
+            " | providers " + std::to_string(g_blackwell_temporal_modules.size());
+      } else if (!g_midpoint_modules.empty()) {
+        temporal_status = "Temporal: MIDPOINT | providers " + std::to_string(g_midpoint_modules.size());
+      } else {
+        temporal_status = temporal ? "Temporal: NATIVE / no addon correction" : "Temporal: DISABLED";
+      }
+      ReleaseSRWLockShared(&g_provider_maintenance_lock);
+    }
+    ImGui::TextUnformatted(temporal_status.c_str());
+  }
+  }
+  SaveQualityRequest();
+
+  if (advanced && ImGui::CollapsingHeader("UI Composition")) {
   bool ui_composition = mfgunlock::framecount::g_ui_composition_enabled.load(
       std::memory_order_relaxed);
   if (ImGui::Checkbox("Automatic UI Composition", &ui_composition)) {
@@ -3744,14 +4055,7 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
 
   const auto ui_debug = mfgunlock::framecount::ReadUiDebugSnapshot();
   if (!ui_composition) {
-    ImGui::TextDisabled(mfgunlock::framecount::g_ui_composition_applied.load()
-        ? "UI Composition: REQUESTED_OFF | LAST_ACCEPTED_ON"
-        : "UI Composition: DISABLED");
-  } else if (!mfgunlock::outputstate::Read().known) {
-    ImGui::TextDisabled("UI Composition: WAIT_OUTPUT");
-  } else if (!mfgunlock::outputstate::Read().dlssg_supported) {
-    ImGui::TextDisabled(
-        "UI Composition: OUTPUT_UNSUPPORTED");
+    // No status row when disabled.
   } else if (mfgunlock::framecount::g_ui_composition_fell_back.load(
                  std::memory_order_relaxed)) {
     ImGui::Text("UI Composition: REJECTED 0x%x | NATIVE_FALLBACK",
@@ -3770,8 +4074,6 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     } else {
       ImGui::TextDisabled("UI Composition: WAIT_PAIR");
     }
-  } else {
-    ImGui::TextDisabled("UI Composition: READY");
   }
   bool inject_ui_candidate =
       mfgunlock::framecount::g_ui_candidate_injection_enabled.load(
@@ -3784,7 +4086,124 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
                               inject_ui_candidate ? 1 : 0);
   }
 
-  if (debug_options) {
+  }
+
+  if (advanced && ImGui::CollapsingHeader("Runtime & compatibility")) {
+  static const char* kRuntimeModes[] = {
+      "Game default", "Prefer local runtime", "Force NVIDIA OTA runtime"};
+  int runtime_mode = static_cast<int>(
+      mfgunlock::framecount::g_runtime_selection_mode.load(std::memory_order_relaxed));
+  bool runtime_changed = false;
+  runtime_changed = ImGui::Combo("Streamline runtime", &runtime_mode, kRuntimeModes, ARRAYSIZE(kRuntimeModes));
+  if (runtime_changed) {
+    mfgunlock::framecount::g_runtime_selection_mode.store(
+        static_cast<unsigned int>(runtime_mode), std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "RuntimeSelectionMode", runtime_mode);
+  }
+
+  {
+    int count = static_cast<int>(g_max_count.load(std::memory_order_relaxed));
+    if (ImGui::InputInt("Reported MultiFrameCountMax (0 = native)", &count,
+                        0, 0, ImGuiInputTextFlags_EnterReturnsTrue)) {
+      count = (std::max)(0, (std::min)(count, 5));
+      g_max_count.store(static_cast<unsigned int>(count), std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyLiveOptionsChanged();
+      reshade::set_config_value(nullptr, kConfigSection, "MaxCount", count);
+    }
+
+    bool flip_off = g_force_flip_meter_off.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Force legacy software pacing", &flip_off)) {
+      g_force_flip_meter_off.store(flip_off, std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyLiveOptionsChanged();
+      reshade::set_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", flip_off ? 1 : 0);
+    }
+
+    if (g_flip_meter_rollback_pending.load(std::memory_order_acquire)) {
+      ImGui::TextDisabled("Software pacing: reverting.");
+    } else if (g_flip_meter_patched.load(std::memory_order_acquire)) {
+      ImGui::TextUnformatted("Software pacing patch: applied");
+    } else if (g_flip_meter_failed.load(std::memory_order_acquire)) {
+      ImGui::TextDisabled("Software pacing: unavailable.");
+    } else {
+      ImGui::TextDisabled("Software pacing: inactive.");
+    }
+  }
+  if (mfgunlock::framecount::g_state_seen.load(std::memory_order_relaxed)) {
+    const unsigned int status =
+        mfgunlock::framecount::g_dlssg_status.load(std::memory_order_relaxed);
+    if (status != 0) ImGui::Text("DLSS-G runtime status: 0x%x.", status);
+  }
+
+  float dynamic_target = mfgunlock::framecount::g_dynamic_target_fps.load(std::memory_order_relaxed);
+  static bool invalid_dynamic_target = false;
+  if (ImGui::InputFloat("Dynamic output target (0 = Auto)", &dynamic_target, 0.0f, 0.0f, "%.9g",
+                        ImGuiInputTextFlags_EnterReturnsTrue)) {
+    invalid_dynamic_target = !mfgunlock::runtimecontrols::ValidDynamicTarget(dynamic_target);
+    if (!invalid_dynamic_target) {
+      mfgunlock::framecount::g_dynamic_target_fps.store(dynamic_target, std::memory_order_relaxed);
+      mfgunlock::framecount::NotifyDynamicModeChanged();
+      const auto encoded = mfgunlock::runtimecontrols::FormatDynamicTarget(dynamic_target);
+      reshade::set_config_value(nullptr, kConfigSection, "DynamicTargetFPS", encoded.c_str());
+    }
+  }
+  if (invalid_dynamic_target)
+    ImGui::Text("Invalid FPS target");
+
+  }
+
+  if (advanced && ImGui::CollapsingHeader("Diagnostics")) {
+    // Advanced header details remain available here (H4A, H6A).
+    mfgunlock::streamline::DrawAbiDiagnostics();
+    const auto runtime_snapshot = mfgunlock::runtime::Read();
+    HMODULE interposer = mfgunlock::streamline::internal::InterposerModule();
+    const auto contract = mfgunlock::streamline::internal::GetInterposerContract(interposer);
+    const auto compat_ngx = mfgunlock::ngx::internal::LifecycleSnapshot();
+    ImGui::Text("Provider preparation: %s | identity %016llx",
+      mfgunlock::runtime::ProviderReady() ? "STRUCTURAL_PREPARED" :
+          mfgunlock::runtime::FallbackReasonName(runtime_snapshot.fallback_reason),
+      static_cast<unsigned long long>(runtime_snapshot.provider_identity));
+    ImGui::Text("Admission: %s | NGX query: %s",
+      mfgunlock::compatibility::Name(contract.admission.state),
+      mfgunlock::ngx::g_status.capabilities_seen.load(std::memory_order_acquire)
+          ? "yes" : "--");
+    const bool mfg_callable = mfgunlock::framecount::internal::RealSetOptions() != nullptr;
+    ImGui::Text("Native MFG request: %s | Preset observer: %s",
+      !g_enabled.load(std::memory_order_relaxed) ? "DISABLED" :
+          mfg_callable ? "CALLABLE" : "WAITING FOR SETTER",
+      mfgunlock::fgpreset::HasObserver() ? "AVAILABLE" : "UNAVAILABLE");
+    ImGui::Text("Lifecycle: %s | slInit: %s | NGX Creates: %u",
+      mfgunlock::streamline::internal::LifecycleName(
+          mfgunlock::streamline::internal::g_lifecycle_state.load(std::memory_order_acquire)),
+      mfgunlock::streamline::internal::g_init_observed.load(std::memory_order_acquire)
+          ? "yes" : "--", compat_ngx.creates);
+  bool verbose_diagnostics = mfgunlock::diagnostic::g_verbose.load(std::memory_order_relaxed);
+  if (ImGui::Checkbox("Verbose diagnostics", &verbose_diagnostics)) {
+    mfgunlock::diagnostic::g_verbose.store(verbose_diagnostics, std::memory_order_relaxed);
+    reshade::set_config_value(nullptr, kConfigSection, "VerboseDiagnostics",
+                              verbose_diagnostics ? 1 : 0);
+  }
+    const auto ui_debug = mfgunlock::framecount::ReadUiDebugSnapshot();
+    const bool inject_ui_candidate =
+        mfgunlock::framecount::g_ui_candidate_injection_enabled.load(std::memory_order_relaxed);
+  if (mfgunlock::framecount::g_dynamic_support_seen.load(std::memory_order_acquire)) {
+    ImGui::Text("Native capability report: %s",
+        mfgunlock::framecount::g_dynamic_supported.load(std::memory_order_relaxed)
+            ? "supported" : "unsupported");
+  } else if (mfgunlock::framecount::g_dynamic_probe_attempted.load(std::memory_order_acquire)) {
+    ImGui::Text("Native capability probe: 0x%x",
+        mfgunlock::framecount::g_dynamic_probe_result.load(std::memory_order_relaxed));
+  } else {
+    ImGui::TextDisabled("Native capability report: not yet observed");
+  }
+  {
+    ImGui::Text("R6 trials: GetState %llu | Dynamic %llu | repeats avoided %llu / %llu",
+        static_cast<unsigned long long>(mfgunlock::framecount::g_dynamic_probe_calls.load()),
+        static_cast<unsigned long long>(mfgunlock::framecount::g_dynamic_request_calls.load()),
+        static_cast<unsigned long long>(mfgunlock::framecount::g_dynamic_suppressed_repeats.load()),
+        static_cast<unsigned long long>(mfgunlock::framecount::g_fixed_suppressed_repeats.load()));
+  }
+
+  {
     const float ui_debug_height = ImGui::GetTextLineHeightWithSpacing() * 10.0f;
     const bool pair_now =
         mfgunlock::framecount::g_ui_pair_eligible.load(std::memory_order_relaxed);
@@ -3964,97 +4383,17 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
     ImGui::EndChild();
   }
 
-  ImGui::Separator();
-  bool scatter = g_intermediate_scatter_retention.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Intermediate Scatter Retention", &scatter)) {
-    g_intermediate_scatter_retention.store(scatter, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "IntermediateScatterRetention",
-                              scatter ? 1 : 0);
-  }
-  static const char* kBoundaryModes[] = {"Off", "Balanced", "Aggressive"};
-  int boundary_mode = static_cast<int>(g_boundary_artifact_mode.load(std::memory_order_relaxed));
-  if (ImGui::Combo("Boundary Artifact Mitigation", &boundary_mode,
-                   kBoundaryModes, ARRAYSIZE(kBoundaryModes))) {
-    const auto parsed = mfgunlock::blackwelltemporal::ParseBoundaryArtifactMode(boundary_mode);
-    g_boundary_artifact_mode.store(static_cast<unsigned int>(parsed), std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "BoundaryArtifactMitigationMode",
-                              static_cast<int>(parsed));
-  }
-  if (!scatter) ImGui::TextDisabled("ISR: DISABLED");
-  if (scatter || g_blackwell_temporal_patched.load(std::memory_order_acquire)) {
-    if (!g_temporal_fix.load(std::memory_order_relaxed) && !g_blackwell_temporal_patched.load()) {
-      ImGui::TextDisabled("ISR: DEPENDENCY_TEMPORAL");
-    } else if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
-      if (!g_blackwell_temporal_modules.empty()) {
-        ImGui::Text("ISR: ACTIVE | Boundary: %s",
-                    mfgunlock::blackwelltemporal::BoundaryArtifactModeName(
-                        g_blackwell_temporal_modules.front().boundary_mode));
-      } else if (!g_blackwell_temporal_detail.empty()) {
-        if (g_midpoint_patched.load(std::memory_order_acquire))
-          ImGui::TextUnformatted("ISR: UNAVAILABLE | MIDPOINT_ACTIVE");
-        else
-          ImGui::TextUnformatted("ISR: INACTIVE");
-      } else {
-        ImGui::TextDisabled("ISR: PENDING");
-      }
-      ReleaseSRWLockShared(&g_provider_maintenance_lock);
-    }
-  }
-
-  ImGui::Separator();
-  bool warp = g_validated_warp_blend.load(std::memory_order_relaxed);
-  if (ImGui::Checkbox("Validated Warp Blend", &warp)) {
-    g_validated_warp_blend.store(warp, std::memory_order_relaxed);
-    reshade::set_config_value(nullptr, kConfigSection, "ValidatedWarpBlend", warp ? 1 : 0);
-  }
-  if (debug_options) {
-    static const char* kWarpModes[] = {
-        "Redirect control",
-        "Blackwell baseline",
-        "Validated Warp",
-    };
-    int warp_mode = g_validated_warp_mode.load(std::memory_order_relaxed);
-    if (ImGui::Combo("Warp diagnostic mode", &warp_mode, kWarpModes, ARRAYSIZE(kWarpModes)))
-      SetWarpMode(warp_mode);
-
-  }
-  DrawWarpStatus(warp);
-
-  if (debug_options) {
-    ImGui::Separator();
-    bool temporal = g_temporal_fix.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox("Temporal correction", &temporal)) {
-      g_temporal_fix.store(temporal, std::memory_order_relaxed);
-      reshade::set_config_value(nullptr, kConfigSection, "TemporalFix", temporal ? 1 : 0);
-    }
-    if (TryAcquireSRWLockShared(&g_provider_maintenance_lock)) {
-      if (g_blackwell_temporal_patched.load(std::memory_order_acquire)) {
-        ImGui::Text("Temporal: BLACKWELL_SM%u | providers %zu",
-                    g_blackwell_temporal_modules.front().target_sm,
-                    g_blackwell_temporal_modules.size());
-      } else if (g_midpoint_patched.load(std::memory_order_acquire)) {
-        ImGui::Text("Temporal: MIDPOINT | providers %zu",
-                    g_midpoint_modules.size());
-      } else {
-        ImGui::TextDisabled("Temporal fix: pending.");
-      }
-      ReleaseSRWLockShared(&g_provider_maintenance_lock);
-    }
-  } else if (!g_temporal_fix.load(std::memory_order_relaxed)) {
-    ImGui::TextDisabled("Temporal: REQUESTED_OFF");
-  }
-  SaveQualityRequest();
-  namespace qc = mfgunlock::qualityconfig;
-  const auto lifecycle = mfgunlock::ngx::internal::LifecycleSnapshot();
-  const auto requested_quality = qc::g_requested.load(std::memory_order_acquire);
-  const auto prepared_quality = qc::g_prepared.load(std::memory_order_acquire);
-  if (qc::Pending(requested_quality, prepared_quality))
-    ImGui::TextDisabled("Quality: CHANGE_PENDING | epoch %llu",
+    const auto lifecycle = mfgunlock::ngx::internal::LifecycleSnapshot();
+    namespace qc = mfgunlock::qualityconfig;
+    const auto requested_quality = qc::g_requested.load(std::memory_order_acquire);
+    const auto prepared_quality = qc::g_prepared.load(std::memory_order_acquire);
+    ImGui::Text("Quality: %s | epoch %llu",
+        qc::Pending(requested_quality, prepared_quality) ? "PENDING" : "UP_TO_DATE",
         static_cast<unsigned long long>(lifecycle.epoch));
-  if (mfgunlock::framecount::LiveOptionsActionText() != nullptr)
-    ImGui::TextDisabled("Runtime options: PENDING | revision %llu",
+    ImGui::Text("Runtime options: %s | revision %llu",
+        mfgunlock::framecount::LiveOptionsActionText() ? "PENDING" : "UP_TO_DATE",
         static_cast<unsigned long long>(mfgunlock::framecount::g_options_revision.load()));
-  if (debug_options) {
+  {
     const float backend_debug_height = ImGui::GetTextLineHeightWithSpacing() * 7.0f;
     ImGui::BeginChild("##mfgunlock_backend_debug",
                       ImVec2(0.0f, backend_debug_height), true,
@@ -4121,8 +4460,9 @@ void OnRegisterOverlay(reshade::api::effect_runtime* /*runtime*/) {
 
     ImGui::PopTextWrapPos();
     ImGui::EndChild();
-  }
+  }  }
 }
+
 
 void LoadConfig() {
   int value = 0;
@@ -4141,9 +4481,10 @@ void LoadConfig() {
   if (selected == mfgunlock::Architecture::kUnknown)
     mfgunlock::provider::Log("invalid Architecture setting", true);
   if (reshade::get_config_value(nullptr, kConfigSection, "MaxCount", value)) {
-    if (value < static_cast<int>(kMinCount)) value = static_cast<int>(kMinCount);
-    if (value > static_cast<int>(kMaxCount)) value = static_cast<int>(kMaxCount);
-    g_max_count.store(static_cast<unsigned int>(value), std::memory_order_relaxed);
+    const int normalized = (std::max)(0, (std::min)(value, 5));
+    g_max_count.store(static_cast<unsigned int>(normalized), std::memory_order_relaxed);
+    if (normalized != value)
+      reshade::set_config_value(nullptr, kConfigSection, "MaxCount", normalized);
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "ForceFlipMeteringOff", value)) {
     g_force_flip_meter_off.store(value != 0, std::memory_order_relaxed);
@@ -4177,7 +4518,9 @@ void LoadConfig() {
   int debug_options = 0;
   reshade::get_config_value(nullptr, kConfigSection, "ShowDebugOptions", debug_options);
   g_show_debug_options.store(debug_options != 0, std::memory_order_relaxed);
-  mfgunlock::diagnostic::g_verbose.store(debug_options != 0, std::memory_order_relaxed);
+  int verbose_diagnostics = 0;
+  reshade::get_config_value(nullptr, kConfigSection, "VerboseDiagnostics", verbose_diagnostics);
+  mfgunlock::diagnostic::g_verbose.store(verbose_diagnostics != 0, std::memory_order_relaxed);
   int ui_candidate_injection = 1;
   const bool has_ui_candidate_injection = reshade::get_config_value(
       nullptr, kConfigSection, "UICandidateInjection", ui_candidate_injection);
@@ -4204,11 +4547,16 @@ void LoadConfig() {
     mfgunlock::framecount::g_dynamic_mfg_enabled.store(value != 0,
                                                        std::memory_order_relaxed);
   }
-  if (reshade::get_config_value(nullptr, kConfigSection, "DynamicTargetFPS", value)) {
-    if (value < 0) value = 0;
-    if (value > 480) value = 480;
-    mfgunlock::framecount::g_dynamic_target_fps.store(
-        static_cast<unsigned int>(value), std::memory_order_relaxed);
+  std::array<char, 128> dynamic_target_text{};
+  size_t dynamic_target_size = dynamic_target_text.size() - 1;
+  if (reshade::get_config_value(nullptr, kConfigSection, "DynamicTargetFPS",
+                               dynamic_target_text.data(), &dynamic_target_size)) {
+    float target = 0.0f;
+    if (mfgunlock::runtimecontrols::ParseDynamicTarget(dynamic_target_text.data(), target))
+      mfgunlock::framecount::g_dynamic_target_fps.store(target, std::memory_order_relaxed);
+    else
+      reshade::log::message(reshade::log::level::warning,
+          "mfgunlock: invalid DynamicTargetFPS; expected 0 (Auto) or a finite positive float. Previous value retained.");
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "UIComposition", value)) {
     mfgunlock::framecount::g_ui_composition_enabled.store(
@@ -4230,8 +4578,10 @@ void LoadConfig() {
         std::memory_order_relaxed);
   }
   if (reshade::get_config_value(nullptr, kConfigSection, "ForceMultiplier", value)) {
-    if (value != 0 && (value < 2 || value > 6)) value = 0;
-    mfgunlock::framecount::g_force_multiplier.store(static_cast<unsigned int>(value),
+    const int normalized = value < 2 ? 0 : (std::min)(value, 6);
+    if (normalized != value)
+      reshade::set_config_value(nullptr, kConfigSection, "ForceMultiplier", normalized);
+    mfgunlock::framecount::g_force_multiplier.store(static_cast<unsigned int>(normalized),
                                                     std::memory_order_relaxed);
     mfgunlock::framecount::NotifyFixedMultiplierChanged();
   }
@@ -4247,6 +4597,7 @@ void TryAttachRuntime() {
     ~Release() { g_bootstrap_busy.store(false, std::memory_order_release); }
   } release;
   try {
+    mfgunlock::provider::Log("DLSS_STARTUP_D2 BOOTSTRAP_BEGIN");
     LoadConfig();
     mfgunlock::runtime::Attach(mfgunlock::architecture::ActiveProfile());
     EnsureEarlyLoadConfig();
@@ -4270,6 +4621,7 @@ void TryAttachRuntime() {
 
 DWORD WINAPI DeferredBootstrap(LPVOID held_module) {
   TryAttachRuntime();
+  DumpDlssStartupEvidence("bootstrap-worker");
   FreeLibraryAndExitThread(static_cast<HMODULE>(held_module), 0);
 }
 
@@ -4411,8 +4763,6 @@ extern "C" __declspec(dllexport) bool MfgUnlockGetDiagnosticState(
       : mfgunlock::diagnostic::kUiAutoNoCandidate;
   if (!mfgunlock::framecount::g_ui_candidate_injection_enabled.load(std::memory_order_relaxed))
     auto_reject |= mfgunlock::diagnostic::kUiAutoDisabled;
-  if (!mfgunlock::outputstate::SupportsHudSeparation(output_state))
-    auto_reject |= mfgunlock::diagnostic::kUiAutoOutputUnsupported;
   if (candidate.present && !mfgunlock::outputstate::IsUiEncodingCompatible(
           output_state,
           static_cast<mfgunlock::outputstate::UiEncoding>(candidate.ui_encoding), false))
@@ -4621,14 +4971,369 @@ extern "C" __declspec(dllexport) bool MfgUnlockGetAdvancedFeatureState(
   return true;
 }
 
-BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
-  // At process termination CUDA may still retain cached replacement pointers.
-  // Leave allocations and mapped-image patches to process teardown.
-  if (fdw_reason == DLL_PROCESS_DETACH && reserved != nullptr) return TRUE;
-  switch (fdw_reason) {
-    case DLL_PROCESS_ATTACH: {
+namespace {
+
+mfgunlock::addonentry::State g_addon_entry;
+mfgunlock::addonentry::HostLifetime g_reshade_host_lifetime;
+
+// Keep the D1 observation journal. R2 additionally refreshes host registration
+// at AddonInit; runtime/provider setup remains one-time. Diagnostics must not
+// initialize SDK module caches before the real registration call.
+mfgunlock::registrationtrace::Journal<> g_registration_trace;
+// Separate from verbose registration entries: keep actual SL/NGX startup
+// evidence even when temporary Vulkan instances reopen/truncate ReShade.log.
+// Bounded memory only on the producer path; file I/O is explicit and off-frame.
+mfgunlock::registrationtrace::Journal<1024, 4096> g_dlss_startup_trace;
+std::atomic_flag g_dlss_dump_busy = ATOMIC_FLAG_INIT;
+struct RegistrationTraceLastError {
+  DWORD value = GetLastError();
+  ~RegistrationTraceLastError() { SetLastError(value); }
+};
+
+void TraceDlssStartupLog(const char* message, bool warning) noexcept {
+  RegistrationTraceLastError saved;
+  g_dlss_startup_trace.Append("tick=%llu tid=%lu severity=%s %s",
+      static_cast<unsigned long long>(GetTickCount64()),
+      static_cast<unsigned long>(GetCurrentThreadId()), warning ? "WARN" : "INFO",
+      message ? message : "<null>");
+}
+
+void DumpDlssStartupEvidence(const char* phase) {
+  RegistrationTraceLastError saved;
+  if (g_dlss_dump_busy.test_and_set(std::memory_order_acquire)) return;
+  struct Unlock { ~Unlock() { g_dlss_dump_busy.clear(std::memory_order_release); } } unlock;
+  wchar_t path[1024]{};
+  const DWORD length = GetModuleFileNameW(g_self_module, path, 1024);
+  if (!length || length >= 1024) return;
+  auto* slash = std::wcsrchr(path, L'\\');
+  constexpr wchar_t name[] = L"MFGAmpereUnlock.dlss-startup.log";
+  if (!slash || static_cast<size_t>(slash + 1 - path) + std::size(name) > std::size(path)) return;
+  std::copy(std::begin(name), std::end(name), slash + 1);
+  HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE) {
+    char error[128]{};
+    std::snprintf(error, sizeof(error), "DLSS_STARTUP_D2 file_error=%lu\n",
+                  static_cast<unsigned long>(GetLastError()));
+    OutputDebugStringA(error);
+    return;
+  }
+  auto emit = [&](const char* line) {
+    DWORD written = 0;
+    WriteFile(file, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
+    WriteFile(file, "\r\n", 2, &written, nullptr);
+  };
+  char line[4608]{};
+  std::snprintf(line, sizeof(line),
+      "DLSS_STARTUP_D2 phase=%s pid=%lu tick=%llu dropped=%llu observations_only=1",
+      phase, static_cast<unsigned long>(GetCurrentProcessId()),
+      static_cast<unsigned long long>(GetTickCount64()),
+      static_cast<unsigned long long>(g_dlss_startup_trace.Dropped()));
+  emit(line);
+  std::snprintf(line, sizeof(line),
+      "STATE registration_attempts=%u host_ready=%u runtime_initialized=%u bootstrap_complete=%u bootstrap_busy=%u loadhook_installed=%u slinit_hook_installed=%u slinit_observed=%u sl_fg_requested=%d sl_lifecycle=%s ngx_capabilities_seen=%u ngx_vulkan_capabilities=%u ngx_fg_available=%u ngx_fg_created=%u enabled=%u runtime_selection=%u",
+      g_addon_entry.Attempts(), static_cast<unsigned>(g_addon_entry.Ready()),
+      static_cast<unsigned>(g_addon_entry.Initialized()),
+      static_cast<unsigned>(g_bootstrap_complete.load()), static_cast<unsigned>(g_bootstrap_busy.load()),
+      static_cast<unsigned>(mfgunlock::loadhook::g_hooked.load()),
+      static_cast<unsigned>(mfgunlock::framecount::g_init_hooked.load()),
+      static_cast<unsigned>(mfgunlock::streamline::internal::g_init_observed.load()),
+      mfgunlock::streamline::internal::g_feature_requested.load(),
+      mfgunlock::streamline::internal::LifecycleName(mfgunlock::streamline::internal::g_lifecycle_state.load()),
+      static_cast<unsigned>(mfgunlock::ngx::g_status.capabilities_seen.load()),
+      static_cast<unsigned>(mfgunlock::ngx::g_status.vulkan_capabilities.load()),
+      static_cast<unsigned>(mfgunlock::ngx::g_status.available.load()),
+      static_cast<unsigned>(mfgunlock::ngx::g_status.feature_created.load()),
+      static_cast<unsigned>(g_enabled.load()), mfgunlock::framecount::g_runtime_selection_mode.load());
+  emit(line);
+  std::snprintf(line, sizeof(line), "HOST_LIFETIME_R3 retained_host=%p policy=PROCESS_LIFETIME",
+      g_reshade_host_lifetime.Host());
+  emit(line);
+  std::snprintf(line, sizeof(line), "COMMON_ROLE_R3 resolved_common=%p",
+      static_cast<void*>(mfgunlock::streamline::internal::CommonModule()));
+  emit(line);
+  // GetModuleHandle does not load a library or call any vendor API.
+  for (const wchar_t* module_name : {L"sl.interposer.dll", L"sl.common.dll", L"sl.dlss.dll",
+          L"sl.dlss_g.dll", L"sl.dlss_d.dll", L"_nvngx.dll", L"nvngx.dll", L"nvngx_dlss.dll",
+          L"nvngx_dlssg.dll", L"nvngx_dlssd.dll"}) {
+    const auto module = std::wcscmp(module_name, L"sl.common.dll") == 0
+        ? mfgunlock::streamline::internal::CommonModule() : GetModuleHandleW(module_name);
+    std::snprintf(line, sizeof(line), "MODULE name=%ls handle=%p", module_name,
+                  static_cast<void*>(module));
+    emit(line);
+  }
+  g_dlss_startup_trace.Visit([&](size_t index, const char* message) {
+    std::snprintf(line, sizeof(line), "seq=%llu %s",
+                  static_cast<unsigned long long>(index), message);
+    emit(line);
+  });
+  CloseHandle(file);
+}
+
+void TraceRegistrationModule(const char* label, HMODULE module) {
+  RegistrationTraceLastError saved;
+  char path[1024]{};
+  const DWORD n = module ? GetModuleFileNameA(module, path, sizeof(path)) : 0;
+  const DWORD error = n ? 0 : GetLastError();
+  path[sizeof(path) - 1] = '\0';
+  g_registration_trace.Append("module=%s handle=%p path=%s path_error=%lu truncated=%u",
+      label, static_cast<void*>(module), path, static_cast<unsigned long>(error),
+      static_cast<unsigned>(n >= sizeof(path)));
+}
+
+void TraceRegistrationExports(const char* label, HMODULE module) {
+  RegistrationTraceLastError saved;
+  if (!module) return;
+  for (const char* name : {"ReShadeRegisterAddon", "ReShadeUnregisterAddon",
+                           "ReShadeLogMessage", "ReShadeGetImGuiFunctionTable"}) {
+    const auto function = GetProcAddress(module, name);
+    HMODULE owner = nullptr;
+    if (function)
+      GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+          GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+          reinterpret_cast<LPCWSTR>(function), &owner);
+    unsigned char bytes[32]{};
+    SIZE_T read = 0;
+    char head[65]{};
+    if (function && ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(function),
+                                      bytes, sizeof(bytes), &read)) {
+      read = (std::min)(read, sizeof(bytes));
+      for (SIZE_T i = 0; i < read; ++i)
+        std::snprintf(head + i * 2, sizeof(head) - i * 2, "%02x", bytes[i]);
+    }
+    g_registration_trace.Append("exports=%s name=%s address=%p owner=%p entry_bytes=%s",
+        label, name, reinterpret_cast<void*>(function), static_cast<void*>(owner), head);
+    if (function && owner != module) TraceRegistrationModule("forwarded-export-owner", owner);
+  }
+}
+
+void TraceRegistrationState(const char* phase, HMODULE self, HMODULE given_host,
+                            bool sdk_was_called) {
+  RegistrationTraceLastError saved;
+  g_registration_trace.Append(
+      "phase=%s pid=%lu tid=%lu tick=%llu self=%p given_host=%p local_ready=%u attempts=%u state_host=%p bootstrap_complete=%u bootstrap_busy=%u shutting_down=%u",
+      phase, static_cast<unsigned long>(GetCurrentProcessId()),
+      static_cast<unsigned long>(GetCurrentThreadId()),
+      static_cast<unsigned long long>(GetTickCount64()), static_cast<void*>(self),
+      static_cast<void*>(given_host), static_cast<unsigned>(g_addon_entry.Ready()),
+      g_addon_entry.Attempts(), g_addon_entry.Host(),
+      static_cast<unsigned>(g_bootstrap_complete.load()),
+      static_cast<unsigned>(g_bootstrap_busy.load()),
+      static_cast<unsigned>(g_bootstrap_shutting_down.load()));
+  TraceRegistrationModule("self", self);
+  TraceRegistrationModule("given-host", given_host);
+  if (!sdk_was_called) return; // Reading uninitialized SDK caches changes them.
+  const HMODULE sdk_self = reshade::internal::get_current_module_handle();
+  const HMODULE sdk_host = reshade::internal::get_reshade_module_handle();
+  g_registration_trace.Append("sdk_cache self_match=%u host_match=%u sdk_self=%p sdk_host=%p",
+      static_cast<unsigned>(sdk_self == self), static_cast<unsigned>(sdk_host == given_host),
+      static_cast<void*>(sdk_self), static_cast<void*>(sdk_host));
+  TraceRegistrationModule("sdk-self", sdk_self);
+  TraceRegistrationModule("sdk-host", sdk_host);
+  TraceRegistrationExports("sdk-host", sdk_host);
+  if (sdk_host != given_host) TraceRegistrationExports("given-host", given_host);
+}
+
+void DumpRegistrationTrace(HMODULE self, HMODULE host, const char* phase) {
+  RegistrationTraceLastError saved;
+  // Called ONLY from AddonInit (not DllMain). Independent file keeps early
+  // records even if ReShade's logger/registration does not work at first load.
+  wchar_t path[1024]{};
+  HANDLE file = INVALID_HANDLE_VALUE;
+  const DWORD length = GetModuleFileNameW(self, path, 1024);
+  if (length && length < 1024) {
+    if (auto* slash = std::wcsrchr(path, L'\\')) {
+      constexpr wchar_t name[] = L"MFGAmpereUnlock.registration.log";
+      if (static_cast<size_t>(slash + 1 - path) + sizeof(name) / sizeof(wchar_t) <= 1024) {
+        std::copy(name, name + sizeof(name) / sizeof(wchar_t), slash + 1);
+        file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+      }
+    }
+  }
+  const DWORD file_error = file == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+  using LogFn = void (*)(void*, int, const char*);
+  const auto log = host ? reinterpret_cast<LogFn>(GetProcAddress(host, "ReShadeLogMessage")) : nullptr;
+  auto emit = [&](const char* line) {
+    if (file != INVALID_HANDLE_VALUE) {
+      DWORD written = 0;
+      WriteFile(file, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
+      WriteFile(file, "\r\n", 2, &written, nullptr);
+    }
+    if (log) log(nullptr, 3, line);
+    OutputDebugStringA(line);
+  };
+  char line[1800]{};
+  std::snprintf(line, sizeof(line), "[MFG Unlock] REGDIAG_D1 dump=%s file_error=%lu dropped=%llu",
+      phase, static_cast<unsigned long>(file_error),
+      static_cast<unsigned long long>(g_registration_trace.Dropped()));
+  emit(line);
+  // The bounded D1 journal retains the first records. Always include a fresh
+  // summary as well, even after repeated host initialization fills that journal.
+  std::snprintf(line, sizeof(line),
+      "[MFG Unlock] registration R2 snapshot phase=%s host_ready=%u runtime_initialized=%u attempts=%u bootstrap_complete=%u",
+      phase, static_cast<unsigned>(g_addon_entry.Ready()),
+      static_cast<unsigned>(g_addon_entry.Initialized()), g_addon_entry.Attempts(),
+      static_cast<unsigned>(g_bootstrap_complete.load(std::memory_order_acquire)));
+  emit(line);
+  g_registration_trace.Visit([&](size_t index, const char* text) {
+    std::snprintf(line, sizeof(line), "[MFG Unlock] REGDIAG_D1 seq=%llu %s",
+        static_cast<unsigned long long>(index), text);
+    emit(line);
+  });
+  if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+}
+
+HMODULE FindRegistrationHost() {
+  // Do not initialize the SDK's cached handle to nullptr during an early load.
+  // AddonInit supplies the authoritative handle later when discovery is too early.
+  HMODULE modules[1024]{};
+  DWORD bytes = 0;
+  if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof(modules), &bytes))
+    return nullptr;
+  const size_t count = (std::min)(static_cast<size_t>(bytes), sizeof(modules)) /
+      sizeof(HMODULE);
+  for (size_t i = 0; i < count; ++i) {
+    if (GetProcAddress(modules[i], "ReShadeRegisterAddon") &&
+        GetProcAddress(modules[i], "ReShadeUnregisterAddon")) return modules[i];
+  }
+  return nullptr;
+}
+
+bool RetainRegistrationHost(HMODULE host) {
+  RegistrationTraceLastError saved;
+  return g_reshade_host_lifetime.Ensure(host, [](void* candidate) {
+    HMODULE pinned = nullptr;
+    const bool ok = GetModuleHandleExW(
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+        reinterpret_cast<LPCWSTR>(candidate), &pinned) && pinned == candidate;
+    const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+    char text[192]{};
+    std::snprintf(text, sizeof(text),
+        "HOST_LIFETIME_R3 host=%p retained=%u win32_error=%lu policy=PROCESS_LIFETIME",
+        candidate, static_cast<unsigned>(ok), static_cast<unsigned long>(error));
+    g_registration_trace.Append("%s", text);
+    TraceDlssStartupLog(text, !ok);
+    OutputDebugStringA(text);
+    return ok;
+  });
+}
+
+void LogRegistration(HMODULE host, const char* where, const char* result, int severity = 3) {
+  // ReShade's logging wrapper must not cache a null function pointer before the
+  // first successful registration. Resolve the optional logger from this host.
+  char path[MAX_PATH]{};
+  if (host) GetModuleFileNameA(host, path, MAX_PATH - 1);
+  char text[768]{};
+  std::snprintf(text, sizeof(text),
+      "[MFG Unlock] registration R2 entry=%s result=%s attempts=%u api=%u imgui=%u host=%p path=%s",
+      where, result, g_addon_entry.Attempts(),
+      static_cast<unsigned>(RESHADE_API_VERSION), static_cast<unsigned>(IMGUI_VERSION_NUM),
+      static_cast<void*>(host), path);
+  using LogFn = void (*)(void*, int, const char*);
+  const auto log = host ? reinterpret_cast<LogFn>(GetProcAddress(host, "ReShadeLogMessage")) : nullptr;
+  g_registration_trace.Append("tick=%llu tid=%lu %s", static_cast<unsigned long long>(GetTickCount64()),
+      static_cast<unsigned long>(GetCurrentThreadId()), text);
+  TraceDlssStartupLog(text, severity <= 2);
+  if (log) log(nullptr, severity, text);
+  OutputDebugStringA(text);
+}
+
+void RegisterAddonCallbacks() {
+  reshade::register_overlay("MFG Unlock", OnRegisterOverlay);
+  reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+  reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+  reshade::register_event<reshade::addon_event::reshade_begin_effects>(OnBeginEffects);
+  reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
+  reshade::register_event<reshade::addon_event::reshade_present>(OnOverlayRendered);
+  reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffects);
+  RegisterScreenshotObserver(true);
+  reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+  reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
+  reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteUiCommandList);
+  reshade::register_event<reshade::addon_event::init_command_list>(OnInitUiCommandList);
+  reshade::register_event<reshade::addon_event::reset_command_list>(OnResetUiCommandList);
+  reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyUiCommandList);
+  reshade::register_event<reshade::addon_event::init_pipeline>(OnInitUiBlendPipeline);
+  reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyUiBlendPipeline);
+  reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindUiBlendPipeline);
+  reshade::register_event<reshade::addon_event::draw>(OnDrawUiCandidate);
+  reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexedUiCandidate);
+  reshade::register_event<reshade::addon_event::destroy_resource>(
+      OnDestroyUiCandidateResource);
+  reshade::register_event<reshade::addon_event::barrier>(OnUiCandidateBarrier);
+  reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
+      OnBindUiCandidateRenderTargets);
+  reshade::register_event<reshade::addon_event::clear_render_target_view>(
+      OnClearUiCandidateRenderTarget);
+  reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+  reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+  reshade::register_event<reshade::addon_event::present>(OnPresentUiOutput);
+#if defined(MFGUNLOCK_RESHADE_API) && MFGUNLOCK_RESHADE_API >= 18
+  reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresentUiAlpha);
+#endif
+}
+
+bool InitializeAddon(HMODULE self, HMODULE requested_host, const char* where) {
+  mfgunlock::provider::g_startup_log_observer.store(&TraceDlssStartupLog, std::memory_order_relaxed);
+  TraceRegistrationState(where, self, requested_host, g_addon_entry.Ready());
+  HMODULE observed_host = requested_host;
+  const auto register_with_host = [&](void* addon, void* host) {
+    observed_host = static_cast<HMODULE>(host);
+    if (!GetProcAddress(observed_host, "ReShadeRegisterAddon") ||
+        !GetProcAddress(observed_host, "ReShadeUnregisterAddon")) {
+      LogRegistration(observed_host, where, "HOST_API_EXPORTS_MISSING", 1);
+      return false;
+    }
+    // Do this before ANY SDK registration/callback caches or runtime workers.
+    // ReShade may otherwise unload when a temporary Vulkan probe is destroyed.
+    if (!RetainRegistrationHost(observed_host)) {
+      observed_host = nullptr;
+      LogRegistration(nullptr, where, "HOST_LIFETIME_UNAVAILABLE", 1);
+      return false;
+    }
+    LogRegistration(observed_host, where, "REGISTER_BEGIN");
+    const bool registered = mfgunlock::addonentry::RegisterWithHost(
+        &reshade::register_addon, &reshade::internal::get_reshade_module_handle,
+        static_cast<HMODULE>(addon), observed_host);
+    g_registration_trace.Append("sdk_register_return=%u last_error=%lu",
+        static_cast<unsigned>(registered), static_cast<unsigned long>(GetLastError()));
+    TraceRegistrationState("after-sdk-register", static_cast<HMODULE>(addon), observed_host, true);
+    if (!registered) {
+      // SDK registration can fail after the host has registered the addon
+      // (e.g. ImGui mismatch). Remove only our incomplete registration.
+      reshade::unregister_addon(static_cast<HMODULE>(addon));
+      return false;
+    }
+    return true;
+  };
+  mfgunlock::addonentry::Result result;
+  if (requested_host && g_addon_entry.Initialized()) {
+    result = g_addon_entry.Refresh(self, requested_host,
+        [&](void* addon, void* host) {
+          // ReShade's public unregister removes only this module's entry and
+          // its callbacks; it is a no-op when the current host has lost them.
+          // Removing before re-registering also prevents duplicate callbacks
+          // on the normal early-load -> AddonInit path.
+          using UnregisterFn = void (*)(void*);
+          const auto unregister = reinterpret_cast<UnregisterFn>(GetProcAddress(
+              static_cast<HMODULE>(host), "ReShadeUnregisterAddon"));
+          if (!unregister) {
+            LogRegistration(static_cast<HMODULE>(host), where,
+                            "HOST_API_EXPORTS_MISSING", 1);
+            return false;
+          }
+          LogRegistration(static_cast<HMODULE>(host), where,
+                          "REFRESH_HOST_REGISTRATION");
+          unregister(addon);
+          return register_with_host(addon, host);
+        }, []() { RegisterAddonCallbacks(); });
+  } else {
+    result = g_addon_entry.Attach(self, requested_host,
+        [&]() -> void* { observed_host = FindRegistrationHost(); return observed_host; },
+        register_with_host, [&]() {
+      const HMODULE h_module = self;
       g_self_module = h_module;
-      if (!reshade::register_addon(h_module)) return FALSE;
       mfgunlock::ngx::g_before_fg_create = BeforeFgCreate;
       mfgunlock::framecount::internal::g_mode_observer = ObserveFgMode;
       mfgunlock::framecount::g_observe_streamline_ui_tags = ObserveNativeStreamlineTags;
@@ -4650,11 +5355,13 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
       mfgunlock::loadhook::g_on_load_result = TraceDlssLoadResult;
       mfgunlock::framecount::g_on_init = mfgunlock::streamline::OnInit;
       mfgunlock::framecount::g_init_compatible = mfgunlock::streamline::CanHookInit;
+      mfgunlock::framecount::g_find_interposer = mfgunlock::streamline::internal::InterposerModule;
       mfgunlock::framecount::g_interposer_contract_ready =
           mfgunlock::streamline::FullModernContractReady;
       mfgunlock::framecount::g_provider_mfg_ceiling = +[]() -> unsigned int {
-        return g_mfg_gate_ceiling.load(std::memory_order_acquire);
+        return g_enabled.load(std::memory_order_acquire) ? g_max_count.load(std::memory_order_acquire) : 0u;
       };
+      mfgunlock::framecount::g_on_dlssg_entry_observed = ObserveDlssgFeatureEntry;
       mfgunlock::framecount::g_multi_frame_ready = []() {
         const auto* profile = mfgunlock::architecture::ActiveProfile();
         if (!g_enabled.load() || !profile || !mfgunlock::runtime::ProviderReady()) return false;
@@ -4662,20 +5369,14 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
           return profile->provider_backend != mfgunlock::ProviderBackend::kNativeSm89 ||
                  g_gate_patched.load(std::memory_order_acquire);
         }
-        const bool temporal_ready =
-            g_midpoint_patched.load(std::memory_order_acquire) ||
-            g_blackwell_temporal_patched.load(std::memory_order_acquire);
         return mfgunlock::provider::PreparedProviderCount() == 1 &&
-               temporal_ready && g_gate_patched.load(std::memory_order_acquire);
+               g_gate_patched.load(std::memory_order_acquire);
       };
       mfgunlock::framecount::g_dynamic_stack_ready = DynamicRuntimeStackReady;
       mfgunlock::ngx::g_capability_limit = []() -> unsigned int {
-        if (!mfgunlock::framecount::g_multi_frame_ready()) return 0;
-        if (mfgunlock::framecount::g_streamline_plugin_seen.load(std::memory_order_acquire) &&
-            mfgunlock::framecount::g_streamline_max_generated.load(std::memory_order_acquire) == 0) {
-          return 0;
-        }
-        return g_max_count.load(std::memory_order_relaxed);
+        // The reported menu range permits a real native trial. Structural and
+        // prior reported maxima must not silently reduce a user-selected request.
+        return g_enabled.load() ? g_max_count.load(std::memory_order_relaxed) : 0;
       };
       mfgunlock::ngx::g_streamline_ceiling = []() -> unsigned int {
         return mfgunlock::framecount::g_streamline_max_generated.load(std::memory_order_acquire);
@@ -4700,38 +5401,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
       };
       mfgunlock::loadhook::g_on_dlssg_loaded = ProcessLoadedDlssgModule;
 
-      reshade::register_overlay("MFG Unlock", OnRegisterOverlay);
-      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
-      reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-      reshade::register_event<reshade::addon_event::reshade_begin_effects>(OnBeginEffects);
-      reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnFinishEffects);
-      reshade::register_event<reshade::addon_event::reshade_present>(OnOverlayRendered);
-      reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffects);
-      RegisterScreenshotObserver(true);
-      reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
-      reshade::register_event<reshade::addon_event::destroy_command_queue>(OnDestroyCommandQueue);
-      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteUiCommandList);
-      reshade::register_event<reshade::addon_event::init_command_list>(OnInitUiCommandList);
-      reshade::register_event<reshade::addon_event::reset_command_list>(OnResetUiCommandList);
-      reshade::register_event<reshade::addon_event::destroy_command_list>(OnDestroyUiCommandList);
-      reshade::register_event<reshade::addon_event::init_pipeline>(OnInitUiBlendPipeline);
-      reshade::register_event<reshade::addon_event::destroy_pipeline>(OnDestroyUiBlendPipeline);
-      reshade::register_event<reshade::addon_event::bind_pipeline>(OnBindUiBlendPipeline);
-      reshade::register_event<reshade::addon_event::draw>(OnDrawUiCandidate);
-      reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexedUiCandidate);
-      reshade::register_event<reshade::addon_event::destroy_resource>(
-          OnDestroyUiCandidateResource);
-      reshade::register_event<reshade::addon_event::barrier>(OnUiCandidateBarrier);
-      reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(
-          OnBindUiCandidateRenderTargets);
-      reshade::register_event<reshade::addon_event::clear_render_target_view>(
-          OnClearUiCandidateRenderTarget);
-      reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-      reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
-      reshade::register_event<reshade::addon_event::present>(OnPresentUiOutput);
-#if defined(MFGUNLOCK_RESHADE_API) && MFGUNLOCK_RESHADE_API >= 18
-      reshade::register_event<reshade::addon_event::finish_present>(OnFinishPresentUiAlpha);
-#endif
+      RegisterAddonCallbacks();
       // A retained module reference lets the worker finish before an external
       // unload. It releases that reference atomically with thread exit.
       HMODULE held = nullptr;
@@ -4741,9 +5411,42 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
         if (thread) CloseHandle(thread);
         else FreeLibrary(held);  // the first safe ReShade callback will retry
       }
+      });
+  }
+  if (!observed_host) observed_host = static_cast<HMODULE>(g_addon_entry.Host());
+  LogRegistration(observed_host, where, mfgunlock::addonentry::Name(result),
+                  mfgunlock::addonentry::Succeeded(result) ? 3 : 2);
+  return mfgunlock::addonentry::Succeeded(result);
+}
+
+}  // namespace
+
+// ReShade calls this with its own module handle, including for a module already
+// mapped by LoadFromDllMain. Always reconcile the current host registration;
+// this deliberately does NOT restart the already initialized MFG runtime.
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE reshade_module) {
+  TraceRegistrationState("AddonInit-enter", addon_module, reshade_module, g_addon_entry.Ready());
+  DumpRegistrationTrace(addon_module, reshade_module, "before-AddonInit");
+  const bool result = InitializeAddon(addon_module, reshade_module, "AddonInit");
+  TraceRegistrationState("AddonInit-exit", addon_module, reshade_module, g_addon_entry.Ready());
+  DumpRegistrationTrace(addon_module, reshade_module, "after-AddonInit");
+  DumpDlssStartupEvidence("after-AddonInit");
+  return result;
+}
+
+BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
+  // At process termination CUDA may still retain cached replacement pointers.
+  // Leave allocations and mapped-image patches to process teardown.
+  if (fdw_reason == DLL_PROCESS_DETACH && reserved != nullptr) return TRUE;
+  switch (fdw_reason) {
+    case DLL_PROCESS_ATTACH:
+      g_self_module = h_module;
+      // Keep the early path required by Streamline. If registration is too
+      // early, keep the DLL inert so the normal AddonInit path can retry.
+      InitializeAddon(h_module, nullptr, "DllMain");
       break;
-    }
     case DLL_PROCESS_DETACH:
+      if (!g_addon_entry.Initialized()) break;
       g_bootstrap_shutting_down.store(true, std::memory_order_release);
       mfgunlock::runtime::BeginShutdown();
       mfgunlock::ngx::g_before_fg_create = nullptr;
@@ -4796,7 +5499,9 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID reserved) {
       mfgunlock::framecount::g_init_compatible = nullptr;
       mfgunlock::framecount::g_interposer_contract_ready = nullptr;
       mfgunlock::framecount::g_multi_frame_ready = nullptr;
+      mfgunlock::framecount::g_on_dlssg_entry_observed = nullptr;
       mfgunlock::framecount::g_dynamic_stack_ready = nullptr;
+      mfgunlock::framecount::g_find_interposer = nullptr;
       mfgunlock::ngx::g_prepare_loaded_providers = nullptr;
       mfgunlock::streamline::Shutdown();
       mfgunlock::framecount::Uninstall();

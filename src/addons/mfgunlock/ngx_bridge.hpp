@@ -27,6 +27,7 @@
 
 #include "./provider.hpp"
 #include "./capability_policy.hpp"
+#include "./runtime_controls.hpp"
 #include "./feature_capabilities.hpp"
 #include "./ngx_hook.hpp"
 #include "./count_observer.hpp"
@@ -69,6 +70,7 @@ struct Status {
   std::atomic_bool vulkan_capabilities{false};
   std::atomic_bool available{false};
   std::atomic_uint32_t capability_max{0};
+  std::atomic<uint64_t> native_maximum{runtimecontrols::kUnknownMaximum};
   std::atomic_bool feature_created{false};
   std::atomic_bool feature_active{false};
 };
@@ -113,10 +115,8 @@ inline void TraceCapabilityBlock(const char* api, const char* phase,
 }
 
 inline bool NeedsCapabilityBridge() {
-  const auto* profile = architecture::ActiveProfile();
-  return profile
-      ? features::BackendSupports(profile, features::Feature::kFixedMfg)
-      : architecture::NeedsDetection();
+  // Typed native calls and observations do not depend on a retarget recipe.
+  return g_enabled.load(std::memory_order_relaxed);
 }
 
 // Original NVAPI pointers are kept separately from the entry hook. Architecture
@@ -325,7 +325,14 @@ inline bool IsModuleNamed(HMODULE module, const wchar_t* wanted) {
 }
 
 inline bool IsNgxRuntime(HMODULE module) {
-  return IsModuleNamed(module, L"_nvngx.dll") || IsModuleNamed(module, L"nvngx.dll");
+  if (!module) return false;
+  if (IsModuleNamed(module, L"_nvngx.dll") || IsModuleNamed(module, L"nvngx.dll")) return true;
+  // Public parameter APIs distinguish the NGX runtime from provider-private
+  // CreateFeature exports, which can have a different signature.
+  return GetProcAddress(module, "NVSDK_NGX_D3D12_GetCapabilityParameters") ||
+      GetProcAddress(module, "NVSDK_NGX_D3D12_GetParameters") ||
+      GetProcAddress(module, "NVSDK_NGX_VULKAN_GetCapabilityParameters") ||
+      GetProcAddress(module, "NVSDK_NGX_VULKAN_GetParameters");
 }
 
 using RequirementsFn = decltype(&NVSDK_NGX_D3D12_GetFeatureRequirements);
@@ -823,6 +830,21 @@ inline NVSDK_NGX_Result FinalizeRequirements(NVSDK_NGX_Result result,
   return result;
 }
 
+inline void TraceVulkanRequirement(const char* phase,
+    const NVSDK_NGX_FeatureDiscoveryInfo* discovery,
+    const NVSDK_NGX_FeatureRequirement* output, NVSDK_NGX_Result result) noexcept {
+  static std::atomic_uint calls{0};
+  if (calls.fetch_add(1, std::memory_order_relaxed) >= 128) return;
+  DiscoveryTrace([&](auto& message) {
+    message << "NGX_VULKAN_REQUIREMENTS phase=" << phase << " feature="
+            << (discovery ? static_cast<uint32_t>(discovery->FeatureID) : UINT32_MAX)
+            << " result=0x" << std::hex << static_cast<uint32_t>(result);
+    if (result == NVSDK_NGX_Result_Success && output)
+      message << " supported=0x" << static_cast<uint32_t>(output->FeatureSupported)
+              << " min_arch=0x" << output->MinHWArchitecture;
+  });
+}
+
 template <size_t I>
 NVSDK_NGX_Result NVSDK_CONV VulkanRequirements(
     VkInstance instance, VkPhysicalDevice physical_device,
@@ -833,14 +855,18 @@ NVSDK_NGX_Result NVSDK_CONV VulkanRequirements(
   if (!real) return NVSDK_NGX_Result_FAIL_InvalidParameter;
   if (g_shutting_down.load(std::memory_order_acquire)) {
     ScopedArchQuery no_spoof(nullptr);
-    return real(instance, physical_device, discovery, output);
+    const auto result = real(instance, physical_device, discovery, output);
+    TraceVulkanRequirement("NATIVE", discovery, output, result);
+    return result;
   }
   const bool fg = discovery != nullptr && static_cast<uint32_t>(discovery->FeatureID) ==
       static_cast<uint32_t>(NVSDK_NGX_Feature_FrameGeneration);
   if (!g_enabled.load(std::memory_order_relaxed) || !architecture::NeedsBridge() ||
       !fg || g_in_requirements) {
     ScopedArchQuery no_spoof(nullptr);
-    return real(instance, physical_device, discovery, output);
+    const auto result = real(instance, physical_device, discovery, output);
+    TraceVulkanRequirement("NATIVE", discovery, output, result);
+    return result;
   }
 
   g_in_requirements = true;
@@ -860,6 +886,7 @@ NVSDK_NGX_Result NVSDK_CONV VulkanRequirements(
 
   ScopedArchQuery architecture_scope(physical_gpu);
   const NVSDK_NGX_Result result = real(instance, physical_device, discovery, output);
+  TraceVulkanRequirement("NATIVE", discovery, output, result);
 
   try {
     if (physical_gpu != nullptr && g_prepare_loaded_providers != nullptr)
@@ -868,7 +895,9 @@ NVSDK_NGX_Result NVSDK_CONV VulkanRequirements(
     Log("Vulkan NGX requirements postflight failed", true);
   }
 
-  return FinalizeRequirements(result, output, physical_gpu != nullptr);
+  const auto returned = FinalizeRequirements(result, output, physical_gpu != nullptr);
+  TraceVulkanRequirement("RETURNED", discovery, output, returned);
+  return returned;
 }
 
 template <size_t I>
@@ -1102,7 +1131,14 @@ NVSDK_NGX_Result CreateVulkanFeature(NVSDK_NGX_Feature feature,
                                      NVSDK_NGX_Handle** handle, Forward&& forward) {
   if (feature != NVSDK_NGX_Feature_FrameGeneration) {
     ScopedArchQuery no_spoof(nullptr);
-    return forward();
+    const auto result = forward();
+    static std::atomic_uint calls{0};
+    if (calls.fetch_add(1, std::memory_order_relaxed) < 32) DiscoveryTrace([&](auto& message) {
+      message << "NGX_VULKAN_CREATE feature=" << static_cast<uint32_t>(feature)
+              << " result=0x" << std::hex << static_cast<uint32_t>(result)
+              << " path=NATIVE";
+    });
+    return result;
   }
   if (g_shutting_down.load(std::memory_order_acquire) || g_in_vulkan_call) return forward();
   VulkanCallScope scope;
@@ -1203,49 +1239,104 @@ inline void ObserveCapabilityCount(NVSDK_NGX_Parameter* parameters, int value,
   countobserver::Emit(event);
 }
 
+// Diagnostic ownership only; no cached pointer is dereferenced. Keep taint
+// markers until the owning NGX module retires, even across feature recreation.
+struct CapabilityOriginal {
+  const void* owner = nullptr;
+  NVSDK_NGX_Parameter* block = nullptr;
+  runtimecontrols::OriginalMaximum maximum;
+};
+inline std::mutex g_capability_evidence_lock;
+inline uint64_t g_capability_evidence_epoch = 1;
+inline std::vector<CapabilityOriginal> g_capability_originals;
+inline const void* g_last_capability_owner = nullptr;
+inline constexpr size_t kCapabilityEvidenceBudget = 1024;
+
+inline void ForgetCapabilityOwner(const void* owner) {
+  std::lock_guard lock(g_capability_evidence_lock);
+  ++g_capability_evidence_epoch;
+  std::erase_if(g_capability_originals, [owner](const auto& record) { return record.owner == owner; });
+  if (g_last_capability_owner == owner)
+    g_status.native_maximum.store(runtimecontrols::kUnknownMaximum, std::memory_order_release);
+}
+inline void InvalidateCapabilityEvidence() {
+  std::lock_guard lock(g_capability_evidence_lock);
+  ++g_capability_evidence_epoch;
+  for (auto& record : g_capability_originals) record.maximum.Invalidate();
+  g_status.native_maximum.store(runtimecontrols::kUnknownMaximum, std::memory_order_release);
+}
+
 inline void ApplyCapabilities(NVSDK_NGX_Parameter* parameters, unsigned int limit,
                               unsigned int structural_ceiling = 0,
                               countobserver::Backend backend = countobserver::Backend::kNgxD3D12,
-                              uint64_t caller = 0) {
+                              uint64_t caller = 0, const void* owner = nullptr) {
   if (!parameters) return;
+  uint64_t evidence_epoch = 0;
+  {
+    std::lock_guard lock(g_capability_evidence_lock);
+    evidence_epoch = g_capability_evidence_epoch;
+    g_status.native_maximum.store(runtimecontrols::kUnknownMaximum, std::memory_order_release);
+  }
+  // Only call with the evidence mutex held. Never hold it across vendor code,
+  // an observer callback, or logging: any of those can re-enter lifecycle work.
+  const auto record = [=]() -> runtimecontrols::OriginalMaximum* {
+    auto found = std::find_if(g_capability_originals.begin(), g_capability_originals.end(),
+        [=](const auto& value) { return value.owner == owner && value.block == parameters; });
+    if (found != g_capability_originals.end()) return &found->maximum;
+    if (g_capability_originals.size() >= kCapabilityEvidenceBudget) return nullptr;
+    g_capability_originals.push_back({owner, parameters, {}});
+    return &g_capability_originals.back().maximum;
+  };
+  // No pointer/iterator into this vector survives a native call or callback.
+  // An exhausted diagnostics budget means UNKNOWN, never a denied trial.
   int available = 0;
   int maximum = 0;
   const auto available_result = parameters->Get("FrameGeneration.Available", &available);
   const auto maximum_result = parameters->Get("DLSSG.MultiFrameCountMax", &maximum);
   ObserveCapabilityCount(parameters, maximum, maximum_result, countobserver::Operation::kRead, backend, caller);
-  const auto* profile = architecture::ActiveProfile();
-  const bool count_ready = g_enabled.load() && profile &&
-      features::BackendSupports(profile, features::Feature::kFixedMfg) && limit != 0;
-  const bool admission_ready = g_enabled.load() && profile &&
-      profile->RequiresProviderRetarget() && provider::PreparedProviderCount() == 1;
+  {
+    std::lock_guard lock(g_capability_evidence_lock);
+    if (evidence_epoch == g_capability_evidence_epoch) {
+      auto* original = record();
+      const uint64_t native_maximum = original
+          ? original->Observe(
+              maximum_result == NVSDK_NGX_Result_Success && maximum >= 0, static_cast<uint32_t>(maximum))
+          : runtimecontrols::kUnknownMaximum;
+      g_last_capability_owner = owner;
+      g_status.native_maximum.store(native_maximum, std::memory_order_release);
+    }
+  }
+  const bool count_ready = g_enabled.load() && limit != 0;
+  const bool admission_ready = g_enabled.load();
 
   if (admission_ready && available_result == NVSDK_NGX_Result_Success && available == 0) {
-    int needs_driver = 0;
-    unsigned int feature_result = NVSDK_NGX_Result_Success;
-    const auto driver_result = parameters->Get("FrameGeneration.NeedsUpdatedDriver", &needs_driver);
-    const auto init_result = parameters->Get("FrameGeneration.FeatureInitResult", &feature_result);
-    // A qualified provider does not waive an explicit driver/initialization error.
-    const bool init_ok = init_result != NVSDK_NGX_Result_Success ||
-        feature_result == NVSDK_NGX_Result_Success ||
-        feature_result == NVSDK_NGX_Result_FAIL_FeatureNotSupported;
-    if (driver_result == NVSDK_NGX_Result_Success && needs_driver == 0 && init_ok) {
-      parameters->Set("FrameGeneration.Available", 1);
-      const auto stored = parameters->Get("FrameGeneration.Available", &available);
-      if (stored == NVSDK_NGX_Result_Success && available == 1 && !g_status.available.load())
-        Log("FrameGeneration.Available: 0 -> 1");
-    }
+    // Available exposes the user's selected trial. NeedsUpdatedDriver and
+    // FeatureInitResult remain native diagnostic values; neither substitutes
+    // for the actual Create/Evaluate operation, whose result is never rewritten.
+    parameters->Set("FrameGeneration.Available", 1);
+    const auto stored = parameters->Get("FrameGeneration.Available", &available);
+    if (stored == NVSDK_NGX_Result_Success && available == 1 && !g_status.available.load())
+      Log("FrameGeneration.Available: 0 -> 1 for native trial; native failure fields preserved");
   }
   if (count_ready && available_result == NVSDK_NGX_Result_Success && available > 0 &&
       maximum_result == NVSDK_NGX_Result_Success && maximum >= 0) {
     const auto wanted = CapabilityFrameCount(maximum, limit, structural_ceiling);
     if (wanted != maximum) {
+      {
+        std::lock_guard lock(g_capability_evidence_lock);
+        if (auto* value = record()) value->Wrote(static_cast<uint32_t>(wanted));
+      }
       parameters->Set("DLSSG.MultiFrameCountMax", wanted);
       ObserveCapabilityCount(parameters, wanted, NVSDK_NGX_Result_Success,
                              countobserver::Operation::kWrite, backend, caller);
       int stored = maximum;
       const auto readback = parameters->Get("DLSSG.MultiFrameCountMax", &stored);
       ObserveCapabilityCount(parameters, stored, readback, countobserver::Operation::kRead, backend, caller);
-      if (readback == NVSDK_NGX_Result_Success && stored != maximum) {
+      if (readback == NVSDK_NGX_Result_Success && stored >= 0) {
+        std::lock_guard lock(g_capability_evidence_lock);
+        if (auto* value = record()) value->Wrote(static_cast<uint32_t>(stored));
+      }
+      if (readback == NVSDK_NGX_Result_Success && stored >= 0 && stored != maximum) {
         if (g_status.capability_max.load() != static_cast<unsigned int>(stored))
           Log("DLSSG.MultiFrameCountMax: " + std::to_string(maximum) + " -> " + std::to_string(stored));
         maximum = stored;
@@ -1287,7 +1378,10 @@ NVSDK_NGX_Result NVSDK_CONV Capabilities(NVSDK_NGX_Parameter** output) {
   if (!slot.parameters_seen[Api].exchange(true)) {
     Log(std::string(kParameterExports[Api]) + ": " + std::to_string(static_cast<uint32_t>(result)));
   }
-  if (result != NVSDK_NGX_Result_Success || !output || !*output) return result;
+  if (result != NVSDK_NGX_Result_Success || !output || !*output) {
+    g_status.native_maximum.store(runtimecontrols::kUnknownMaximum, std::memory_order_release);
+    return result;
+  }
   TraceCapabilityBlock(kParameterExports[Api], "NATIVE", *output, trace_call);
   try {
     // The native call can load the provider while populating the block.
@@ -1295,7 +1389,7 @@ NVSDK_NGX_Result NVSDK_CONV Capabilities(NVSDK_NGX_Parameter** output) {
     ApplyCapabilities(*output, g_capability_limit ? g_capability_limit() : 0,
                       g_streamline_ceiling ? g_streamline_ceiling() : 0,
                       Api >= 2 ? countobserver::Backend::kNgxVulkan : countobserver::Backend::kNgxD3D12,
-                      countobserver::CallerAddress());
+                      countobserver::CallerAddress(), &slot);
   } catch (...) {
     Log("NGX capability update failed", true);
   }
@@ -1358,6 +1452,7 @@ inline std::vector<hook::HookItem> EntryHooks(size_t index) {
 
 inline void ClearRuntime(size_t index) {
   auto& slot = g_slots[index];
+  ForgetCapabilityOwner(&slot);
   for (const auto& entry : EntryHooks(index)) *std::get<1>(entry) = nullptr;
   slot.module = nullptr;
   slot.identity = {};
@@ -1378,9 +1473,11 @@ inline void ClearRuntime(size_t index) {
 }
 
 inline bool ShouldHookEntry(const char* name, bool provider_bridge) {
-  return provider_bridge ||
-      (std::strcmp(name, "NVSDK_NGX_D3D12_GetFeatureRequirements") != 0 &&
-       std::strcmp(name, "NVSDK_NGX_VULKAN_GetFeatureRequirements") != 0);
+  (void)name;
+  (void)provider_bridge;
+  // Each entry is checked for a callable ABI below. GPU profile selection does
+  // not decide whether a public requirements call can be observed or retried.
+  return true;
 }
 
 inline bool IsTargetName(const char* name) {
@@ -1400,6 +1497,7 @@ inline bool IsTargetName(const char* name) {
 }  // namespace internal
 
 inline bool ResetFeatureTrackingForDeviceRecreation() {
+  internal::InvalidateCapabilityEvidence();
   std::lock_guard lock(internal::g_lifecycle_lock);
   if (internal::g_lifecycle.creates != 0 || internal::g_lifecycle.evaluates != 0 ||
       internal::g_lifecycle.releases != 0) {
@@ -1508,7 +1606,7 @@ inline void BeforeInit() {
   try {
     internal::ProbeAdapterBeforeInit();
     EnsureEntryHooks();
-    if (architecture::ActiveProfile() && g_prepare_loaded_providers) g_prepare_loaded_providers();
+    if (g_prepare_loaded_providers) g_prepare_loaded_providers();
   } catch (...) {
     Log("NGX preflight failed", true);
   }

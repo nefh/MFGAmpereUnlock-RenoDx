@@ -84,8 +84,13 @@ int main() {
 
   Check(ui::Select(ScRgb(), Candidate(output::UiEncoding::kSdrSrgb,
                                       alpha::AlphaConvention::kAlphaOnly),
-                   true) == ui::Path::kUnavailable,
-        "unsupported scRGB DLSS-G output remains unavailable");
+                   true) == ui::Path::kAlphaOnly,
+        "scRGB output metadata cannot veto actual alpha extraction");
+
+  Check(ui::Select({}, Candidate(output::UiEncoding::kUnknown,
+                                    alpha::AlphaConvention::kAlphaOnly),
+                   true) == ui::Path::kAlphaOnly,
+        "unknown output still permits color-independent coverage extraction");
 
   Check(ui::Select(Sdr(), Candidate(output::UiEncoding::kUnknown,
                                     alpha::AlphaConvention::kAlphaOnly,

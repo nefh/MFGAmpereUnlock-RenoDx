@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
-// Deterministic memory/API doubles for provider_state_test ONLY. Never included
-// by the production addon; these do not validate the Windows ABI or loader.
+// Deterministic memory/API doubles for portable provider tests. Strict module
+// handles reproduce C++ type checks, not execution of the Windows ABI or loader.
 #pragma once
 #include <algorithm>
 #include <cstdint>
@@ -11,7 +11,13 @@
 #include <vector>
 #include <set>
 using DWORD=uint32_t; using WORD=uint16_t; using BOOL=int;
-using HMODULE=void*;using HANDLE=void*;using LPCWSTR=const wchar_t*;using FARPROC=void(*)();
+#ifdef MFG_TEST_STRICT_MODULE_HANDLES
+struct HINSTANCE__;
+using HMODULE=HINSTANCE__*;
+#else
+using HMODULE=void*;
+#endif
+using HANDLE=void*;using LPCWSTR=const wchar_t*;using FARPROC=void(*)();
 constexpr BOOL FALSE=0;
 constexpr DWORD MEM_IMAGE=0x1000000,MEM_MAPPED=0x40000,MEM_COMMIT=0x1000;
 constexpr DWORD PAGE_NOACCESS=1,PAGE_READONLY=2,PAGE_READWRITE=4,PAGE_WRITECOPY=8;
@@ -33,15 +39,17 @@ struct MEMORY_BASIC_INFORMATION {void* BaseAddress=nullptr;void* AllocationBase=
 struct SRWLOCK {bool exclusive=false;unsigned shared=0;};
 #define SRWLOCK_INIT {}
 namespace provider_mock {
-struct Region {HMODULE base;size_t bytes;DWORD type=MEM_IMAGE,protect=PAGE_READONLY;};
+struct Region {void* base;size_t bytes;DWORD type=MEM_IMAGE,protect=PAGE_READONLY;void* allocation=nullptr;};
 inline std::vector<Region> regions;
 inline std::map<std::pair<HMODULE,std::string>,FARPROC> exports;
 inline std::map<HMODULE,std::string> paths;
 inline bool retain_ok=true,force_lock_busy=false;
-inline unsigned protection_calls=0,fail_protection_call=0,retains=0;
+inline unsigned protection_calls=0,fail_protection_call=0,retains=0,releases=0;
 inline std::set<unsigned> fail_protection_calls;
+inline void (*before_protect)(void*,size_t,DWORD)=nullptr;
 inline std::set<void*> allocations;
 inline unsigned flush_calls=0,fail_flush_call=0,corrupt_flush_call=0;
+inline std::set<unsigned> fail_flush_calls,corrupt_flush_calls;
 inline unsigned frees = 0;
 inline bool fail_free = false;
 }
@@ -53,10 +61,11 @@ inline void ReleaseSRWLockShared(SRWLOCK* l){--l->shared;}
 inline size_t VirtualQuery(const void* pointer,MEMORY_BASIC_INFORMATION* out,size_t size){
  auto at=reinterpret_cast<uintptr_t>(pointer);
  for(const auto& r:provider_mock::regions){auto base=reinterpret_cast<uintptr_t>(r.base);
-  if(at>=base&&at-base<r.bytes){*out={r.base,r.base,r.bytes,MEM_COMMIT,r.protect,r.type};return size;}}
+  if(at>=base&&at-base<r.bytes){*out={r.base,r.allocation?r.allocation:r.base,r.bytes,MEM_COMMIT,r.protect,r.type};return size;}}
  return 0;
 }
-inline BOOL VirtualProtect(void* pointer,size_t,DWORD desired,DWORD* old){
+inline BOOL VirtualProtect(void* pointer,size_t bytes,DWORD desired,DWORD* old){
+ if(provider_mock::before_protect)provider_mock::before_protect(pointer,bytes,desired);
  ++provider_mock::protection_calls;
  if(provider_mock::protection_calls==provider_mock::fail_protection_call ||
     provider_mock::fail_protection_calls.contains(provider_mock::protection_calls))return 0;
@@ -68,15 +77,18 @@ inline BOOL VirtualProtect(void* pointer,size_t,DWORD desired,DWORD* old){
 inline HANDLE GetCurrentProcess(){return nullptr;}
 inline BOOL FlushInstructionCache(HANDLE,const void* address,size_t bytes){
  ++provider_mock::flush_calls;
- if(bytes && provider_mock::flush_calls==provider_mock::corrupt_flush_call)
+ if(bytes && (provider_mock::flush_calls==provider_mock::corrupt_flush_call ||
+              provider_mock::corrupt_flush_calls.contains(provider_mock::flush_calls)))
    *const_cast<unsigned char*>(static_cast<const unsigned char*>(address)) ^= 1;
- return provider_mock::flush_calls!=provider_mock::fail_flush_call;
+ return provider_mock::flush_calls!=provider_mock::fail_flush_call &&
+        !provider_mock::fail_flush_calls.contains(provider_mock::flush_calls);
 }
 inline FARPROC GetProcAddress(HMODULE module,const char* name){auto it=provider_mock::exports.find({module,name});return it==provider_mock::exports.end()?nullptr:it->second;}
 inline BOOL GetModuleHandleExW(DWORD,LPCWSTR address,HMODULE* module){
  if(!provider_mock::retain_ok)return 0;
- *module=reinterpret_cast<void*>(const_cast<wchar_t*>(address));++provider_mock::retains;return 1;
+ *module=reinterpret_cast<HMODULE>(const_cast<wchar_t*>(address));++provider_mock::retains;return 1;
 }
+inline BOOL FreeLibrary(HMODULE){++provider_mock::releases;return 1;}
 inline DWORD GetModuleFileNameA(HMODULE module,char* output,DWORD capacity){
  auto it=provider_mock::paths.find(module);if(it==provider_mock::paths.end())return 0;
  if(it->second.size()+1>capacity)return capacity;

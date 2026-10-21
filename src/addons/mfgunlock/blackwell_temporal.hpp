@@ -2,8 +2,7 @@
  * Full Blackwell temporal framework for Ada, Ampere and Turing.
  * SPDX-License-Identifier: MIT
  *
- * The exact DLSS-G 310.9.1 Blackwell motion-vector, inpaint and inpaint-
- * decision PTX programs are rebuilt as sm_89, sm_86 or sm_75 fatbins. Intermediate Scatter
+ * Structurally resolved motion-vector, inpaint and inpaint-decision PTX programs are rebuilt as sm_89, sm_86 or sm_75 fatbins. Intermediate Scatter
  * Retention is an optional rewrite of the motion-vector program inside this
  * complete temporal backend; it is never applied as a standalone redirect.
  */
@@ -129,8 +128,8 @@ struct BoundaryDirection {
   bool reload_divisor;
 };
 
-// Exact 310.9.1 shared-tile mapping. Profile hashes and unique anchors guard
-// every use before this register mapping can reach a rebuilt provider fatbin.
+// Shared-tile recipe. Unique local instructions and declared native operand
+// definitions guard this mapping; whole-program identities never admit it.
 constexpr std::array<BoundaryDirection, 2> kBoundaryDirections = {{
     {"CURR_TO_PREV", "fma.rn.ftz.f32 %f14, %f7, %f7, %f157;\n",
      "%f7", "%f8", "%f9",
@@ -203,45 +202,99 @@ inline std::string BuildBoundaryProgram(const BoundaryDirection& direction,
   return stream.str();
 }
 
-inline bool RewriteMotionVector(std::string& ptx, BoundaryArtifactMode mode,
+inline bool FindDivisorLoad(const std::string& source, size_t& start, size_t& bytes,
+                            std::string& reg, std::string& why) {
+  std::string code;
+  if (!validatedwarp::internal::MaskPtx(source, code)) {
+    why = "motion-vector lexical structure is invalid"; return false;
+  }
+  size_t matches = 0;
+  for (size_t at = 0; at < code.size();) {
+    const auto nl = code.find('\n', at);
+    const auto end = nl == code.npos ? code.size() : nl;
+    auto line = ptx::Trim(std::string_view(code).substr(at, end - at));
+    if (line.starts_with("ld.param.f32") && line.size() > 12 &&
+        (line[12] == ' ' || line[12] == '\t')) {
+      auto rest = ptx::Trim(line.substr(12));
+      const auto comma = rest.find(',');
+      if (comma != rest.npos && validatedwarp::internal::CompactCode(rest.substr(comma + 1)) ==
+          "[Kernel_EstimateIntermMvecsScatter_param_0+120];") {
+        const auto destination = ptx::Trim(rest.substr(0, comma));
+        if (destination.starts_with("%f")) {
+          start = at; bytes = end - at + (nl != code.npos);
+          reg = destination; ++matches;
+        }
+      }
+    }
+    at = end + (nl != code.npos);
+  }
+  if (matches != 1) { why = matches ? "motion-vector divisor load is ambiguous" :
+      "motion-vector divisor load is missing"; return false; }
+  return true;
+}
+
+inline bool RewriteMotionVector(std::string& source, BoundaryArtifactMode mode,
                                 std::string& why) {
-  if (MotionVectorAlreadyModified(ptx)) {
-    why = "motion-vector PTX is already modified";
-    return false;
+  if (MotionVectorAlreadyModified(source)) {
+    why = "motion-vector PTX is already modified"; return false;
   }
-
+  size_t divisor_at = 0, divisor_bytes = 0;
+  std::string divisor;
+  if (!FindDivisorLoad(source, divisor_at, divisor_bytes, divisor, why)) return false;
+  const std::string_view divisor_operand = divisor;
+  if (!validatedwarp::internal::LocalOperandsDefined(source, divisor_at + divisor_bytes,
+      {&divisor_operand, 1}, why)) return false;
   if (mode == BoundaryArtifactMode::kOff) {
-    return validatedwarp::internal::ReplaceOnce(
-        ptx, kMotionDivisorLoad,
-        std::string(kMotionDivisorLoad) +
-            "mul.ftz.f32 %f2, %f2, 0f3F000000; // MFGUNLOCK_INTERMEDIATE_SCATTER_V1\n",
-        why);
+    source.insert(divisor_at + divisor_bytes, "mul.ftz.f32 " + divisor + ", " + divisor +
+        ", 0f3F000000; // MFGUNLOCK_INTERMEDIATE_SCATTER_V1\n");
+    return true;
   }
-  if (mode != BoundaryArtifactMode::kBalanced &&
-      mode != BoundaryArtifactMode::kAggressive) {
-    why = "unknown boundary artifact mode";
-    return false;
+  if (mode != BoundaryArtifactMode::kBalanced && mode != BoundaryArtifactMode::kAggressive) {
+    why = "unknown boundary artifact mode"; return false;
   }
-  if (!validatedwarp::internal::ReplaceOnce(
-          ptx, kMotionDivisorLoad, kMotionDivisorLoad, why)) {
-    return false;
+  std::string code;
+  if (!validatedwarp::internal::MaskPtx(source, code)) {
+    why = "motion-vector lexical structure is invalid"; return false;
   }
-
-  if (!validatedwarp::internal::ReplaceOnce(
-          ptx, kMotionRegisterAnchor,
-          std::string(kMotionRegisterAnchor) +
-              ".reg .pred %qgp<2>;\n.reg .f32 %qgf<12>;\n",
-          why)) {
-    return false;
-  }
+  std::vector<std::pair<size_t, std::string>> injections;
   for (const auto& direction : kBoundaryDirections) {
-    if (!validatedwarp::internal::ReplaceOnce(
-            ptx, direction.anchor,
-            std::string(direction.anchor) + BuildBoundaryProgram(direction, mode), why)) {
+    const auto at = code.find(direction.anchor);
+    if (at == code.npos || code.find(direction.anchor, at + 1) != code.npos) {
+      why = at == code.npos ? "required PTX anchor is missing" : "required PTX anchor is ambiguous";
       return false;
     }
+    std::vector<std::string_view> operands = {direction.center_x, direction.center_y,
+        direction.center_depth, direction.motion_length, divisor};
+    for (const auto& neighbor : direction.neighbors)
+      for (const auto* operand : neighbor) operands.push_back(operand);
+    if (!validatedwarp::internal::LocalOperandsDefined(source, at + std::strlen(direction.anchor),
+        operands, why)) return false;
   }
-  return true;
+  unsigned predicates = 0; size_t declaration_end = 0;
+  if (!validatedwarp::internal::QualityRegisterLimit(code, ".pred", "%p", predicates, declaration_end)) {
+    why = "motion-vector predicate declaration is ambiguous"; return false;
+  }
+  const auto qgp = validatedwarp::internal::FreshRegisterPrefix(source, "%qgp");
+  const auto qgf = validatedwarp::internal::FreshRegisterPrefix(source, "%qgf");
+  std::string result = source;
+  for (const auto& direction : kBoundaryDirections) {
+    std::string program = BuildBoundaryProgram(direction, mode);
+    // BuildBoundaryProgram's divisor is a template operand, resolved from the
+    // actual parameter load. Token replacement avoids aliasing %f20 etc.
+    for (size_t at = 0; (at = program.find("%f2", at)) != program.npos;) {
+      const auto end = at + 3;
+      if (end == program.size() || program[end] < '0' || program[end] > '9') {
+        program.replace(at, 3, divisor); at += divisor.size();
+      } else at = end;
+    }
+    validatedwarp::internal::RenameGeneratedPrefix(program, "%qgp", qgp);
+    validatedwarp::internal::RenameGeneratedPrefix(program, "%qgf", qgf);
+    injections.emplace_back(code.find(direction.anchor) + std::strlen(direction.anchor), std::move(program));
+  }
+  std::sort(injections.begin(), injections.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (const auto& insertion : injections) result.insert(insertion.first, insertion.second);
+  result.insert(declaration_end, "\n.reg .pred " + qgp + "<2>;\n.reg .f32 " + qgf + "<12>;\n");
+  source.swap(result); return true;
 }
 
 inline bool RewriteMotionVectorOff(std::string& ptx, std::string& why) {
@@ -266,27 +319,16 @@ inline validatedwarp::internal::RewritePtxCallback MotionVectorRewrite(
   }
 }
 
+// Other native image payloads are copied intact; their fingerprints or sizes
+// cannot qualify/refuse a PTX rewrite. Verify the actual rebuilt selection.
 inline bool ValidateAdaCubinSlot(
     const validatedwarp::internal::PreparedRedirect& prepared,
-    const KernelSpec& spec, std::string& why) {
+    const KernelSpec&, std::string& why) {
   std::vector<fatbin::Entry> entries;
   size_t end = 0;
-  if (!fatbin::Parse(std::span<const unsigned char>(
-          prepared.located.address, prepared.located.size), entries, end) ||
-      end != prepared.located.size || entries.size() != 3) {
-    why = "temporal fatbin layout changed";
-    return false;
-  }
-  const auto& cubin = entries[2];
-  if (cubin.kind != 2 || cubin.architecture != validatedwarp::internal::kAdaArch ||
-      cubin.payload_bytes != spec.ada_cubin_slot_size) {
-    why = "original Ada cubin slot layout changed";
-    return false;
-  }
-  const auto* payload = prepared.located.address + cubin.PayloadOffset();
-  if (validatedwarp::internal::Fnv1a64(payload, cubin.payload_bytes) !=
-      spec.ada_cubin_fnv1a64) {
-    why = "original Ada cubin slot fingerprint changed";
+  if (prepared.rebuilt.empty() || !fatbin::Parse(prepared.rebuilt, entries, end) ||
+      end != prepared.rebuilt.size()) {
+    why = "temporal replacement has invalid container bounds";
     return false;
   }
   return true;
@@ -324,8 +366,8 @@ inline bool Prepare(HMODULE module, bool enable_intermediate_scatter,
                     uint32_t target_sm = 86) {
   plan = {};
   result = {};
-  if (target_sm != 75 && target_sm != 86 && target_sm != 89) {
-    result.detail = "unsupported temporal target";
+  if (target_sm == 0) {
+    result.detail = "temporal target is unknown";
     return false;
   }
   plan.target_sm = target_sm;

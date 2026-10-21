@@ -151,7 +151,7 @@ void GrammarTests() {
   auto input=source;
   Check(!ptx::LowerTuringFmaRelu(input,70,1,why)&&input==source,"unknown lowering target");
   std::vector<unsigned char> raw(source.begin(),source.end());raw.push_back(0);size_t digit=0;
-  Check(!ptx::FindTargetDigits(raw,75,digit),"unlowered modifier denied by final validator");
+  Check(ptx::FindTargetDigits(raw,75,digit),"instruction spelling alone does not veto a real driver JIT trial");
   Check(ptx::FindTargetDigits(raw,86,digit),"modifier valid for Ampere target");
   raw.assign(result.begin(),result.end());raw.push_back(0);
   Check(ptx::FindTargetDigits(raw,75,digit),"lowered SM75 accepted");

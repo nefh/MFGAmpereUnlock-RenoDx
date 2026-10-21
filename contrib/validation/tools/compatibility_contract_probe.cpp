@@ -31,9 +31,8 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc == 7 && std::string_view(argv[1]) == "--gateway") {
-      const unsigned parent_major = Number(argv[2]);
+      (void)Number(argv[2]);  // Parent version is not a gateway prerequisite.
       c::PluginGatewayEvidence evidence{};
-      evidence.parent_abi_qualified = parent_major == 1 || parent_major == 2;
       (void)Number(argv[3]);  // File-version metadata only.
       evidence.named_dlssg = Number(argv[4]) != 0;
       evidence.own_code_gateway = Number(argv[5]) != 0;

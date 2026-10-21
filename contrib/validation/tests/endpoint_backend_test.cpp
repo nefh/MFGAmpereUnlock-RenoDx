@@ -113,10 +113,10 @@ void UnitChecks() {
   changed[2] ^= 1;
   Check(!endpoint::Matches(changed, own), "changed bytes reject");
   Check(!endpoint::Matches({}, own), "truncated bytes reject");
-  Check(!endpoint::QualifiedCode({}, endpoint::kTimestamp), "empty image reject");
+  Check(!endpoint::ReferenceCodeFingerprint({}, endpoint::kTimestamp), "empty image reject");
   Bytes image(endpoint::kImageBytes);
-  Check(!endpoint::QualifiedCode(image, endpoint::kTimestamp), "same size not a fingerprint");
-  Check(!endpoint::QualifiedCode(image, endpoint::kTimestamp + 1), "unknown version reject");
+  Check(!endpoint::ReferenceCodeFingerprint(image, endpoint::kTimestamp), "same size not a fingerprint");
+  Check(!endpoint::ReferenceCodeFingerprint(image, endpoint::kTimestamp + 1), "unknown version differs from historical reference inventory");
   Check(endpoint::kPayloads.size() == 39 && endpoint::kSelectors.size() == 2,
         "both networks and all payloads are required");
   for (size_t i = 0; i < endpoint::kPayloads.size(); ++i) {
@@ -135,10 +135,10 @@ void FileChecks(const char* path) {
   auto image = MapFile(path);
   Register(image);
   const auto before = image;
-  Check(endpoint::QualifiedCode(image, endpoint::kTimestamp), "real provider code qualification");
+  Check(endpoint::ReferenceCodeFingerprint(image, endpoint::kTimestamp), "historical provider fingerprint observation");
   for (const auto& region : endpoint::kCode) {
     image[region.rva] ^= 1;
-    Check(!endpoint::QualifiedCode(image, endpoint::kTimestamp), "one-bit code changes reject");
+    Check(!endpoint::ReferenceCodeFingerprint(image, endpoint::kTimestamp), "one-bit code changes reject");
     image[region.rva] ^= 1;
   }
   const auto* turing = architecture::GetProfile(mfgunlock::Architecture::kTuring);
@@ -148,8 +148,8 @@ void FileChecks(const char* path) {
     std::string reason;
     Check(ptx::Retarget(source, plan, reason, *turing) == ptx::Result::kRetargeted,
           "every endpoint payload retargets");
-    Check(endpoint::PreparedPayload(source, plan.replacement, region), "prepared SM75 payload");
-    Check(!endpoint::PreparedPayload(source, source, region), "original SM89 payload not ready");
+    Check(endpoint::ReferencePreparedPayload(source, plan.replacement, region), "prepared SM75 payload");
+    Check(!endpoint::ReferencePreparedPayload(source, source, region), "original SM89 payload not ready");
   }
 
   Reset();
@@ -160,7 +160,7 @@ void FileChecks(const char* path) {
   for (const auto& site : endpoint::kSelectors)
     Check(image[site.rva] == 0x90 && image[site.rva + 1] == 0x90, "PTX branch selected");
   for (const auto& region : endpoint::kPayloads)
-    Check(endpoint::PreparedPayload({before.data() + region.rva, region.bytes},
+    Check(endpoint::ReferencePreparedPayload({before.data() + region.rva, region.bytes},
                                    {image.data() + region.rva, region.bytes}, region),
           "published payload is SM75");
   const auto& patches = provider::internal::g_providers.front().patches;

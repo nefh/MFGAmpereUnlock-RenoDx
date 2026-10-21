@@ -12,15 +12,20 @@
 #include <fcntl.h>
 #endif
 constexpr DWORD MAX_PATH = 260;  // Provider API double does not define this Windows constant.
-constexpr char kFlipMarker[] = "FG1 DLL has been detected";
-std::atomic_bool g_flip_meter_failed{false}, g_flip_meter_patched{false};
-std::vector<int> g_flip_meter_sites;
 void PatchFrameCountCeiling(HMODULE) {}  // Tested by the independent ceiling path.
-bool WriteFlipSite(unsigned char*, const unsigned char*, size_t) {
-  g_flip_meter_sites.push_back(1);  // Selection test; do not execute image writes.
+#include "addon_image_seam.hpp"
+bool WriteFlipSite(unsigned char* at, const unsigned char*, size_t length) {
+  FlipSite planned;
+  planned.address = at;
+  planned.length = static_cast<unsigned char>(length);
+  g_flip_meter_sites.push_back(planned);  // Selection only, never image writes.
   return true;
 }
-#include "addon_image_seam.hpp"
+bool RestoreFlipSitesFrom(size_t first) {
+  g_flip_meter_sites.resize(first);  // Remove plans only; no protection or bytes change.
+  RefreshFlipTransactionState();
+  return true;
+}
 
 int main(int argc, char** argv) {
   // The corpus runner supplies an offline mapped-layout byte copy through
@@ -63,7 +68,10 @@ int main(int argc, char** argv) {
     int value = -1;
     const bool unique = markers == 1 &&
         FindFlipMeteringFallback(base, headers, marker, field, value);
+    const auto before = image;
     if (valid) TryPatchFlipMeteringInModule(module);
+    if (image != before || provider_mock::protection_calls != 0 || provider_mock::flush_calls != 0)
+      return 2;  // The read-only claim is an observed invariant, not a fixed label.
     std::cout << "{\"image_valid\":" << (valid ? "true" : "false")
               << ",\"marker_matches\":" << markers
               << ",\"unique_fallback\":" << (unique ? "true" : "false")
@@ -163,4 +171,20 @@ int main(int argc, char** argv) {
   assert(TryPatchFlipMeteringInModule(mod));
   assert(g_flip_meter_sites.size() == 1 && g_flip_meter_patched);
   assert(provider_mock::protection_calls == 0);
+  // Exercise the exact production retry cache, independently of write stubs.
+  // A failed module must not suppress a different image or a new user revision.
+  g_flip_meter_sites.clear();g_flip_meter_attempts.clear();g_flip_meter_patched=false;
+  std::memset(marker, 0, sizeof(kFlipMarker));
+  assert(!TryPatchFlipMeteringOnce(mod, 1, 1));
+  std::memcpy(marker, kFlipMarker, sizeof(kFlipMarker));
+  for (unsigned i = 0; i < 1000; ++i) assert(!TryPatchFlipMeteringOnce(mod, 1, 1));
+  assert(g_flip_meter_sites.empty() && g_flip_meter_attempts.size() == 1);
+  assert(TryPatchFlipMeteringOnce(mod, 1, 2) && g_flip_meter_sites.size() == 1);
+  assert(TryPatchFlipMeteringOnce(mod, 2, 3) && g_flip_meter_sites.size() == 1);
+  auto second = bytes;
+  provider_mock::regions.push_back({second.data(), second.size(), MEM_IMAGE, PAGE_EXECUTE_READ});
+  g_flip_meter_failed = true; // Failure from another plugin is diagnostic only.
+  assert(TryPatchFlipMeteringOnce(second.data(), 2, 3) && g_flip_meter_sites.size() == 2);
+  assert(g_flip_meter_attempts.size() == 2 && !g_flip_meter_failed);
+  std::cout << "mapped_image_bounds_test PASS (bounds, local stores, module/revision retry isolation)\n";
 }

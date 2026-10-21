@@ -10,8 +10,9 @@
 
 namespace mfgunlock::features {
 
-// These bits describe target parity and architecture-specific backend availability only.
-// Renderer, provider fingerprint, ABI and runtime capability gates stay in their owning layers.
+// These bits describe implemented operations, not permission based on a GPU
+// model or previous verification. Runtime availability is observed by attempting
+// a callable operation. PTX target selection remains a separate exact recipe.
 enum class Feature : uint32_t {
   kFixedMfg = 1u << 0,
   kDynamicMfg = 1u << 1,
@@ -80,9 +81,8 @@ inline constexpr uint32_t kNativeSm89BackendBits =
     static_cast<uint32_t>(Feature::kThinGeometryStability) |
     static_cast<uint32_t>(Feature::kFallbackSelection);
 
-// Keep retargeted architecture capability declarations separate even while the
-// currently verified feature sets are equal. Future evidence for one target
-// must not silently enable the other.
+// Retargeted architecture declarations identify the transformation recipes.
+// They do not restrict shared typed operations to those hardware profiles.
 inline constexpr uint32_t kRetargetSm86BackendBits = kNativeSm89BackendBits;
 inline constexpr uint32_t kRetargetSm75BackendBits = kNativeSm89BackendBits;
 
@@ -94,12 +94,13 @@ inline constexpr FeatureCapabilities kNoCapabilities{};
 
 inline constexpr FeatureCapabilities TargetCapabilities(
     const ArchitectureProfile* profile) {
-  return profile ? kTargetCapabilities : kNoCapabilities;
+  (void)profile;
+  return kTargetCapabilities;
 }
 
 inline constexpr FeatureCapabilities BackendCapabilities(
     const ArchitectureProfile* profile) {
-  if (!profile) return kNoCapabilities;
+  if (!profile) return kNativeSm89BackendCapabilities;
   switch (profile->provider_backend) {
     case ProviderBackend::kNativeSm89:
       return kNativeSm89BackendCapabilities;
@@ -108,7 +109,7 @@ inline constexpr FeatureCapabilities BackendCapabilities(
     case ProviderBackend::kRetargetSm75:
       return kRetargetSm75BackendCapabilities;
     default:
-      return kNoCapabilities;
+      return kNativeSm89BackendCapabilities;
   }
 }
 
@@ -121,7 +122,7 @@ inline constexpr bool BackendSupports(const ArchitectureProfile* profile, Featur
 }
 
 inline constexpr bool HasQualityBackend(const ArchitectureProfile* profile) {
-  return profile && BackendSupports(profile, Feature::kTemporalFramework) &&
+  return BackendSupports(profile, Feature::kTemporalFramework) &&
          BackendSupports(profile, Feature::kIntermediateScatter) &&
          BackendSupports(profile, Feature::kBoundaryMitigation) &&
          BackendSupports(profile, Feature::kValidatedWarp);

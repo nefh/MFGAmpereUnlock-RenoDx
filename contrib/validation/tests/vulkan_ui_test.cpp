@@ -31,26 +31,26 @@ int main(){
   assert(forwarded==1&&observed.size()==3&&observed[0].resource==&ui&&observed[1].resource==&color);
   assert(ui.state==1&&ui.nativeFormat==37&&ui.view==reinterpret_cast<void*>(0x103));
   ui.view=nullptr;assessment=q::AssessTags(tags,3,o::Read());
-  assert(!q::CanAutomaticallyUseUiRecomposition(assessment,o::Read())&&!assessment.suppress_hud_separation);
+  assert(q::CanAutomaticallyUseUiRecomposition(assessment,o::Read())&&!assessment.suppress_hud_separation);
   f::internal::HookedSetTag(sl::ViewportHandle(0),tags,3,reinterpret_cast<sl::CommandBuffer*>(0xabc));
   assert(forwarded==2&&observed[0].resource==&ui); // Unknown metadata is not rewritten.
   ui=Make(3,64);assessment=q::AssessTags(tags,3,o::Read());
   assert(assessment.issues&q::kUiColorAlphaLowPrecision);
   ui=Make(3,24);assessment=q::AssessTags(tags,3,o::Read());
   assert(!(assessment.issues&q::kUiColorAlphaLowPrecision));
-  assert(!q::CanAutomaticallyUseUiRecomposition(assessment,o::Read()));
+  assert(q::CanAutomaticallyUseUiRecomposition(assessment,o::Read()));
   ui=Make(3,37);ui.state=0;assessment=q::AssessTags(tags,3,o::Read());
-  assert(!q::CanAutomaticallyUseUiRecomposition(assessment,o::Read()));
+  assert(q::CanAutomaticallyUseUiRecomposition(assessment,o::Read()));
   o::Observe(o::FormatKind::kRgba16Float,10,true,o::kColorSpaceScRgbLinear,true);
-  assert(!q::CanAutomaticallyUseUiRecomposition(q::AssessTags(tags,3,o::Read()),o::Read()));
-  // Invalid UI metadata in an earlier batch must not be "proven" by a later
-  // valid HUDless-only batch. Native batches themselves remain unchanged.
+  assert(q::CanAutomaticallyUseUiRecomposition(q::AssessTags(tags,3,o::Read()),o::Read()));
+  // Incomplete observed metadata is diagnostic; both native split batches
+  // remain unchanged and an options-only request is still attempted.
   o::Observe(o::FormatKind::kRgb10A2Unorm,24,true,o::kColorSpaceHdr10Pq,true);
   f::internal::ForgetUiOutputs();
   ui=Make(3,37);ui.view=nullptr;
   f::internal::HookedSetTag(sl::ViewportHandle(0),tags,1,reinterpret_cast<sl::CommandBuffer*>(0xabc));
   f::internal::HookedSetTag(sl::ViewportHandle(0),tags+1,2,reinterpret_cast<sl::CommandBuffer*>(0xabc));
-  assert(!f::g_ui_pair_eligible.load());
+  assert(f::g_ui_pair_eligible.load());
   ui=Make(3,37);
   f::internal::HookedSetTag(sl::ViewportHandle(0),tags,1,reinterpret_cast<sl::CommandBuffer*>(0xabc));
   assert(f::g_ui_pair_eligible.load());

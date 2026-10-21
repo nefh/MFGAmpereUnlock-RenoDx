@@ -10,6 +10,7 @@ BUILD_ROOT="${MFG_BUILD_ROOT:-$ROOT}"
 LOG_ROOT="${MFG_VALIDATION_LOG_DIR:-$ROOT/validation-logs}"
 FAIL=0
 SKIP_ASAN=0
+ASAN_SKIP_REASON="minimal smoke failed; no ASan project PASS"
 GCC_READY=0
 RESULTS=()
 mkdir -p "$BUILD_ROOT" "$LOG_ROOT" || exit 1
@@ -20,6 +21,7 @@ for cmd in cmake ninja g++ clang++ python3 timeout; do
   command -v "$cmd" >/dev/null || { echo "MISSING: $cmd"; exit 1; }
 done
 [[ "$PARALLEL" =~ ^[1-9][0-9]*$ ]] || { echo 'Invalid MFG_VALIDATION_JOBS'; exit 1; }
+[[ "${MFG_SKIP_ASAN:-0}" =~ ^[01]$ ]] || { echo 'Invalid MFG_SKIP_ASAN (use 0 or 1)'; exit 1; }
 if [[ -n "$PROVIDER" && ! -f "$PROVIDER" ]]; then
   echo "PROVIDER_NOT_FOUND=$PROVIDER"; exit 1
 fi
@@ -80,21 +82,29 @@ if run_logged gcc-strict build_suite gcc "$(command -v g++)" Release "$STRICT"; 
   GCC_READY=1
 fi
 run_logged clang-strict build_suite clang "$(command -v clang++)" Release "$STRICT" || true
-printf '\n===== ASAN RUNTIME SMOKE =====\n'
-printf 'int main() { return 0; }\n' > "$TEMP/smoke.cpp"
-export ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1:symbolize=1'
 export UBSAN_OPTIONS='print_stacktrace=1:halt_on_error=1'
-if clang++ -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
-     "$TEMP/smoke.cpp" -o "$TEMP/smoke" >"$LOG_ROOT/asan-smoke.log" 2>&1; then
-  for attempt in 1 2 3; do
-    if ! (ulimit -c 0; ulimit -f 2048; timeout --signal=TERM --kill-after=2s 10s "$TEMP/smoke") >>"$LOG_ROOT/asan-smoke.log" 2>&1; then
-      SKIP_ASAN=1; break
-    fi
-  done
-else
-  # A missing sanitizer library/compiler error is a failed prerequisite, not a runtime skip.
+if [[ "${MFG_SKIP_ASAN:-0}" == 1 ]]; then
   SKIP_ASAN=1
-  record asan-compile FAIL
+  ASAN_SKIP_REASON="declared unavailable environment; smoke NOT repeated; no ASan project PASS"
+  printf '\n===== ASAN: EXPLICIT ENVIRONMENT SKIP =====\n'
+  printf '%s\n' "$ASAN_SKIP_REASON" > "$LOG_ROOT/asan-smoke.log"
+else
+  printf '\n===== ASAN RUNTIME SMOKE =====\n'
+  printf 'int main() { return 0; }\n' > "$TEMP/smoke.cpp"
+  export ASAN_OPTIONS='detect_leaks=1:halt_on_error=1:abort_on_error=1:symbolize=1'
+  export UBSAN_OPTIONS='print_stacktrace=1:halt_on_error=1'
+  if clang++ -O0 -g -fsanitize=address,undefined -fno-sanitize-recover=all \
+       "$TEMP/smoke.cpp" -o "$TEMP/smoke" >"$LOG_ROOT/asan-smoke.log" 2>&1; then
+    for attempt in 1 2 3; do
+      if ! (ulimit -c 0; ulimit -f 2048; timeout --signal=TERM --kill-after=2s 10s "$TEMP/smoke") >>"$LOG_ROOT/asan-smoke.log" 2>&1; then
+        SKIP_ASAN=1; break
+      fi
+    done
+  else
+    # A missing sanitizer library/compiler error is a failed prerequisite, not a runtime skip.
+    SKIP_ASAN=1
+    record asan-compile FAIL
+  fi
 fi
 if (( SKIP_ASAN == 0 )); then
   record asan-smoke PASS
@@ -102,7 +112,7 @@ if (( SKIP_ASAN == 0 )); then
     "$STRICT -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \
     '-fsanitize=address,undefined' || true
 else
-  record asan 'SKIPPED_ENVIRONMENT (minimal smoke failed; no ASan project PASS)'
+  record asan "SKIPPED_ENVIRONMENT ($ASAN_SKIP_REASON)"
   if [[ "${MFG_REQUIRE_ASAN:-0}" == 1 ]]; then record asan-required FAIL; fi
   run_logged ubsan build_suite ubsan "$(command -v g++)" Debug \
     "$STRICT -fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer" \

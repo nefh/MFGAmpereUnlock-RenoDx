@@ -123,28 +123,31 @@ int main() {
 
   assessment = guard::AssessTags(tags.data(), tags.size(), scrgb);
   Check((assessment.issues & guard::kOutputEncodingUnsupported) != 0 &&
-            !guard::CanAutomaticallyUseUiRecomposition(assessment, scrgb) &&
+            guard::CanAutomaticallyUseUiRecomposition(assessment, scrgb) &&
             !assessment.suppress_hud_separation,
-        "scRGB is detected as unsupported without rewriting native tags");
+        "scRGB diagnostic does not preempt a native UIR attempt");
 
   assessment = guard::AssessTags(tags.data(), tags.size(), unknown);
   Check((assessment.issues & guard::kOutputEncodingUnknown) != 0 &&
-            !guard::CanAutomaticallyUseUiRecomposition(assessment, unknown) &&
+            guard::CanAutomaticallyUseUiRecomposition(assessment, unknown) &&
             !assessment.suppress_hud_separation,
-        "unknown output declines automatic UIR without rewriting native tags");
+        "unknown output allows an options request with unchanged native tags");
 
   ui.nativeFormat = 24;
   assessment = guard::AssessTags(tags.data(), tags.size(), sdr);
   Check((assessment.issues & guard::kUiColorAlphaLowPrecision) != 0 &&
-            assessment.suppress_hud_separation,
-        "two-bit UI alpha is rejected");
+            !assessment.suppress_hud_separation &&
+            guard::CanAutomaticallyUseUiRecomposition(assessment, sdr),
+        "two-bit UI alpha is diagnosed without suppressing native intent");
   ui.nativeFormat = 28;
 
   ui.width = 1280;
   tags[2] = MakeTag(ui, sl::kBufferTypeUIColorAndAlpha);
   assessment = guard::AssessTags(tags.data(), tags.size(), sdr);
-  Check((assessment.issues & guard::kUiExtentMismatch) != 0,
-        "UI extent mismatch is rejected");
+  Check((assessment.issues & guard::kUiExtentMismatch) != 0 &&
+            !assessment.suppress_hud_separation &&
+            guard::CanAutomaticallyUseUiRecomposition(assessment, sdr),
+        "differing valid native extents receive an empirical UIR attempt");
   ui.width = 1920;
   tags[2] = MakeTag(ui, sl::kBufferTypeUIColorAndAlpha);
 
@@ -152,13 +155,22 @@ int main() {
   assessment = guard::AssessTags(tags.data(), tags.size(), sdr);
   Check((assessment.issues & guard::kInvalidOptionalResource) != 0,
         "unknown optional resource ABI is rejected");
+  Check(!guard::CanAutomaticallyUseUiRecomposition(assessment, sdr),
+        "wrong resource type is a concrete structure error");
   tags[1].resource->structType = sl::Resource::s_structType;
+
+  tags[1].extent.left = 1;
+  assessment = guard::AssessTags(tags.data(), tags.size(), sdr);
+  Check((assessment.issues & guard::kInvalidOptionalResource) != 0 &&
+            !guard::CanAutomaticallyUseUiRecomposition(assessment, sdr),
+        "resource extent beyond its real dimensions remains rejected");
+  tags[1].extent.left = 0;
 
   Check(guard::ShouldRequestAutomaticUiPath(sdr) &&
             guard::ShouldRequestAutomaticUiPath(hdr10) &&
-            !guard::ShouldRequestAutomaticUiPath(scrgb) &&
-            !guard::ShouldRequestAutomaticUiPath(unknown),
-        "automatic path requires a supported known output encoding");
+            guard::ShouldRequestAutomaticUiPath(scrgb) &&
+            guard::ShouldRequestAutomaticUiPath(unknown),
+        "options negotiation is independent of output encoding assumptions");
 
   sl::Constants constants{};
   constants.reset = sl::Boolean::eFalse;

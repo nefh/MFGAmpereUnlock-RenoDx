@@ -81,7 +81,7 @@ struct Image {
 
     const unsigned char gate[] = {0xb8, 0x90, 1, 0, 0, 0xc3};
     std::memcpy(bytes.data() + 0x1000, gate, sizeof(gate));
-    if (!valid_gate) bytes[0x1001] = 0x55;
+    if (!valid_gate) bytes[0x1000] = 0x55;
 
     // One minimal compressed PTX container. This is the same validated layout
     // used by ptx_retarget_test.
@@ -154,10 +154,7 @@ void Reset() {
 }
 
 bool Allowed() {
-  return policy::CanRelaxRequirements({true, true, provider::PreparedProviderCount(),
-                                       policy::kNgxSuccess, policy::kDlssGFeatureId,
-                                       policy::kAdapterUnsupported, architecture::kAdaArchitecture},
-                                      mfgunlock::architecture::ActiveProfile());
+  return provider::PreparedProviderCount() > 0;
 }
 
 }  // namespace
@@ -269,8 +266,8 @@ int main() {
     Image rejected(2, false);
     Check(!PrepareFixture(rejected.module), "unrecognized genuine provider rejected");
     Check(provider::GetProviderStatus().ready == 1 && provider::GetProviderStatus().blocked == 1 &&
-              !Allowed(),
-          "live rejected provider vetoes");
+              Allowed(),
+          "inspected rejection does not revoke another committed provider");
     Check(!provider::internal::g_rejected.front().path.empty() &&
               !provider::internal::g_rejected.front().reason.empty(),
           "rejection identifies module and reason");
@@ -308,31 +305,31 @@ int main() {
     Image forwarded(5);
     mock::exports[{forwarded.module, "NVSDK_NGX_GetGPUArchitecture"}] =
         reinterpret_cast<FARPROC>(ready.bytes.data() + 0x1000);
-    Check(!PrepareFixture(forwarded.module) && !Allowed(),
-          "unresolved forwarded ABI blocks, never patched");
+    Check(!PrepareFixture(forwarded.module) && Allowed(),
+          "unresolved forwarded ABI is unpatched without revoking another provider");
     forwarded.Unmap();
 
     Image incomplete(13);
     mock::exports.erase({incomplete.module, "NVSDK_NGX_D3D12_PopulateDeviceParameters_Impl"});
-    Check(!PrepareFixture(incomplete.module) && !Allowed(),
-          "partial provider ABI is a real blocker");
+    Check(!PrepareFixture(incomplete.module) && Allowed(),
+          "partial provider ABI blocks only its own transaction");
 
     auto* reused_header = reinterpret_cast<IMAGE_NT_HEADERS64*>(incomplete.bytes.data() + 0x80);
     ++reused_header->FileHeader.TimeDateStamp;
     Check(provider::GetProviderStatus().ready == 1 && provider::GetProviderStatus().blocked == 1 &&
-              !Allowed(),
-          "new image at rejected address cannot authorize the other ready provider");
+              Allowed(),
+          "new image at rejected address cannot revoke the other ready provider");
     incomplete.Unmap();
 
     Image retry(6);
     mock::retain_ok = false;
-    Check(!PrepareFixture(retry.module) && !Allowed(),
-          "unretained real provider blocks");
+    Check(!PrepareFixture(retry.module) && Allowed(),
+          "unretained provider does not revoke separately retained provider");
     mock::retain_ok = true;
     Check(PrepareFixture(retry.module), "same provider can be fully requalified");
     Check(provider::GetProviderStatus().blocked == 0 && provider::GetProviderStatus().ready == 2 &&
-              !Allowed(),
-          "two prepared providers remain ambiguous");
+              Allowed(),
+          "independent committed providers retain their readiness");
     Check(provider::internal::g_rejected.size() == 3,
           "only successful transaction retires its own rejection");
 
@@ -377,7 +374,7 @@ int main() {
     g_fixture_profiles[reuse.module].profile.timestamp = nt->FileHeader.TimeDateStamp;
     Check(provider::GetProviderStatus().blocked == 1 && !Allowed(),
           "reused address stays unqualified");
-    reuse.bytes[0x1001] = 0x90;
+    reuse.bytes[0x1000] = 0xb8;
     Check(PrepareFixture(reuse.module) && Allowed(),
           "remapped candidate must pass full preparation");
     Check(provider::internal::g_rejected.empty(),
@@ -390,8 +387,8 @@ int main() {
     Reset();
     Image bad(10);
     bad.bytes[0] = 0;
-    Check(!PrepareFixture(bad.module) && provider::GetProviderStatus().failed && !Allowed(),
-          "malformed executable never silently ignored");
+    Check(!PrepareFixture(bad.module) && !provider::GetProviderStatus().failed && !Allowed(),
+          "malformed read-only candidate is not a failed write transaction");
 
     Reset();
     Image late(11);

@@ -80,7 +80,8 @@ void Reset() {
   mfgunlock::g_enabled = true;
   fc::g_force_multiplier = 0;
   fc::g_options_revision = 1;
-  fc::g_options_cache_epoch = 1;
+  fc::g_options_cache_epoch.fetch_add(1);
+  fc::g_request_retry_revision.fetch_add(1);
   fc::g_present_thread = 7;
   fc::g_dynamic_mfg_enabled = false;
   fc::g_dynamic_applied = false;
@@ -365,15 +366,16 @@ void PacingAndCeiling() {
   fc::g_pacing_ready = [] { return false; };
   fc::g_ensure_pacing = [] { throw std::runtime_error("automatic update must not install pacing patches"); };
   Request(4); Boundary();
-  Check(fc::g_fixed_override_status == fc::FixedOverrideStatus::kBlockedPacing,
-        "automatic setter never hot-patches legacy pacing");
-  Check(g_counts.back() == 1, "pacing block preserves native request");
+  Check(fc::g_fixed_override_status == fc::FixedOverrideStatus::kApplied,
+        "automatic setter submits the native request without hot-patching legacy pacing");
+  Check(g_counts.size() == 2 && g_counts.back() == 3,
+        "live explicit override reaches native setter despite missing pacing readiness");
   Reset();
   fc::internal::HookedSetOptions({}, native);
   fc::g_streamline_max_generated = 3;
   Request(6); Boundary();
-  Check(g_counts.back() == 1 && fc::g_fixed_override_status == fc::FixedOverrideStatus::kBlockedStructuralCeiling,
-        "automatic requests obey structural ceiling without silent clamp");
+  Check(g_counts.back() == 5 && fc::g_fixed_override_status == fc::FixedOverrideStatus::kApplied,
+        "automatic user count request reaches native API despite lower scanner estimate");
 }
 void HdrTelemetry() {
   Reset();
